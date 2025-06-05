@@ -1,10 +1,41 @@
 use std::collections::BTreeMap;
 
 use kube::CustomResource;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
 use serde::{Deserialize, Serialize};
 
-type GenericMap = serde_json::Value;
+use crate::resources::LabelMap;
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[serde(transparent)]
+pub struct GenericMap(pub serde_json::Value);
+
+impl JsonSchema for GenericMap {
+    fn schema_name() -> String {
+        "GenericMap".to_string()
+    }
+
+    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
+        use schemars::schema::InstanceType;
+        use schemars::schema::SchemaObject;
+        use serde_json::json;
+
+        let schema_obj = SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            ..Default::default()
+        };
+
+        // Inject the Kubernetes extension
+        let mut raw = serde_json::to_value(&schema_obj).unwrap();
+        let obj = raw.as_object_mut().unwrap();
+        obj.insert(
+            "x-kubernetes-preserve-unknown-fields".to_string(),
+            json!(true),
+        );
+
+        serde_json::from_value(raw).unwrap()
+    }
+}
 
 #[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 #[kube(
@@ -13,6 +44,10 @@ type GenericMap = serde_json::Value;
     kind = "PlaybookPlan",
     namespaced
 )]
+#[kube(printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.triggers.schedule"}"#)]
+#[kube(printcolumn = r#"{"name":"Hosts","type":"number","jsonPath":".status.eligibleHostsCount"}"#)]
+#[kube(printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#)]
+#[kube(printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#)]
 #[kube(status = "PlaybookPlanStatus")]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanSpec {
@@ -56,26 +91,40 @@ pub enum Hosts {
         #[serde(rename = "fromNodes")]
         from_nodes: NodeSelectorTerm,
     },
+    FromStaticList {
+        #[serde(rename = "fromList")]
+        from_list: Vec<String>,
+    },
 }
 
 impl Default for Hosts {
     fn default() -> Self {
         Self::FromClusterNodes {
-            from_nodes: NodeSelectorTerm {
-                match_labels: BTreeMap::new(),
-            },
+            from_nodes: NodeSelectorTerm::default(),
         }
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct NodeSelectorTerm {
-    pub match_labels: BTreeMap<String, String>,
+#[serde(untagged)]
+pub enum NodeSelectorTerm {
+    MatchLabels {
+        #[serde(rename = "matchLabels")]
+        labels: LabelMap,
+    },
+}
+
+impl Default for NodeSelectorTerm {
+    fn default() -> Self {
+        Self::MatchLabels {
+            labels: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(tag = "type")]
+#[serde(untagged)]
 #[serde(rename_all = "camelCase")]
 pub enum ExecutionStrategy {
     Ssh { ssh: SshConfig },
@@ -120,6 +169,16 @@ pub struct Template {
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
+    pub eligible_hosts_count: Option<usize>,
+    pub phase: Option<Phase>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum Phase {
+    #[default]
+    Waiting,
+    Running,
 }
 
 #[test]
@@ -136,8 +195,8 @@ fn test_schema() {
                 Inventory {
                     name: "controlplane".into(),
                     hosts: Hosts::FromClusterNodes {
-                        from_nodes: NodeSelectorTerm {
-                            match_labels: {
+                        from_nodes: NodeSelectorTerm::MatchLabels {
+                            labels: {
                                 let mut labels = BTreeMap::new();
                                 labels.insert(
                                     "node.kubernetes.io/role".into(),
@@ -151,8 +210,8 @@ fn test_schema() {
                 Inventory {
                     name: "workers".into(),
                     hosts: Hosts::FromClusterNodes {
-                        from_nodes: NodeSelectorTerm {
-                            match_labels: {
+                        from_nodes: NodeSelectorTerm::MatchLabels {
+                            labels: {
                                 let mut labels = BTreeMap::new();
                                 labels.insert("node.kubernetes.io/role".into(), "worker".into());
                                 labels

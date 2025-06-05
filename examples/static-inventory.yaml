@@ -2,31 +2,26 @@
 apiVersion: ansible.cloudbending.dev/v1alpha1
 kind: PlaybookPlan
 metadata:
-  name: blubb
+  name: ccu-example
 spec:
   # An OCI image with Ansible and all required collections
   image: docker.io/serversideup/ansible-core:2.18
   # Controls when a playbook is executed
   triggers:
     # The playbook will run immediately after the resource is created or updated ...
-    immediate: false
-    # ... and daily at 1 AM
-    schedule: "0 1 * * *"
+    immediate: true
   # These host groups will be available in our playbook
   inventory:
-    - name: linux
+    - name: ccu
       hosts:
-        fromNodes:
-          matchLabels:
-            kubernetes.io/os: linux
-    - name: controlplane
-      hosts:
-        fromNodes:
-          matchLabels:
-            node-role.kubernetes.io/control-plane: "true"
+        fromList:
+          - ccu.fritz.box
   # Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
   executionStrategy:
-    chroot:
+    ssh:
+      user: root
+      secretRef:
+        name: sshkey-ccu.fritz.box
   # These will usually be populated via Helm
   variables:
     inline:
