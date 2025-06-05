@@ -1,0 +1,28 @@
+# code: language=yaml
+apiVersion: ansible.cloudbending.dev/v1alpha1
+kind: Inventory
+metadata:
+  name: digital-signage
+spec:
+  groups:
+    - name: controlplane
+      hosts:
+        - fromNodes:
+            matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values: [homelab-control-0]
+      variables: {}
+    - name: linux
+      hosts:
+        - fromNodes:
+            matchExpressions:
+              - key: kubernetes.io/os
+                operator: In
+                values: [linux]
+      variables: {}
+# status:
+#   resolvedGroups:
+#     - name: digital-signage
+#       hosts:
+#         - homelab-worker-0

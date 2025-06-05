@@ -1,0 +1,70 @@
+# code: language=yaml
+apiVersion: ansible.cloudbending.dev/v1alpha1
+kind: PlaybookPlan
+metadata:
+  name: blubb
+spec:
+  # An OCI image with Ansible and all required collections
+  image: registry.tld/ansible:1.0.0
+  # Controls when a playbook is executed
+  triggers:
+    # The playbook will run immediately after the resource is created or updated ...
+    immediate: false
+    # ... and daily at 1 AM
+    schedule: "0 1 * * *"
+  # These host groups will be available in our playbook
+  inventory:
+    - name: controlplane
+      hosts:
+        fromNodes:
+          matchLabels:
+            node.kubernetes.io/role: controlplane
+    - name: workers
+      hosts:
+        fromNodes:
+          matchLabels:
+            node.kubernetes.io/role: worker
+  # Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
+  executionStrategy:
+    type: ssh # 'chroot' or 'ssh'
+    ssh:
+      user: root
+      secretRef:
+        name: ansible-ssh
+  # These will usually be populated via Helm
+  variables:
+    inline:
+      # Variables will be available in Ansible
+      ttyTimeout:
+        present: true
+  # The playbook will be built from this, some fields will be set automatically (vars, hosts)
+  templates:
+    - hosts: mo-clients
+      tasks:
+        - name: Ensure script for setting timeout for inactive TTY users is present
+          when: "ttyTimeout.present"
+          ansible.builtin.copy:
+            src: set-tty-timeout.sh
+            dest: /etc/profile.d/set-tty-timeout.sh
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Ensure script for setting timeout for inactive TTY users is absent
+          when: "not ttyTimeout.present"
+          ansible.builtin.file:
+            state: absent
+          path: /etc/profile.d/set-tty-timeout.sh
+status:
+  conditions:
+    - lastTransitionTime: 2025-06-04T22:24:00+02:00
+      type: LastExecutionSuccessful
+      status: "False"
+      reason: Pending
+      message: Playbook has not been run yet
+  eligibleHosts:
+    controlplane:
+      - homelab-control-0
+    workers:
+      - homelab-worker-0
+      - homelab-worker-1
