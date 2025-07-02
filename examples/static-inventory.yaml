@@ -30,22 +30,16 @@ spec:
         present: true
   # The playbook will be built from this, some fields will be set automatically (vars, hosts)
   templates:
-    - hosts: mo-clients
-      tasks:
-        - name: Ensure script for setting timeout for inactive TTY users is present
-          when: "ttyTimeout.present"
+    - hosts: all
+      tasks: |
+        - name: Copy certificate
           ansible.builtin.copy:
-            src: set-tty-timeout.sh
-            dest: /etc/profile.d/set-tty-timeout.sh
+            src: tls.crt
+            dest: /etc/somewhere/tls.crt
             owner: root
             group: root
-            mode: "0644"
+            mode: "0640"
 
-        - name: Ensure script for setting timeout for inactive TTY users is absent
-          when: "not ttyTimeout.present"
-          ansible.builtin.file:
-            state: absent
-          path: /etc/profile.d/set-tty-timeout.sh
 # status:
 # conditions:
 #   - lastTransitionTime: 2025-06-04T22:24:00+02:00

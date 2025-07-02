@@ -9,9 +9,11 @@ use tracing_subscriber::{fmt, layer::SubscriberExt as _};
 
 use crate::resources::playbookplan::PlaybookPlan;
 
+mod ansible;
 mod controllers;
 mod nodeselector;
 mod resources;
+mod utils;
 
 #[tokio::main]
 async fn main() {

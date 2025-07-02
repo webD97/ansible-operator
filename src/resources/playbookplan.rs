@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
 use serde::{Deserialize, Serialize};
@@ -160,9 +161,10 @@ pub struct Variables {
 #[serde(rename_all = "camelCase")]
 pub struct Template {
     pub hosts: String,
-    pub tasks: Vec<GenericMap>,
-    pub pre_tasks: Option<Vec<GenericMap>>,
-    pub post_tasks: Option<Vec<GenericMap>>,
+    pub handlers: Option<String>,
+    pub tasks: String,
+    pub pre_tasks: Option<String>,
+    pub post_tasks: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -170,7 +172,8 @@ pub struct Template {
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
     pub eligible_hosts_count: Option<usize>,
-    pub phase: Option<Phase>,
+    pub phase: Phase,
+    pub last_rendered_generation: Option<i64>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -233,17 +236,14 @@ fn test_schema() {
                 hosts: "all".into(),
                 pre_tasks: None,
                 post_tasks: None,
-                tasks: vec![
-                    serde_yaml::from_str(
-                        r#"
-name: Ensure httpd installed
-ansible.builtin.dnf:
-  name: httpd
-  state: installed
-"#,
-                    )
-                    .unwrap(),
-                ],
+                handlers: None,
+                tasks: r#"
+- name: Ensure httpd installed
+  ansible.builtin.dnf:
+    name: httpd
+    state: installed
+"#
+                .into(),
             }],
         },
     );

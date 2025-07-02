@@ -1,16 +1,21 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures_util::Stream;
-use k8s_openapi::api::core::v1::Node;
+use k8s_openapi::{
+    api::core::v1::{Node, Secret},
+    apimachinery::pkg::apis::meta::v1::OwnerReference,
+};
 use kube::{
     api::{ListParams, PostParams},
     runtime::{Controller, controller::Action, reflector::Lookup as _},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
+    ansible,
     nodeselector::node_matches,
-    resources::playbookplan::{Hosts, Phase, PlaybookPlan, PlaybookPlanStatus},
+    resources::playbookplan::{Hosts, PlaybookPlan, PlaybookPlanStatus},
+    utils::create_or_update,
 };
 
 struct Context {
@@ -62,43 +67,63 @@ async fn reconcile(
         &object.metadata.namespace.clone().unwrap(),
     );
 
-    // Setup initial status and requeue
-    if object.status.is_none() {
-        info!("Populating initial status");
-        setup_initial_status(&object, &playbookplan_api).await?;
-        return Ok(Action::requeue(Duration::ZERO));
-    }
+    let namespace = object.namespace().expect("expected a namespace");
+    let name = object.name().expect("expected a name");
+    let uid = object.uid().expect("expected a uid");
+    let generation = object.metadata.generation.expect("expected generation");
+
+    let mut resource_status = object.status.clone().unwrap_or_default();
 
     // Resolve groups
     info!("Resolving groups");
-    let resolved_inventories = resolve_inventories(context, &object).await?;
-    let mut patch_object = playbookplan_api.get_status(&object.name().unwrap()).await?;
+    let resolved_inventories = resolve_inventories(&context, &object).await?;
 
-    if let Some(ref mut status) = patch_object.status {
-        status.eligible_hosts_count = Some(
-            resolved_inventories
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<std::collections::HashSet<String>>()
-                .len(),
-        );
-        status.eligible_hosts = Some(resolved_inventories);
+    resource_status.eligible_hosts_count = Some(
+        resolved_inventories
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<std::collections::HashSet<String>>()
+            .len(),
+    );
+    resource_status.eligible_hosts = Some(resolved_inventories);
+
+    // Render playbook if necessary
+    if let Some(status) = &object.status
+        && status.last_rendered_generation.unwrap_or_default() < generation
+    {
+        info!("Rendering playbook to secret");
+        match ansible::render_playbook(&object.spec) {
+            Ok(rendered_playbook) => {
+                let secret = create_secret_for_playbook(&namespace, &name, &uid, rendered_playbook);
+
+                let secrets_api =
+                    kube::Api::<Secret>::namespaced(context.client.clone(), &namespace);
+
+                create_or_update(
+                    secrets_api,
+                    "ansible-operator",
+                    &name,
+                    secret,
+                    |desired, actual| {
+                        actual.data = desired.data;
+                    },
+                )
+                .await?;
+
+                resource_status.last_rendered_generation = Some(generation);
+            }
+            Err(e) => warn!("Failed to render playbook: {e}"),
+        }
     }
 
-    playbookplan_api
-        .replace_status(
-            object.metadata.name.as_ref().unwrap(),
-            &PostParams::default(),
-            serde_json::to_vec(&patch_object).unwrap(),
-        )
-        .await?;
+    persist_status(&playbookplan_api, &object, resource_status).await?;
 
     Ok(Action::requeue(Duration::from_secs(3600)))
 }
 
 async fn resolve_inventories(
-    context: Arc<Context>,
+    context: &Context,
     object: &PlaybookPlan,
 ) -> Result<BTreeMap<String, Vec<String>>, kube::Error> {
     let inventories_spec = &object.spec.inventory;
@@ -106,7 +131,7 @@ async fn resolve_inventories(
     let mut resolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for inventory in inventories_spec {
-        let resolved_hosts = resolve_hosts(&inventory.hosts, Arc::clone(&context)).await?;
+        let resolved_hosts = resolve_hosts(&inventory.hosts, context).await?;
         resolved.insert(inventory.name.clone(), resolved_hosts);
     }
 
@@ -115,7 +140,7 @@ async fn resolve_inventories(
 
 async fn resolve_hosts(
     hosts_source: &Hosts,
-    context: Arc<Context>,
+    context: &Context,
 ) -> Result<Vec<String>, kube::Error> {
     let nodes_api: kube::Api<Node> = kube::Api::all(context.client.clone());
     let nodes = nodes_api.list(&ListParams::default()).await?;
@@ -133,25 +158,47 @@ async fn resolve_hosts(
     Ok(hosts)
 }
 
-async fn setup_initial_status(
-    object: &PlaybookPlan,
+async fn persist_status(
     api: &kube::Api<PlaybookPlan>,
+    object: &PlaybookPlan,
+    status: PlaybookPlanStatus,
 ) -> Result<(), kube::Error> {
-    let mut patch_object = api.get_status(&object.name().unwrap()).await?;
-
-    let initial_status = PlaybookPlanStatus {
-        phase: Some(Phase::Waiting),
-        ..Default::default()
-    };
-
-    patch_object.status = Some(initial_status);
+    let mut patch_object = object.clone();
+    patch_object.status = Some(status);
 
     api.replace_status(
-        object.metadata.name.as_ref().unwrap(),
+        &object.name().expect("expected a name"),
         &PostParams::default(),
         serde_json::to_vec(&patch_object).unwrap(),
     )
     .await?;
 
     Ok(())
+}
+
+fn create_secret_for_playbook(
+    pb_namespace: &str,
+    pb_name: &str,
+    pb_uid: &str,
+    playbook: String,
+) -> Secret {
+    let mut secret = Secret::default();
+
+    secret.metadata.namespace = Some(pb_namespace.into());
+    secret.metadata.name = Some(pb_name.into());
+
+    secret.metadata.owner_references = Some(vec![OwnerReference {
+        api_version: PlaybookPlan::api_version(&()).into(),
+        kind: PlaybookPlan::kind(&()).into(),
+        name: pb_name.into(),
+        uid: pb_uid.into(),
+        ..Default::default()
+    }]);
+
+    let mut string_data = BTreeMap::new();
+    string_data.insert("playbook.yml".into(), playbook);
+
+    secret.string_data = Some(string_data);
+
+    secret
 }

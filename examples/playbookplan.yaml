@@ -36,7 +36,7 @@ spec:
   # The playbook will be built from this, some fields will be set automatically (vars, hosts)
   templates:
     - hosts: mo-clients
-      tasks:
+      tasks: |
         - name: Ensure script for setting timeout for inactive TTY users is present
           when: "ttyTimeout.present"
           ansible.builtin.copy:
@@ -51,6 +51,7 @@ spec:
           ansible.builtin.file:
             state: absent
           path: /etc/profile.d/set-tty-timeout.sh
+
 # status:
 # conditions:
 #   - lastTransitionTime: 2025-06-04T22:24:00+02:00
