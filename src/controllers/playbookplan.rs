@@ -113,14 +113,6 @@ async fn reconcile(
             }
         };
 
-        let rendered_inventory = match ansible::render_inventory(&resolved_inventories) {
-            Ok(rendered_inventory) => rendered_inventory,
-            Err(e) => {
-                warn!("Failed to render inventory: {e}");
-                "".into()
-            }
-        };
-
         let rendered_variables = match &object.spec.variables {
             Some(variables) => serde_yaml::to_string(&variables.inline).unwrap(),
             None => "".into(),
@@ -131,7 +123,6 @@ async fn reconcile(
             &name,
             &uid,
             rendered_playbook,
-            rendered_inventory,
             rendered_variables,
         );
 
@@ -239,7 +230,6 @@ fn create_secret_for_playbook(
     pb_name: &str,
     pb_uid: &str,
     playbook: String,
-    inventory: String,
     variables: String,
 ) -> Secret {
     let mut secret = Secret::default();
@@ -257,7 +247,6 @@ fn create_secret_for_playbook(
 
     let mut string_data = BTreeMap::new();
     string_data.insert("playbook.yml".into(), playbook);
-    string_data.insert("inventory.yml".into(), inventory);
     string_data.insert("variables.yml".into(), variables);
 
     secret.string_data = Some(string_data);
