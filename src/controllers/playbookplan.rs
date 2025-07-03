@@ -2,7 +2,13 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use futures_util::Stream;
 use k8s_openapi::{
-    api::core::v1::{Node, Secret},
+    api::{
+        batch::v1::{Job, JobSpec},
+        core::v1::{
+            Container, Node, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Volume,
+            VolumeMount,
+        },
+    },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
@@ -14,7 +20,7 @@ use tracing::{info, warn};
 use crate::{
     ansible,
     nodeselector::node_matches,
-    resources::playbookplan::{Hosts, PlaybookPlan, PlaybookPlanStatus},
+    resources::playbookplan::{ExecutionStrategy, Hosts, PlaybookPlan, PlaybookPlanStatus},
     utils::create_or_update,
 };
 
@@ -86,34 +92,86 @@ async fn reconcile(
             .collect::<std::collections::HashSet<String>>()
             .len(),
     );
-    resource_status.eligible_hosts = Some(resolved_inventories);
+    resource_status.eligible_hosts = Some(resolved_inventories.clone());
+
+    let secrets_api = kube::Api::<Secret>::namespaced(context.client.clone(), &namespace);
+
+    let rendered_playbook_outdated = if let Some(status) = &object.status {
+        status.last_rendered_generation.unwrap_or_default() < generation
+    } else {
+        true
+    };
 
     // Render playbook if necessary
-    if let Some(status) = &object.status
-        && status.last_rendered_generation.unwrap_or_default() < generation
-    {
+    if secrets_api.get_opt(&name).await?.is_none() || rendered_playbook_outdated {
         info!("Rendering playbook to secret");
-        match ansible::render_playbook(&object.spec) {
-            Ok(rendered_playbook) => {
-                let secret = create_secret_for_playbook(&namespace, &name, &uid, rendered_playbook);
-
-                let secrets_api =
-                    kube::Api::<Secret>::namespaced(context.client.clone(), &namespace);
-
-                create_or_update(
-                    secrets_api,
-                    "ansible-operator",
-                    &name,
-                    secret,
-                    |desired, actual| {
-                        actual.data = desired.data;
-                    },
-                )
-                .await?;
-
-                resource_status.last_rendered_generation = Some(generation);
+        let rendered_playbook = match ansible::render_playbook(&object.spec) {
+            Ok(rendered_playbook) => rendered_playbook,
+            Err(e) => {
+                warn!("Failed to render playbook: {e}");
+                "".into()
             }
-            Err(e) => warn!("Failed to render playbook: {e}"),
+        };
+
+        let rendered_inventory = match ansible::render_inventory(&resolved_inventories) {
+            Ok(rendered_inventory) => rendered_inventory,
+            Err(e) => {
+                warn!("Failed to render inventory: {e}");
+                "".into()
+            }
+        };
+
+        let rendered_variables = match &object.spec.variables {
+            Some(variables) => serde_yaml::to_string(&variables.inline).unwrap(),
+            None => "".into(),
+        };
+
+        let secret = create_secret_for_playbook(
+            &namespace,
+            &name,
+            &uid,
+            rendered_playbook,
+            rendered_inventory,
+            rendered_variables,
+        );
+
+        create_or_update(
+            secrets_api,
+            "ansible-operator",
+            &name,
+            secret,
+            |desired, actual| {
+                actual.metadata.managed_fields = None;
+                actual.data = desired.data;
+                actual.string_data = desired.string_data;
+            },
+        )
+        .await?;
+
+        resource_status.last_rendered_generation = Some(generation);
+    }
+
+    // Create jobs
+    if let Some(immediate) = object.spec.triggers.immediate
+        && immediate
+    {
+        let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
+
+        for (_, hosts) in resolved_inventories.iter() {
+            for host in hosts {
+                let job = create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object);
+
+                jobs_api
+                    .create(
+                        &PostParams {
+                            field_manager: Some("ansible-operator".into()),
+                            ..Default::default()
+                        },
+                        &job,
+                    )
+                    .await
+                    .unwrap();
+            }
         }
     }
 
@@ -181,6 +239,8 @@ fn create_secret_for_playbook(
     pb_name: &str,
     pb_uid: &str,
     playbook: String,
+    inventory: String,
+    variables: String,
 ) -> Secret {
     let mut secret = Secret::default();
 
@@ -197,8 +257,108 @@ fn create_secret_for_playbook(
 
     let mut string_data = BTreeMap::new();
     string_data.insert("playbook.yml".into(), playbook);
+    string_data.insert("inventory.yml".into(), inventory);
+    string_data.insert("variables.yml".into(), variables);
 
     secret.string_data = Some(string_data);
 
     secret
+}
+
+fn create_job_for_ssh_playbook(
+    pb_namespace: &str,
+    pb_name: &str,
+    host: &str,
+    pb_uid: &str,
+    plan: &PlaybookPlan,
+) -> Job {
+    let mut job = Job::default();
+    job.metadata.namespace = Some(pb_namespace.into());
+    job.metadata.name = Some(format!("apply-{pb_name}-on-{host}"));
+
+    job.metadata.owner_references = Some(vec![OwnerReference {
+        api_version: PlaybookPlan::api_version(&()).into(),
+        kind: PlaybookPlan::kind(&()).into(),
+        name: pb_name.into(),
+        uid: pb_uid.into(),
+        ..Default::default()
+    }]);
+
+    let mut ansible_command = vec![
+        "ansible-playbook".into(),
+        "--extra-vars".into(),
+        "@/run/ansible-operator/variables.yml".into(),
+    ];
+
+    let connection_args = match &plan.spec.execution_strategy {
+        ExecutionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
+        ExecutionStrategy::Ssh { ssh } => vec![
+            "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
+            "--private-key".into(),
+            "/ssh/id_rsa".into(),
+            "--user".into(),
+            ssh.user.clone(),
+            "-i".into(),
+            format!("{host},"),
+        ],
+    };
+
+    ansible_command.extend(connection_args);
+    ansible_command.push("playbook.yml".into());
+
+    let pod_template = PodTemplateSpec {
+        metadata: None,
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".into()),
+            volumes: Some(vec![
+                Volume {
+                    name: "playbook".into(),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some(pb_name.into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Volume {
+                    name: "ssh".into(),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some("ssh".into()),
+                        default_mode: Some(0o0400),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ]),
+            containers: vec![Container {
+                name: "ansible-playbook".into(),
+                image: Some(plan.spec.image.clone()),
+                working_dir: Some("/run/ansible-operator".into()),
+                volume_mounts: Some(vec![
+                    VolumeMount {
+                        name: "playbook".into(),
+                        mount_path: "/run/ansible-operator".into(),
+                        ..Default::default()
+                    },
+                    VolumeMount {
+                        name: "ssh".into(),
+                        mount_path: "/ssh".into(),
+                        ..Default::default()
+                    },
+                ]),
+                command: Some(ansible_command),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    };
+
+    let job_spec = JobSpec {
+        backoff_limit: Some(0),
+        template: pod_template,
+        ..Default::default()
+    };
+
+    job.spec = Some(job_spec);
+
+    job
 }

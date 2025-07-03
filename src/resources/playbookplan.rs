@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
 use serde::{Deserialize, Serialize};
@@ -250,5 +249,5 @@ fn test_schema() {
 
     let serialized = serde_yaml::to_string(&playbookplan).unwrap();
 
-    println!("{}", serialized);
+    println!("{serialized}");
 }

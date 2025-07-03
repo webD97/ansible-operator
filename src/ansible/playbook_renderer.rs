@@ -2,7 +2,7 @@ use serde_yaml::{Mapping, Value};
 
 use crate::resources::playbookplan::PlaybookPlanSpec;
 
-pub fn render_playbook(spec: &PlaybookPlanSpec) -> Result<String, RenderError> {
+pub fn render_playbook(spec: &PlaybookPlanSpec) -> Result<String, super::RenderError> {
     let mut playbook = Vec::new();
 
     for play_spec in &spec.templates {
@@ -43,38 +43,4 @@ pub fn render_playbook(spec: &PlaybookPlanSpec) -> Result<String, RenderError> {
     }
 
     Ok(serde_yaml::to_string(&playbook)?)
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum RenderError {
-    #[error(transparent)]
-    SerializationError(#[from] serde_yaml::Error),
-}
-
-#[cfg(test)]
-mod test {
-    use crate::{
-        ansible::playbook_renderer::render_playbook,
-        resources::playbookplan::{PlaybookPlanSpec, Template},
-    };
-
-    #[test]
-    pub fn test_render_playbook() {
-        let spec = &PlaybookPlanSpec {
-            templates: vec![Template {
-                hosts: "all".into(),
-                tasks: r#"
-- name: Ensure httpd installed
-  ansible.builtin.dnf:
-    name: httpd
-    state: installed
-"#
-                .into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        println!("{}", render_playbook(spec).unwrap());
-    }
 }
