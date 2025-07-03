@@ -1,46 +1,17 @@
-use serde_yaml::{Mapping, Value};
+use serde_yaml::{Mapping, Sequence, Value};
 
 use crate::resources::playbookplan::PlaybookPlanSpec;
 
 pub fn render_playbook(spec: &PlaybookPlanSpec) -> Result<String, super::RenderError> {
-    let mut playbook = Vec::new();
+    let mut plays: Sequence = serde_yaml::from_str(&spec.template)?;
 
-    for play_spec in &spec.templates {
-        let mut play = Mapping::new();
-
-        play.insert(
-            Value::String("hosts".into()),
-            Value::String(play_spec.hosts.clone()),
-        );
-
-        if let Some(handlers) = &play_spec.handlers.clone() {
-            play.insert(
-                Value::String("handlers".into()),
-                serde_yaml::from_str(handlers)?,
-            );
-        }
-
-        if let Some(pre_tasks) = &play_spec.pre_tasks.clone() {
-            play.insert(
-                Value::String("pre_tasks".into()),
-                serde_yaml::from_str(pre_tasks)?,
-            );
-        }
-
-        play.insert(
-            Value::String("tasks".into()),
-            serde_yaml::from_str(&play_spec.tasks.clone())?,
-        );
-
-        if let Some(post_tasks) = &play_spec.post_tasks.clone() {
-            play.insert(
-                Value::String("post_tasks".into()),
-                serde_yaml::from_str(post_tasks)?,
-            );
-        }
-
-        playbook.push(play);
+    for play in &mut plays {
+        configure_ansible_play(play.as_mapping_mut().expect("expected a yaml map"));
     }
 
-    Ok(serde_yaml::to_string(&playbook)?)
+    Ok(serde_yaml::to_string(&plays)?)
+}
+
+fn configure_ansible_play(play: &mut Mapping) {
+    play.insert(Value::String("hosts".into()), Value::String("all".into()));
 }

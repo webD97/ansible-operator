@@ -29,9 +29,10 @@ spec:
       k3s_version: v1.33.1+k3s1
       k3s_checksum: sha256:0f53a0ee29c837713472e5fb0a13b5841f9dca76d029b26138364b9efbac66b1
   # The playbook will be built from this, some fields will be set automatically (vars, hosts)
-  templates:
+  template: |
     - hosts: all
-      handlers: |
+
+      handlers:
         - name: Restart_k3s
           become: true
           ansible.builtin.systemd:
@@ -42,7 +43,8 @@ spec:
           become: true
           ansible.builtin.command:
             cmd: restorecon /usr/local/bin/k3s
-      tasks: |
+
+      tasks:
         - name: Ensure k3s {{ k3s_version }} installed
           become: true
           notify: [Restart_k3s, Restorecon_k3s]

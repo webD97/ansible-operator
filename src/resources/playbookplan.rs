@@ -67,7 +67,7 @@ pub struct PlaybookPlanSpec {
     pub variables: Option<Variables>,
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
-    pub templates: Vec<Template>,
+    pub template: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -158,16 +158,6 @@ pub struct Variables {
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Template {
-    pub hosts: String,
-    pub handlers: Option<String>,
-    pub tasks: String,
-    pub pre_tasks: Option<String>,
-    pub post_tasks: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
     pub eligible_hosts_count: Option<usize>,
@@ -231,19 +221,14 @@ fn test_schema() {
                 },
             },
             variables: None,
-            templates: vec![Template {
-                hosts: "all".into(),
-                pre_tasks: None,
-                post_tasks: None,
-                handlers: None,
-                tasks: r#"
-- name: Ensure httpd installed
-  ansible.builtin.dnf:
-    name: httpd
-    state: installed
-"#
-                .into(),
-            }],
+            template: r#"
+- tasks:
+    - name: Ensure httpd installed
+        ansible.builtin.dnf:
+            name: httpd
+            state: installed
+            "#
+            .into(),
         },
     );
 
