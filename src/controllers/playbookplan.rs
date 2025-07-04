@@ -162,12 +162,13 @@ async fn reconcile(
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
                 let job = create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object);
+                let job_name = job.name().expect("expected rendered job to contain a name");
 
-                if jobs_api.get_opt(&name).await?.is_some() {
+                if jobs_api.get_opt(&job_name).await?.is_some() {
                     continue;
                 }
 
-                info!("Creating job");
+                info!("Creating job {job_name}");
                 jobs_api
                     .create(
                         &PostParams {
@@ -277,9 +278,14 @@ fn create_job_for_ssh_playbook(
     pb_uid: &str,
     plan: &PlaybookPlan,
 ) -> Job {
+    let generation = plan
+        .metadata
+        .generation
+        .expect("expected PlaybookPlan to have a generation");
+
     let mut job = Job::default();
     job.metadata.namespace = Some(pb_namespace.into());
-    job.metadata.name = Some(format!("apply-{pb_name}-on-{host}"));
+    job.metadata.name = Some(format!("apply-{pb_name}-{generation}-on-{host}"));
 
     job.metadata.owner_references = Some(vec![OwnerReference {
         api_version: PlaybookPlan::api_version(&()).into(),
