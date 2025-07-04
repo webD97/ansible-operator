@@ -131,10 +131,21 @@ async fn reconcile(
             "ansible-operator",
             &name,
             secret,
-            |desired, actual| {
-                actual.metadata.managed_fields = None;
-                actual.data = desired.data;
-                actual.string_data = desired.string_data;
+            |existing, desired_state| {
+                desired_state.metadata.managed_fields = None;
+
+                // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
+                desired_state.data = {
+                    let desired_data = desired_state.string_data.clone().unwrap_or_default();
+
+                    existing.data.map(|d| {
+                        BTreeMap::from_iter(
+                            d.iter()
+                                .filter(|(key, _)| !desired_data.contains_key(*key))
+                                .map(|(key, value)| (key.clone(), value.clone())),
+                        )
+                    })
+                };
             },
         )
         .await?;
@@ -152,6 +163,11 @@ async fn reconcile(
             for host in hosts {
                 let job = create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object);
 
+                if jobs_api.get_opt(&name).await?.is_some() {
+                    continue;
+                }
+
+                info!("Creating job");
                 jobs_api
                     .create(
                         &PostParams {
@@ -273,28 +289,6 @@ fn create_job_for_ssh_playbook(
         ..Default::default()
     }]);
 
-    let mut ansible_command = vec![
-        "ansible-playbook".into(),
-        "--extra-vars".into(),
-        "@/run/ansible-operator/variables.yml".into(),
-    ];
-
-    let connection_args = match &plan.spec.execution_strategy {
-        ExecutionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
-        ExecutionStrategy::Ssh { ssh } => vec![
-            "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
-            "--private-key".into(),
-            "/ssh/id_rsa".into(),
-            "--user".into(),
-            ssh.user.clone(),
-            "-i".into(),
-            format!("{host},"),
-        ],
-    };
-
-    ansible_command.extend(connection_args);
-    ansible_command.push("playbook.yml".into());
-
     let pod_template = PodTemplateSpec {
         metadata: None,
         spec: Some(PodSpec {
@@ -334,7 +328,7 @@ fn create_job_for_ssh_playbook(
                         ..Default::default()
                     },
                 ]),
-                command: Some(ansible_command),
+                command: Some(render_ansible_command(plan, host)),
                 ..Default::default()
             }],
             ..Default::default()
@@ -350,4 +344,30 @@ fn create_job_for_ssh_playbook(
     job.spec = Some(job_spec);
 
     job
+}
+
+fn render_ansible_command(plan: &PlaybookPlan, hostname: &str) -> Vec<String> {
+    let mut ansible_command = vec![
+        "ansible-playbook".into(),
+        "--extra-vars".into(),
+        "@/run/ansible-operator/variables.yml".into(),
+    ];
+
+    let connection_args = match &plan.spec.execution_strategy {
+        ExecutionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
+        ExecutionStrategy::Ssh { ssh } => vec![
+            "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
+            "--private-key".into(),
+            "/ssh/id_rsa".into(),
+            "--user".into(),
+            ssh.user.clone(),
+            "-i".into(),
+            format!("{hostname},"),
+        ],
+    };
+
+    ansible_command.extend(connection_args);
+    ansible_command.push("playbook.yml".into());
+
+    ansible_command
 }

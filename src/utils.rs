@@ -14,7 +14,7 @@ where
     K: DeserializeOwned + Serialize + Clone + Debug,
 {
     if let Some(existing_resource) = api.get_opt(resource_name).await? {
-        let mut updated_resource = existing_resource.clone();
+        let mut updated_resource = resource.clone();
         mutate_fn(existing_resource, &mut updated_resource);
 
         api.patch(
