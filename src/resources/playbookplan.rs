@@ -171,6 +171,8 @@ pub enum Phase {
     #[default]
     Waiting,
     Running,
+    Succeeded,
+    Failed,
 }
 
 #[test]

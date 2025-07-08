@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::{
     ansible,
     nodeselector::node_matches,
-    resources::playbookplan::{ExecutionStrategy, Hosts, PlaybookPlan, PlaybookPlanStatus},
+    resources::playbookplan::{ExecutionStrategy, Hosts, Phase, PlaybookPlan, PlaybookPlanStatus},
     utils::create_or_update,
 };
 
@@ -199,12 +199,12 @@ async fn reconcile(
         resource_status.last_rendered_generation = Some(generation);
     }
 
+    let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
+
     // Create jobs
     if let Some(immediate) = object.spec.triggers.immediate
         && immediate
     {
-        let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
-
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
                 let job = create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object);
@@ -223,9 +223,60 @@ async fn reconcile(
                         },
                         &job,
                     )
-                    .await
-                    .unwrap();
+                    .await?;
             }
+        }
+    }
+
+    // Read managed jobs and populate status
+    let jobs = jobs_api
+        .list(
+            &ListParams::default().labels(
+                format!(
+                    "ansible.cloudbending.dev/playbookplan={}",
+                    format_job_prefix(&name, generation)
+                )
+                .as_str(),
+            ),
+        )
+        .await?;
+
+    let any_running = jobs.iter().any(|job| {
+        job.status
+            .as_ref()
+            .and_then(|status| status.completion_time.as_ref())
+            .is_none()
+    });
+
+    let all_completed = jobs.iter().all(|job| {
+        job.status
+            .as_ref()
+            .and_then(|status| status.completion_time.as_ref())
+            .is_some()
+    });
+
+    let num_successful = jobs
+        .iter()
+        .filter(|job| {
+            job.status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .map(|conditions| {
+                    conditions.iter().any(|condition| {
+                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .count();
+
+    if any_running {
+        resource_status.phase = Phase::Running;
+    } else if all_completed {
+        if num_successful == jobs.iter().count() {
+            resource_status.phase = Phase::Succeeded;
+        } else {
+            resource_status.phase = Phase::Failed;
         }
     }
 
@@ -321,6 +372,10 @@ fn create_secret_for_playbook(
     secret
 }
 
+fn format_job_prefix(playbookplan_name: &str, generation: i64) -> String {
+    format!("apply-{playbookplan_name}-{generation}")
+}
+
 fn create_job_for_ssh_playbook(
     pb_namespace: &str,
     pb_name: &str,
@@ -333,9 +388,10 @@ fn create_job_for_ssh_playbook(
         .generation
         .expect("expected PlaybookPlan to have a generation");
 
+    let job_prefix = format_job_prefix(pb_name, generation);
     let mut job = Job::default();
     job.metadata.namespace = Some(pb_namespace.into());
-    job.metadata.name = Some(format!("apply-{pb_name}-{generation}-on-{host}"));
+    job.metadata.name = Some(format!("{job_prefix}-on-{host}"));
 
     job.metadata.owner_references = Some(vec![OwnerReference {
         api_version: PlaybookPlan::api_version(&()).into(),
@@ -344,6 +400,11 @@ fn create_job_for_ssh_playbook(
         uid: pb_uid.into(),
         ..Default::default()
     }]);
+
+    job.metadata.labels = Some(BTreeMap::from([(
+        "ansible.cloudbending.dev/playbookplan".into(),
+        job_prefix,
+    )]));
 
     let pod_template = PodTemplateSpec {
         metadata: None,
