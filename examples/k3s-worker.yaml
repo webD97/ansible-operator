@@ -26,8 +26,8 @@ spec:
   # These will usually be populated via Helm
   variables:
     inline:
-      k3s_version: v1.33.1+k3s1
-      k3s_checksum: sha256:0f53a0ee29c837713472e5fb0a13b5841f9dca76d029b26138364b9efbac66b1
+      k3s_version: v1.33.2+k3s1
+      k3s_checksum: sha256:a0b8c48bee8588289d2249c3ce2bc58afb273dc7c13057c9b65e56de74c7ceeb
   # The playbook will be built from this, some fields will be set automatically (vars, hosts)
   template: |
     - hosts: all
