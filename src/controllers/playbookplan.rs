@@ -241,20 +241,6 @@ async fn reconcile(
         )
         .await?;
 
-    let any_running = jobs.iter().any(|job| {
-        job.status
-            .as_ref()
-            .and_then(|status| status.completion_time.as_ref())
-            .is_none()
-    });
-
-    let all_completed = jobs.iter().all(|job| {
-        job.status
-            .as_ref()
-            .and_then(|status| status.completion_time.as_ref())
-            .is_some()
-    });
-
     let num_successful = jobs
         .iter()
         .filter(|job| {
@@ -270,14 +256,27 @@ async fn reconcile(
         })
         .count();
 
-    if any_running {
+    let num_failed = jobs
+        .iter()
+        .filter(|job| {
+            job.status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .map(|conditions| {
+                    conditions
+                        .iter()
+                        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
+                })
+                .unwrap_or(false)
+        })
+        .count();
+
+    if num_successful == jobs.iter().count() {
+        resource_status.phase = Phase::Succeeded;
+    } else if num_failed > 0 {
+        resource_status.phase = Phase::Failed;
+    } else {
         resource_status.phase = Phase::Running;
-    } else if all_completed {
-        if num_successful == jobs.iter().count() {
-            resource_status.phase = Phase::Succeeded;
-        } else {
-            resource_status.phase = Phase::Failed;
-        }
     }
 
     persist_status(&playbookplan_api, &object, resource_status).await?;
