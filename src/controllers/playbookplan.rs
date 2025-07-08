@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::{
     api::{
         batch::v1::{Job, JobSpec},
@@ -12,8 +12,14 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
+    Resource,
     api::{ListParams, PostParams},
-    runtime::{Controller, controller::Action, reflector::Lookup as _},
+    runtime::{
+        Controller,
+        controller::Action,
+        reflector::{ObjectRef, store::Writer},
+        watcher,
+    },
 };
 use tracing::{info, warn};
 
@@ -42,13 +48,51 @@ pub fn new(
         client: client.clone(),
     });
 
-    let root_api: kube::Api<PlaybookPlan> = kube::Api::all(client);
+    let playbookplans_api: kube::Api<PlaybookPlan> = kube::Api::all(client.clone());
+    let nodes_api: kube::Api<Node> = kube::Api::all(client.clone());
+    let jobs_api: kube::Api<Job> = kube::Api::all(client);
 
-    Controller::new(root_api, kube::runtime::watcher::Config::default()).run(
-        reconcile,
-        error_policy,
-        Arc::clone(&context),
-    )
+    let playbookplan_reflector_writer = Writer::<PlaybookPlan>::default();
+    let playbookplan_reflector_reader = playbookplan_reflector_writer.as_reader();
+
+    let playbookplan_reflector = kube::runtime::reflector(
+        playbookplan_reflector_writer,
+        watcher(playbookplans_api.clone(), watcher::Config::default()),
+    );
+
+    tokio::spawn(async move {
+        playbookplan_reflector
+            .for_each(|event| async {
+                match event {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Reflector error: {e:?}"),
+                }
+            })
+            .await;
+    });
+
+    Controller::new(playbookplans_api, kube::runtime::watcher::Config::default())
+        // If a managed job updates, trigger PlaybookPlan reconciliation
+        .owns(jobs_api, watcher::Config::default())
+        // If a node updates, trigger reconciliation of all PlaybookPlans with a `fromNodes` inventory
+        .watches(nodes_api, watcher::Config::default(), move |_| {
+            playbookplan_reflector_reader
+                .state()
+                .iter()
+                .filter(|resource| {
+                    resource
+                        .spec
+                        .inventory
+                        .iter()
+                        .any(|inventory| match &inventory.hosts {
+                            Hosts::FromClusterNodes { .. } => true,
+                            Hosts::FromStaticList { .. } => false,
+                        })
+                })
+                .map(|resource| ObjectRef::from(&**resource))
+                .collect::<Vec<_>>()
+        })
+        .run(reconcile, error_policy, Arc::clone(&context))
 }
 
 fn error_policy(
@@ -63,6 +107,8 @@ async fn reconcile(
     object: Arc<PlaybookPlan>,
     context: Arc<Context>,
 ) -> Result<Action, kube::Error> {
+    use kube::runtime::reflector::Lookup as _;
+
     // Check for deletion
     if object.metadata.deletion_timestamp.is_some() {
         return Ok(Action::await_change());
@@ -208,6 +254,8 @@ async fn resolve_hosts(
     hosts_source: &Hosts,
     context: &Context,
 ) -> Result<Vec<String>, kube::Error> {
+    use kube::runtime::reflector::Lookup as _;
+
     let nodes_api: kube::Api<Node> = kube::Api::all(context.client.clone());
     let nodes = nodes_api.list(&ListParams::default()).await?;
 
@@ -229,6 +277,8 @@ async fn persist_status(
     object: &PlaybookPlan,
     status: PlaybookPlanStatus,
 ) -> Result<(), kube::Error> {
+    use kube::runtime::reflector::Lookup as _;
+
     let mut patch_object = object.clone();
     patch_object.status = Some(status);
 
