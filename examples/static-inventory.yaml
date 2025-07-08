@@ -29,9 +29,9 @@ spec:
       ttyTimeout:
         present: true
   # The playbook will be built from this, some fields will be set automatically (vars, hosts)
-  templates:
+  template: |
     - hosts: all
-      tasks: |
+      tasks:
         - name: Copy certificate
           ansible.builtin.copy:
             src: tls.crt
@@ -39,19 +39,3 @@ spec:
             owner: root
             group: root
             mode: "0640"
-
-# status:
-# conditions:
-#   - lastTransitionTime: 2025-06-04T22:24:00+02:00
-#     type: LastExecutionSuccessful
-#     status: "False"
-#     reason: Waiting
-#     message: Playbook is waiting for an execution trigger
-# eligibleHosts:
-#   controlplane:
-#     - homelab-control-0
-#   workers:
-#     - homelab-worker-0
-#     - homelab-worker-1
-# eligibleHostsCount: 3
-# phase: Waiting
