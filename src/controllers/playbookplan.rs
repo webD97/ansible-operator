@@ -29,6 +29,7 @@ use crate::{
     nodeselector::node_matches,
     resources::playbookplan::{
         ExecutionStrategy, Hosts, PlaybookPlan, PlaybookPlanCondition, PlaybookPlanStatus,
+        SshConfig,
     },
     utils::{create_or_update, upsert_condition},
 };
@@ -214,7 +215,13 @@ async fn reconcile(
     if object.spec.triggers.immediate.unwrap_or_default() {
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
-                let job = create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object);
+                let job = match &object.spec.execution_strategy {
+                    ExecutionStrategy::Ssh { ssh } => {
+                        create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object, ssh)
+                    }
+                    ExecutionStrategy::Chroot {} => todo!(),
+                };
+
                 let job_name = job.name().expect("expected rendered job to contain a name");
 
                 if jobs_api.get_opt(&job_name).await?.is_some() {
@@ -301,6 +308,17 @@ async fn reconcile(
                 status: "False".into(),
                 reason: Some("SomeOrAllJobsFailed".into()),
                 message: Some(format!("{num_failed}/{num_total} jobs have failed")),
+                last_transition_time: Some(Utc::now().to_rfc3339()),
+            },
+        );
+    } else {
+        upsert_condition(
+            &mut resource_status.conditions,
+            PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "False".into(),
+                reason: Some("AwaitingJobResults".into()),
+                message: Some(format!("{num_running} jobs are running")),
                 last_transition_time: Some(Utc::now().to_rfc3339()),
             },
         );
@@ -442,6 +460,7 @@ fn create_job_for_ssh_playbook(
     host: &str,
     pb_uid: &str,
     plan: &PlaybookPlan,
+    ssh_config: &SshConfig,
 ) -> Job {
     let generation = plan
         .metadata
@@ -482,7 +501,7 @@ fn create_job_for_ssh_playbook(
                 Volume {
                     name: "ssh".into(),
                     secret: Some(SecretVolumeSource {
-                        secret_name: Some("ssh".into()),
+                        secret_name: Some(ssh_config.secret_ref.name.clone()),
                         default_mode: Some(0o0400),
                         ..Default::default()
                     }),
