@@ -14,7 +14,7 @@ use k8s_openapi::{
 };
 use kube::{
     Resource,
-    api::{ListParams, PostParams},
+    api::{ListParams, ObjectList, PostParams},
     runtime::{
         Controller,
         controller::Action,
@@ -117,15 +117,15 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    let playbookplan_api: kube::Api<PlaybookPlan> = kube::Api::namespaced(
-        context.client.clone(),
-        &object.metadata.namespace.clone().unwrap(),
-    );
-
     let namespace = object.namespace().expect("expected a namespace");
     let name = object.name().expect("expected a name");
     let uid = object.uid().expect("expected a uid");
     let generation = object.metadata.generation.expect("expected generation");
+
+    let playbookplan_api =
+        kube::Api::<PlaybookPlan>::namespaced(context.client.clone(), &namespace);
+    let secrets_api = kube::Api::<Secret>::namespaced(context.client.clone(), &namespace);
+    let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
 
     let mut resource_status = object.status.clone().unwrap_or_default();
 
@@ -143,13 +143,12 @@ async fn reconcile(
     );
     resource_status.eligible_hosts = Some(resolved_inventories.clone());
 
-    let secrets_api = kube::Api::<Secret>::namespaced(context.client.clone(), &namespace);
-
-    let rendered_playbook_outdated = if let Some(status) = &object.status {
-        status.last_rendered_generation.unwrap_or_default() < generation
-    } else {
-        true
-    };
+    let rendered_playbook_outdated = object
+        .status
+        .as_ref()
+        .and_then(|s| s.last_rendered_generation)
+        .map(|g| g < generation)
+        .unwrap_or(true);
 
     // Render playbook if necessary
     if secrets_api.get_opt(&name).await?.is_none() || rendered_playbook_outdated {
@@ -211,8 +210,6 @@ async fn reconcile(
         resource_status.last_rendered_generation = Some(generation);
     }
 
-    let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
-
     // Create jobs
     if object.spec.triggers.immediate.unwrap_or_default() {
         for (_, hosts) in resolved_inventories.iter() {
@@ -251,38 +248,11 @@ async fn reconcile(
         )
         .await?;
 
-    let num_successful = jobs
-        .iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .count();
-
-    let num_failed = jobs
-        .iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions
-                        .iter()
-                        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
-                })
-                .unwrap_or(false)
-        })
-        .count();
-
-    let num_finished = num_failed + num_successful;
     let num_total = jobs.iter().count();
+    let num_successful = count_successful(&jobs);
+    let num_failed = count_failed(&jobs);
+    let num_finished = num_failed + num_successful;
+    let num_running = num_total - num_finished;
 
     // Handle "Running" condition
     if num_finished < num_total {
@@ -292,10 +262,7 @@ async fn reconcile(
                 type_: "Running".into(),
                 status: "True".into(),
                 reason: Some("JobsRunning".into()),
-                message: Some(format!(
-                    "{} jobs are currently running",
-                    num_total - num_finished
-                )),
+                message: Some(format!("{num_running} jobs are currently running")),
                 last_transition_time: Some(Utc::now().to_rfc3339()),
             },
         );
@@ -313,7 +280,7 @@ async fn reconcile(
     }
 
     // Handle "Ready" condition
-    if num_successful == jobs.iter().count() {
+    if num_successful == num_total {
         upsert_condition(
             &mut resource_status.conditions,
             PlaybookPlanCondition {
@@ -321,8 +288,7 @@ async fn reconcile(
                 status: "True".into(),
                 reason: Some("AllJobsSucceeded".into()),
                 message: Some(format!(
-                    "{num_successful}/{} jobs completed successfully",
-                    jobs.iter().count()
+                    "{num_successful}/{num_total} jobs completed successfully"
                 )),
                 last_transition_time: Some(Utc::now().to_rfc3339()),
             },
@@ -334,10 +300,7 @@ async fn reconcile(
                 type_: "Ready".into(),
                 status: "False".into(),
                 reason: Some("SomeOrAllJobsFailed".into()),
-                message: Some(format!(
-                    "{num_failed}/{} jobs have failed",
-                    jobs.iter().count()
-                )),
+                message: Some(format!("{num_failed}/{num_total} jobs have failed")),
                 last_transition_time: Some(Utc::now().to_rfc3339()),
             },
         );
@@ -346,6 +309,38 @@ async fn reconcile(
     persist_status(&playbookplan_api, &object, resource_status).await?;
 
     Ok(Action::requeue(Duration::from_secs(3600)))
+}
+
+fn count_successful(jobs: &ObjectList<Job>) -> usize {
+    jobs.iter()
+        .filter(|job| {
+            job.status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .map(|conditions| {
+                    conditions.iter().any(|condition| {
+                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn count_failed(jobs: &ObjectList<Job>) -> usize {
+    jobs.iter()
+        .filter(|job| {
+            job.status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .map(|conditions| {
+                    conditions
+                        .iter()
+                        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
+                })
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 async fn resolve_inventories(
