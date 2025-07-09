@@ -489,6 +489,8 @@ fn render_ansible_command(plan: &PlaybookPlan, hostname: &str) -> Vec<String> {
             "--user".into(),
             ssh.user.clone(),
             "-i".into(),
+            "inventory.yml".into(),
+            "-l".into(),
             format!("{hostname},"),
         ],
     };
