@@ -167,6 +167,7 @@ pub struct PlaybookPlanStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanCondition {
     #[serde(rename = "type")]
     pub type_: String,
