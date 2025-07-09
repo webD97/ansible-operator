@@ -42,13 +42,14 @@ impl JsonSchema for GenericMap {
     group = "ansible.cloudbending.dev",
     version = "v1alpha1",
     kind = "PlaybookPlan",
-    namespaced
+    namespaced,
+    status = "PlaybookPlanStatus",
+    printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.triggers.schedule"}"#,
+    printcolumn = r#"{"name":"Hosts","type":"number","jsonPath":".status.eligibleHostsCount"}"#,
+    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
+    printcolumn = r#"{"name":"Running","type":"string","jsonPath":".status.conditions[?(@.type==\"Running\")].status"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
-#[kube(printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.triggers.schedule"}"#)]
-#[kube(printcolumn = r#"{"name":"Hosts","type":"number","jsonPath":".status.eligibleHostsCount"}"#)]
-#[kube(printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#)]
-#[kube(printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#)]
-#[kube(status = "PlaybookPlanStatus")]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
@@ -161,18 +162,18 @@ pub struct Variables {
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
     pub eligible_hosts_count: Option<usize>,
-    pub phase: Phase,
     pub last_rendered_generation: Option<i64>,
+    pub conditions: Vec<PlaybookPlanCondition>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "PascalCase")]
-pub enum Phase {
-    #[default]
-    Waiting,
-    Running,
-    Succeeded,
-    Failed,
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct PlaybookPlanCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+    pub last_transition_time: Option<String>,
 }
 
 #[test]

@@ -3,6 +3,8 @@ use std::fmt::Debug;
 use kube::api::{Patch, PatchParams, PostParams};
 use serde::{Serialize, de::DeserializeOwned};
 
+use crate::resources::playbookplan::PlaybookPlanCondition;
+
 pub async fn create_or_update<K>(
     api: kube::Api<K>,
     field_manager: &str,
@@ -35,4 +37,25 @@ where
     }
 
     Ok(())
+}
+
+pub fn upsert_condition(
+    conditions: &mut Vec<PlaybookPlanCondition>,
+    new_condition: PlaybookPlanCondition,
+) {
+    if let Some(existing_condition) = conditions
+        .iter_mut()
+        .find(|c| c.type_ == new_condition.type_)
+    {
+        // Skip change if we can't see a difference in the new value
+        if existing_condition.status == new_condition.status
+            && existing_condition.reason == new_condition.reason
+        {
+            return;
+        }
+
+        *existing_condition = new_condition;
+    } else {
+        conditions.push(new_condition);
+    }
 }

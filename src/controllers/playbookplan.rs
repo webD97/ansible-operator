@@ -10,6 +10,7 @@ use k8s_openapi::{
         },
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
+    chrono::Utc,
 };
 use kube::{
     Resource,
@@ -26,8 +27,10 @@ use tracing::{info, warn};
 use crate::{
     ansible,
     nodeselector::node_matches,
-    resources::playbookplan::{ExecutionStrategy, Hosts, Phase, PlaybookPlan, PlaybookPlanStatus},
-    utils::create_or_update,
+    resources::playbookplan::{
+        ExecutionStrategy, Hosts, PlaybookPlan, PlaybookPlanCondition, PlaybookPlanStatus,
+    },
+    utils::{create_or_update, upsert_condition},
 };
 
 struct Context {
@@ -211,9 +214,7 @@ async fn reconcile(
     let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
 
     // Create jobs
-    if let Some(immediate) = object.spec.triggers.immediate
-        && immediate
-    {
+    if object.spec.triggers.immediate.unwrap_or_default() {
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
                 let job = create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object);
@@ -280,12 +281,66 @@ async fn reconcile(
         })
         .count();
 
-    if num_successful == jobs.iter().count() {
-        resource_status.phase = Phase::Succeeded;
-    } else if num_failed > 0 {
-        resource_status.phase = Phase::Failed;
+    let num_finished = num_failed + num_successful;
+    let num_total = jobs.iter().count();
+
+    // Handle "Running" condition
+    if num_finished < num_total {
+        upsert_condition(
+            &mut resource_status.conditions,
+            PlaybookPlanCondition {
+                type_: "Running".into(),
+                status: "True".into(),
+                reason: Some("JobsRunning".into()),
+                message: Some(format!(
+                    "{} jobs are currently running",
+                    num_total - num_finished
+                )),
+                last_transition_time: Some(Utc::now().to_rfc3339()),
+            },
+        );
     } else {
-        resource_status.phase = Phase::Running;
+        upsert_condition(
+            &mut resource_status.conditions,
+            PlaybookPlanCondition {
+                type_: "Running".into(),
+                status: "False".into(),
+                reason: None,
+                message: None,
+                last_transition_time: Some(Utc::now().to_rfc3339()),
+            },
+        );
+    }
+
+    // Handle "Ready" condition
+    if num_successful == jobs.iter().count() {
+        upsert_condition(
+            &mut resource_status.conditions,
+            PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                reason: Some("AllJobsSucceeded".into()),
+                message: Some(format!(
+                    "{num_successful}/{} jobs completed successfully",
+                    jobs.iter().count()
+                )),
+                last_transition_time: Some(Utc::now().to_rfc3339()),
+            },
+        );
+    } else if num_failed > 0 {
+        upsert_condition(
+            &mut resource_status.conditions,
+            PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "False".into(),
+                reason: Some("SomeOrAllJobsFailed".into()),
+                message: Some(format!(
+                    "{num_failed}/{} jobs have failed",
+                    jobs.iter().count()
+                )),
+                last_transition_time: Some(Utc::now().to_rfc3339()),
+            },
+        );
     }
 
     persist_status(&playbookplan_api, &object, resource_status).await?;
