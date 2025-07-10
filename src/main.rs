@@ -31,7 +31,8 @@ async fn main() {
         .await
         .unwrap();
 
-    let playbookplan_controller = controllers::playbookplan::new(kubeconfig);
+    let kubernetes_client = kube::client::Client::try_from(kubeconfig).unwrap();
+    let playbookplan_controller = controllers::playbookplan::new(kubernetes_client);
 
     playbookplan_controller
         .for_each(|res| async move {

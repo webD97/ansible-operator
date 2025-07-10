@@ -13,7 +13,7 @@ use k8s_openapi::{
     chrono::Utc,
 };
 use kube::{
-    Resource,
+    Api, Resource,
     api::{ListParams, ObjectList, PostParams},
     runtime::{
         Controller,
@@ -22,10 +22,11 @@ use kube::{
         watcher,
     },
 };
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
-    ansible,
+    ansible::{self},
+    controllers::reconcile_error::ReconcileError,
     nodeselector::node_matches,
     resources::playbookplan::{
         ExecutionStrategy, Hosts, PlaybookPlan, PlaybookPlanCondition, PlaybookPlanStatus,
@@ -39,22 +40,20 @@ struct Context {
 }
 
 pub fn new(
-    kubeconfig: kube::Config,
+    client: kube::Client,
 ) -> impl Stream<
     Item = Result<
         (kube::runtime::reflector::ObjectRef<PlaybookPlan>, Action),
-        kube::runtime::controller::Error<kube::Error, kube::runtime::watcher::Error>,
+        kube::runtime::controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
-    let client = kube::client::Client::try_from(kubeconfig).unwrap();
-
     let context = Arc::new(Context {
         client: client.clone(),
     });
 
-    let playbookplans_api: kube::Api<PlaybookPlan> = kube::Api::all(client.clone());
-    let nodes_api: kube::Api<Node> = kube::Api::all(client.clone());
-    let jobs_api: kube::Api<Job> = kube::Api::all(client);
+    let playbookplans_api: Api<PlaybookPlan> = Api::all(client.clone());
+    let nodes_api: Api<Node> = Api::all(client.clone());
+    let jobs_api: Api<Job> = Api::all(client);
 
     let playbookplan_reflector_writer = Writer::<PlaybookPlan>::default();
     let playbookplan_reflector_reader = playbookplan_reflector_writer.as_reader();
@@ -96,21 +95,17 @@ pub fn new(
                 .map(|resource| ObjectRef::from(&**resource))
                 .collect::<Vec<_>>()
         })
-        .run(reconcile, error_policy, Arc::clone(&context))
-}
-
-fn error_policy(
-    _object: Arc<PlaybookPlan>,
-    _error: &kube::Error,
-    _context: Arc<Context>,
-) -> Action {
-    Action::requeue(Duration::from_secs(15))
+        .run(
+            reconcile,
+            |_, _, _| Action::requeue(Duration::from_secs(15)),
+            Arc::clone(&context),
+        )
 }
 
 async fn reconcile(
     object: Arc<PlaybookPlan>,
     context: Arc<Context>,
-) -> Result<Action, kube::Error> {
+) -> Result<Action, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
     // Check for deletion
@@ -118,21 +113,30 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    let namespace = object.namespace().expect("expected a namespace");
-    let name = object.name().expect("expected a name");
-    let uid = object.uid().expect("expected a uid");
-    let generation = object.metadata.generation.expect("expected generation");
+    let namespace = object
+        .namespace()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+    let name = object
+        .name()
+        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+    let uid = object
+        .uid()
+        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
+    let generation = object
+        .metadata
+        .generation
+        .ok_or(ReconcileError::PreconditionFailed("generation not set"))?;
 
-    let playbookplan_api =
-        kube::Api::<PlaybookPlan>::namespaced(context.client.clone(), &namespace);
-    let secrets_api = kube::Api::<Secret>::namespaced(context.client.clone(), &namespace);
-    let jobs_api = kube::Api::<Job>::namespaced(context.client.clone(), &namespace);
+    let playbookplan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), &namespace);
+    let secrets_api = Api::<Secret>::namespaced(context.client.clone(), &namespace);
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), &namespace);
+    let nodes_api = Api::<Node>::all(context.client.clone());
 
     let mut resource_status = object.status.clone().unwrap_or_default();
 
     // Resolve groups
     info!("Resolving groups");
-    let resolved_inventories = resolve_inventories(&context, &object).await?;
+    let resolved_inventories = resolve_inventories(&nodes_api, &object).await?;
 
     resource_status.eligible_hosts_count = Some(
         resolved_inventories
@@ -154,24 +158,11 @@ async fn reconcile(
     // Render playbook if necessary
     if secrets_api.get_opt(&name).await?.is_none() || rendered_playbook_outdated {
         info!("Rendering playbook to secret");
-        let rendered_playbook = match ansible::render_playbook(&object.spec) {
-            Ok(rendered_playbook) => rendered_playbook,
-            Err(e) => {
-                warn!("Failed to render playbook: {e}");
-                "".into()
-            }
-        };
-
-        let rendered_inventory = match ansible::render_inventory(&resolved_inventories) {
-            Ok(rendered_inventory) => rendered_inventory,
-            Err(e) => {
-                warn!("Failed to render inventory: {e}");
-                "".into()
-            }
-        };
+        let rendered_playbook = ansible::render_playbook(&object.spec)?;
+        let rendered_inventory = ansible::render_inventory(&resolved_inventories)?;
 
         let rendered_variables = match &object.spec.variables {
-            Some(variables) => serde_yaml::to_string(&variables.inline).unwrap(),
+            Some(variables) => serde_yaml::to_string(&variables.inline)?,
             None => "".into(),
         };
 
@@ -216,13 +207,21 @@ async fn reconcile(
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
                 let job = match &object.spec.execution_strategy {
-                    ExecutionStrategy::Ssh { ssh } => {
-                        create_job_for_ssh_playbook(&namespace, &name, host, &uid, &object, ssh)
-                    }
+                    ExecutionStrategy::Ssh { ssh } => create_job_for_ssh_playbook(
+                        &namespace,
+                        &name,
+                        host,
+                        &generation.to_string(),
+                        &uid,
+                        &object,
+                        ssh,
+                    ),
                     ExecutionStrategy::Chroot {} => todo!(),
                 };
 
-                let job_name = job.name().expect("expected rendered job to contain a name");
+                let job_name = job.name().ok_or(ReconcileError::PreconditionFailed(
+                    "name not set in rendered job",
+                ))?;
 
                 if jobs_api.get_opt(&job_name).await?.is_some() {
                     continue;
@@ -243,18 +242,7 @@ async fn reconcile(
     }
 
     // Read managed jobs and populate status
-    let jobs = jobs_api
-        .list(
-            &ListParams::default().labels(
-                format!(
-                    "ansible.cloudbending.dev/playbookplan={}",
-                    format_job_prefix(&name, generation)
-                )
-                .as_str(),
-            ),
-        )
-        .await?;
-
+    let jobs = get_jobs_for_playbookplan(&jobs_api, &name, &generation.to_string()).await?;
     let num_total = jobs.iter().count();
     let num_successful = count_successful(&jobs);
     let num_failed = count_failed(&jobs);
@@ -329,6 +317,24 @@ async fn reconcile(
     Ok(Action::requeue(Duration::from_secs(3600)))
 }
 
+async fn get_jobs_for_playbookplan(
+    jobs_api: &Api<Job>,
+    playbookplan_name: &str,
+    generation: &str,
+) -> Result<ObjectList<Job>, kube::Error> {
+    jobs_api
+        .list(
+            &ListParams::default().labels(
+                format!(
+                    "ansible.cloudbending.dev/playbookplan={}",
+                    format_job_prefix(playbookplan_name, generation)
+                )
+                .as_str(),
+            ),
+        )
+        .await
+}
+
 fn count_successful(jobs: &ObjectList<Job>) -> usize {
     jobs.iter()
         .filter(|job| {
@@ -362,7 +368,7 @@ fn count_failed(jobs: &ObjectList<Job>) -> usize {
 }
 
 async fn resolve_inventories(
-    context: &Context,
+    nodes_api: &Api<Node>,
     object: &PlaybookPlan,
 ) -> Result<BTreeMap<String, Vec<String>>, kube::Error> {
     let inventories_spec = &object.spec.inventory;
@@ -370,7 +376,7 @@ async fn resolve_inventories(
     let mut resolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for inventory in inventories_spec {
-        let resolved_hosts = resolve_hosts(&inventory.hosts, context).await?;
+        let resolved_hosts = resolve_hosts(nodes_api, &inventory.hosts).await?;
         resolved.insert(inventory.name.clone(), resolved_hosts);
     }
 
@@ -378,14 +384,12 @@ async fn resolve_inventories(
 }
 
 async fn resolve_hosts(
+    nodes_api: &Api<Node>,
     hosts_source: &Hosts,
-    context: &Context,
 ) -> Result<Vec<String>, kube::Error> {
     use kube::runtime::reflector::Lookup as _;
 
-    let nodes_api: kube::Api<Node> = kube::Api::all(context.client.clone());
     let nodes = nodes_api.list(&ListParams::default()).await?;
-
     let hosts: Vec<String> = match hosts_source {
         Hosts::FromStaticList { from_list } => from_list.to_owned(),
         Hosts::FromClusterNodes { from_nodes } => nodes
@@ -400,21 +404,23 @@ async fn resolve_hosts(
 }
 
 async fn persist_status(
-    api: &kube::Api<PlaybookPlan>,
+    api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
     status: PlaybookPlanStatus,
-) -> Result<(), kube::Error> {
+) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
     let mut patch_object = object.clone();
     patch_object.status = Some(status);
 
-    api.replace_status(
-        &object.name().expect("expected a name"),
-        &PostParams::default(),
-        serde_json::to_vec(&patch_object).unwrap(),
-    )
-    .await?;
+    let name = &object
+        .name()
+        .ok_or(ReconcileError::PreconditionFailed("expected a name"))?;
+
+    let data = serde_json::to_vec(&patch_object)?;
+
+    api.replace_status(name, &PostParams::default(), data)
+        .await?;
 
     Ok(())
 }
@@ -450,7 +456,7 @@ fn create_secret_for_playbook(
     secret
 }
 
-fn format_job_prefix(playbookplan_name: &str, generation: i64) -> String {
+fn format_job_prefix(playbookplan_name: &str, generation: &str) -> String {
     format!("apply-{playbookplan_name}-{generation}")
 }
 
@@ -458,15 +464,11 @@ fn create_job_for_ssh_playbook(
     pb_namespace: &str,
     pb_name: &str,
     host: &str,
+    generation: &str,
     pb_uid: &str,
     plan: &PlaybookPlan,
     ssh_config: &SshConfig,
 ) -> Job {
-    let generation = plan
-        .metadata
-        .generation
-        .expect("expected PlaybookPlan to have a generation");
-
     let job_prefix = format_job_prefix(pb_name, generation);
     let mut job = Job::default();
     job.metadata.namespace = Some(pb_namespace.into());
