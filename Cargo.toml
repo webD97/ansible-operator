@@ -3,6 +3,7 @@ name = "ansible-operator"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license-file = "LICENSE"
 
 [dependencies]
 anyhow = "1.0.98"
