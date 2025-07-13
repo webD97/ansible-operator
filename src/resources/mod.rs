@@ -1,5 +1,5 @@
 mod generic;
-pub mod playbookplan;
+pub mod v1beta1;
 
 pub use generic::*;
 // pub use playbookplan::*;

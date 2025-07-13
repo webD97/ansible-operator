@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Node;
 
-use crate::resources::{LabelMap, playbookplan::NodeSelectorTerm};
+use crate::resources::{LabelMap, v1beta1};
 
-pub fn node_matches(node: &Node, selector: &NodeSelectorTerm) -> bool {
+pub fn node_matches(node: &Node, selector: &v1beta1::NodeSelectorTerm) -> bool {
     match selector {
-        NodeSelectorTerm::MatchLabels { labels } => node_matches_match_labels(node, labels),
+        v1beta1::NodeSelectorTerm::MatchLabels { labels } => {
+            node_matches_match_labels(node, labels)
+        }
     }
 }
 

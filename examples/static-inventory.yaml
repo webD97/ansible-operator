@@ -1,41 +1,27 @@
-# code: language=yaml
-apiVersion: ansible.cloudbending.dev/v1alpha1
+apiVersion: ansible.cloudbending.dev/v1beta1
 kind: PlaybookPlan
 metadata:
   name: ccu-example
 spec:
-  # An OCI image with Ansible and all required collections
   image: docker.io/serversideup/ansible-core:2.18
-  # Controls when a playbook is executed
-  triggers:
-    # The playbook will run immediately after the resource is created or updated ...
-    immediate: true
-  # These host groups will be available in our playbook
   inventory:
     - name: ccu
       hosts:
         fromList:
           - ccu.fritz.box
-  # Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
-  executionStrategy:
+  connectionStrategy:
     ssh:
       user: root
       secretRef:
-        name: sshkey-ccu.fritz.box
-  # These will usually be populated via Helm
-  variables:
-    inline:
-      # Variables will be available in Ansible
-      ttyTimeout:
-        present: true
-  # The playbook will be built from this, some fields will be set automatically (vars, hosts)
-  template: |
-    - hosts: all
-      tasks:
-        - name: Copy certificate
-          ansible.builtin.copy:
-            src: tls.crt
-            dest: /etc/somewhere/tls.crt
-            owner: root
-            group: root
-            mode: "0640"
+        name: ssh
+  template:
+    playbook: |
+      - hosts: all
+        tasks:
+          - name: Copy certificate
+            ansible.builtin.copy:
+              src: tls.crt
+              dest: /etc/somewhere/tls.crt
+              owner: root
+              group: root
+              mode: "0640"

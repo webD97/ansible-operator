@@ -7,7 +7,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{fmt, layer::SubscriberExt as _};
 
-use crate::resources::playbookplan::PlaybookPlan;
+use crate::resources::v1beta1;
 
 mod ansible;
 mod controllers;
@@ -20,7 +20,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.contains(&"--crd".into()) {
-        let crd = PlaybookPlan::crd();
+        let crd = v1beta1::PlaybookPlan::crd();
         println!("{}", serde_yaml::to_string(&crd).unwrap());
         std::process::exit(0);
     }

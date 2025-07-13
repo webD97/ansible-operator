@@ -40,11 +40,10 @@ impl JsonSchema for GenericMap {
 #[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 #[kube(
     group = "ansible.cloudbending.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "PlaybookPlan",
     namespaced,
     status = "PlaybookPlanStatus",
-    printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.triggers.schedule"}"#,
     printcolumn = r#"{"name":"Hosts","type":"number","jsonPath":".status.eligibleHostsCount"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Running","type":"string","jsonPath":".status.conditions[?(@.type==\"Running\")].status"}"#,
@@ -55,27 +54,54 @@ pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
     pub image: String,
 
-    /// Controls when a playbook is executed
-    pub triggers: Triggers,
+    /// Controls when a playbook is executed. If omitted, the playbook will execute once when the resource is applied or updated
+    pub execution_triggers: Option<ExecutionTriggers>,
 
     /// These host groups will be available in our playbook
     pub inventory: Vec<Inventory>,
 
     /// Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
-    pub execution_strategy: ExecutionStrategy,
-
-    // Variables that will be available in Ansible
-    pub variables: Option<Variables>,
+    pub connection_strategy: ConnectionStrategy,
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
-    pub template: String,
+    pub template: PlaybookTemplate,
 }
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+pub struct PlaybookTemplate {
+    /// The actual playbook contents
+    pub playbook: String,
+
+    /// Variables for the playbook
+    pub variables: Option<Vec<PlaybookVariableSource>>,
+
+    /// Files for the playbook
+    pub files: Option<Vec<FilesSource>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+pub struct FilesSource(#[schemars(with = "GenericMap")] k8s_openapi::api::core::v1::Volume);
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Triggers {
-    pub immediate: Option<bool>,
+pub struct ExecutionTriggers {
+    /// Set this to a cron expression to delay playbook execution after the PlaybookPlan or a related secret have changed.
+    /// If omitted, the playbook will be applied immediately.
+    pub delayed_until: Option<String>,
+    /// Set this to a cron expression to execute the playbook on a recurring basis.
     pub schedule: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum PlaybookVariableSource {
+    #[serde(rename_all = "camelCase")]
+    SecretRef {
+        secret_ref: SecretRef,
+    },
+    Inline {
+        inline: GenericMap,
+    },
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -127,12 +153,12 @@ impl Default for NodeSelectorTerm {
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(untagged)]
 #[serde(rename_all = "camelCase")]
-pub enum ExecutionStrategy {
+pub enum ConnectionStrategy {
     Ssh { ssh: SshConfig },
     Chroot {},
 }
 
-impl Default for ExecutionStrategy {
+impl Default for ConnectionStrategy {
     fn default() -> Self {
         Self::Chroot {}
     }
@@ -183,10 +209,10 @@ fn test_schema() {
         "blubb",
         PlaybookPlanSpec {
             image: "registry.tld/ansible:1.0.0".to_string(),
-            triggers: Triggers {
-                immediate: Some(false),
+            execution_triggers: Some(ExecutionTriggers {
+                delayed_until: None,
                 schedule: Some("0 1 * * *".into()),
-            },
+            }),
             inventory: vec![
                 Inventory {
                     name: "controlplane".into(),
@@ -216,7 +242,7 @@ fn test_schema() {
                     },
                 },
             ],
-            execution_strategy: ExecutionStrategy::Ssh {
+            connection_strategy: ConnectionStrategy::Ssh {
                 ssh: SshConfig {
                     user: "root".into(),
                     secret_ref: SecretRef {
@@ -224,15 +250,18 @@ fn test_schema() {
                     },
                 },
             },
-            variables: None,
-            template: r#"
+            template: PlaybookTemplate {
+                playbook: r#"
 - tasks:
     - name: Ensure httpd installed
         ansible.builtin.dnf:
             name: httpd
             state: installed
             "#
-            .into(),
+                .into(),
+                variables: None,
+                files: None,
+            },
         },
     );
 

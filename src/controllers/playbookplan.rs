@@ -28,10 +28,7 @@ use crate::{
     ansible::{self},
     controllers::reconcile_error::ReconcileError,
     nodeselector::node_matches,
-    resources::playbookplan::{
-        ExecutionStrategy, Hosts, PlaybookPlan, PlaybookPlanCondition, PlaybookPlanStatus,
-        SshConfig,
-    },
+    resources::v1beta1,
     utils::{create_or_update, upsert_condition},
 };
 
@@ -43,7 +40,10 @@ pub fn new(
     client: kube::Client,
 ) -> impl Stream<
     Item = Result<
-        (kube::runtime::reflector::ObjectRef<PlaybookPlan>, Action),
+        (
+            kube::runtime::reflector::ObjectRef<v1beta1::PlaybookPlan>,
+            Action,
+        ),
         kube::runtime::controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
@@ -51,11 +51,11 @@ pub fn new(
         client: client.clone(),
     });
 
-    let playbookplans_api: Api<PlaybookPlan> = Api::all(client.clone());
+    let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
     let nodes_api: Api<Node> = Api::all(client.clone());
     let jobs_api: Api<Job> = Api::all(client);
 
-    let playbookplan_reflector_writer = Writer::<PlaybookPlan>::default();
+    let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
     let playbookplan_reflector_reader = playbookplan_reflector_writer.as_reader();
 
     let playbookplan_reflector = kube::runtime::reflector(
@@ -88,8 +88,8 @@ pub fn new(
                         .inventory
                         .iter()
                         .any(|inventory| match &inventory.hosts {
-                            Hosts::FromClusterNodes { .. } => true,
-                            Hosts::FromStaticList { .. } => false,
+                            v1beta1::Hosts::FromClusterNodes { .. } => true,
+                            v1beta1::Hosts::FromStaticList { .. } => false,
                         })
                 })
                 .map(|resource| ObjectRef::from(&**resource))
@@ -103,7 +103,7 @@ pub fn new(
 }
 
 async fn reconcile(
-    object: Arc<PlaybookPlan>,
+    object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<Context>,
 ) -> Result<Action, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
@@ -127,7 +127,8 @@ async fn reconcile(
         .generation
         .ok_or(ReconcileError::PreconditionFailed("generation not set"))?;
 
-    let playbookplan_api = Api::<PlaybookPlan>::namespaced(context.client.clone(), &namespace);
+    let playbookplan_api =
+        Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), &namespace);
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), &namespace);
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), &namespace);
     let nodes_api = Api::<Node>::all(context.client.clone());
@@ -161,22 +162,32 @@ async fn reconcile(
         let rendered_playbook = ansible::render_playbook(&object.spec)?;
         let rendered_inventory = ansible::render_inventory(&resolved_inventories)?;
 
-        let rendered_variables = match &object.spec.variables {
-            Some(variables) => serde_yaml::to_string(&variables.inline)?,
-            None => "".into(),
+        let inlined_variables = match &object.spec.template.variables {
+            Some(variable_sources) => variable_sources
+                .iter()
+                .filter_map(|source| match source {
+                    v1beta1::PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
+                    v1beta1::PlaybookVariableSource::Inline { inline } => Some(inline),
+                })
+                .map(serde_yaml::to_string)
+                .collect(),
+            None => Vec::new(),
         };
 
-        let secret = create_secret_for_playbook(
-            &namespace,
-            &name,
-            &uid,
-            rendered_playbook,
-            rendered_inventory,
-            rendered_variables,
-        );
+        let mut secret = create_secret_for_playbook(&namespace, &name, &uid);
+
+        let mut string_data = BTreeMap::new();
+        string_data.insert("playbook.yml".into(), rendered_playbook);
+        string_data.insert("inventory.yml".into(), rendered_inventory);
+
+        for (index, variable_set) in inlined_variables.into_iter().enumerate() {
+            string_data.insert(format!("static-variables-{index}.yml"), variable_set?);
+        }
+
+        secret.string_data = Some(string_data);
 
         create_or_update(
-            secrets_api,
+            &secrets_api,
             "ansible-operator",
             &name,
             secret,
@@ -202,12 +213,14 @@ async fn reconcile(
         resource_status.last_rendered_generation = Some(generation);
     }
 
+    let triggers = object.spec.execution_triggers.as_ref();
+
     // Create jobs
-    if object.spec.triggers.immediate.unwrap_or_default() {
+    if triggers.is_none() || triggers.is_some_and(|triggers| triggers.delayed_until.is_none()) {
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
-                let job = match &object.spec.execution_strategy {
-                    ExecutionStrategy::Ssh { ssh } => create_job_for_ssh_playbook(
+                let job = match &object.spec.connection_strategy {
+                    v1beta1::ConnectionStrategy::Ssh { ssh } => create_job_for_ssh_playbook(
                         &namespace,
                         &name,
                         host,
@@ -216,7 +229,7 @@ async fn reconcile(
                         &object,
                         ssh,
                     ),
-                    ExecutionStrategy::Chroot {} => todo!(),
+                    v1beta1::ConnectionStrategy::Chroot {} => todo!(),
                 };
 
                 let job_name = job.name().ok_or(ReconcileError::PreconditionFailed(
@@ -253,7 +266,7 @@ async fn reconcile(
     if num_finished < num_total {
         upsert_condition(
             &mut resource_status.conditions,
-            PlaybookPlanCondition {
+            v1beta1::PlaybookPlanCondition {
                 type_: "Running".into(),
                 status: "True".into(),
                 reason: Some("JobsRunning".into()),
@@ -264,7 +277,7 @@ async fn reconcile(
     } else {
         upsert_condition(
             &mut resource_status.conditions,
-            PlaybookPlanCondition {
+            v1beta1::PlaybookPlanCondition {
                 type_: "Running".into(),
                 status: "False".into(),
                 reason: None,
@@ -278,7 +291,7 @@ async fn reconcile(
     if num_successful == num_total {
         upsert_condition(
             &mut resource_status.conditions,
-            PlaybookPlanCondition {
+            v1beta1::PlaybookPlanCondition {
                 type_: "Ready".into(),
                 status: "True".into(),
                 reason: Some("AllJobsSucceeded".into()),
@@ -291,7 +304,7 @@ async fn reconcile(
     } else if num_failed > 0 {
         upsert_condition(
             &mut resource_status.conditions,
-            PlaybookPlanCondition {
+            v1beta1::PlaybookPlanCondition {
                 type_: "Ready".into(),
                 status: "False".into(),
                 reason: Some("SomeOrAllJobsFailed".into()),
@@ -302,7 +315,7 @@ async fn reconcile(
     } else {
         upsert_condition(
             &mut resource_status.conditions,
-            PlaybookPlanCondition {
+            v1beta1::PlaybookPlanCondition {
                 type_: "Ready".into(),
                 status: "False".into(),
                 reason: Some("AwaitingJobResults".into()),
@@ -369,7 +382,7 @@ fn count_failed(jobs: &ObjectList<Job>) -> usize {
 
 async fn resolve_inventories(
     nodes_api: &Api<Node>,
-    object: &PlaybookPlan,
+    object: &v1beta1::PlaybookPlan,
 ) -> Result<BTreeMap<String, Vec<String>>, kube::Error> {
     let inventories_spec = &object.spec.inventory;
 
@@ -385,14 +398,14 @@ async fn resolve_inventories(
 
 async fn resolve_hosts(
     nodes_api: &Api<Node>,
-    hosts_source: &Hosts,
+    hosts_source: &v1beta1::Hosts,
 ) -> Result<Vec<String>, kube::Error> {
     use kube::runtime::reflector::Lookup as _;
 
     let nodes = nodes_api.list(&ListParams::default()).await?;
     let hosts: Vec<String> = match hosts_source {
-        Hosts::FromStaticList { from_list } => from_list.to_owned(),
-        Hosts::FromClusterNodes { from_nodes } => nodes
+        v1beta1::Hosts::FromStaticList { from_list } => from_list.to_owned(),
+        v1beta1::Hosts::FromClusterNodes { from_nodes } => nodes
             .items
             .iter()
             .filter(|node| node_matches(node, from_nodes))
@@ -404,9 +417,9 @@ async fn resolve_hosts(
 }
 
 async fn persist_status(
-    api: &Api<PlaybookPlan>,
-    object: &PlaybookPlan,
-    status: PlaybookPlanStatus,
+    api: &Api<v1beta1::PlaybookPlan>,
+    object: &v1beta1::PlaybookPlan,
+    status: v1beta1::PlaybookPlanStatus,
 ) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
@@ -425,33 +438,19 @@ async fn persist_status(
     Ok(())
 }
 
-fn create_secret_for_playbook(
-    pb_namespace: &str,
-    pb_name: &str,
-    pb_uid: &str,
-    playbook: String,
-    inventory: String,
-    variables: String,
-) -> Secret {
+fn create_secret_for_playbook(pb_namespace: &str, pb_name: &str, pb_uid: &str) -> Secret {
     let mut secret = Secret::default();
 
     secret.metadata.namespace = Some(pb_namespace.into());
     secret.metadata.name = Some(pb_name.into());
 
     secret.metadata.owner_references = Some(vec![OwnerReference {
-        api_version: PlaybookPlan::api_version(&()).into(),
-        kind: PlaybookPlan::kind(&()).into(),
+        api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
+        kind: v1beta1::PlaybookPlan::kind(&()).into(),
         name: pb_name.into(),
         uid: pb_uid.into(),
         ..Default::default()
     }]);
-
-    let mut string_data = BTreeMap::new();
-    string_data.insert("playbook.yml".into(), playbook);
-    string_data.insert("inventory.yml".into(), inventory);
-    string_data.insert("variables.yml".into(), variables);
-
-    secret.string_data = Some(string_data);
 
     secret
 }
@@ -466,8 +465,8 @@ fn create_job_for_ssh_playbook(
     host: &str,
     generation: &str,
     pb_uid: &str,
-    plan: &PlaybookPlan,
-    ssh_config: &SshConfig,
+    plan: &v1beta1::PlaybookPlan,
+    ssh_config: &v1beta1::SshConfig,
 ) -> Job {
     let job_prefix = format_job_prefix(pb_name, generation);
     let mut job = Job::default();
@@ -475,8 +474,8 @@ fn create_job_for_ssh_playbook(
     job.metadata.name = Some(format!("{job_prefix}-on-{host}"));
 
     job.metadata.owner_references = Some(vec![OwnerReference {
-        api_version: PlaybookPlan::api_version(&()).into(),
-        kind: PlaybookPlan::kind(&()).into(),
+        api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
+        kind: v1beta1::PlaybookPlan::kind(&()).into(),
         name: pb_name.into(),
         uid: pb_uid.into(),
         ..Default::default()
@@ -544,16 +543,36 @@ fn create_job_for_ssh_playbook(
     job
 }
 
-fn render_ansible_command(plan: &PlaybookPlan, hostname: &str) -> Vec<String> {
-    let mut ansible_command = vec![
-        "ansible-playbook".into(),
-        "--extra-vars".into(),
-        "@/run/ansible-operator/variables.yml".into(),
-    ];
+fn render_ansible_command(plan: &v1beta1::PlaybookPlan, hostname: &str) -> Vec<String> {
+    let static_vars_filenames: Vec<String> = plan
+        .spec
+        .template
+        .variables
+        .as_ref()
+        .map(|variables| {
+            variables
+                .iter()
+                .filter_map(|source| match source {
+                    v1beta1::PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
+                    v1beta1::PlaybookVariableSource::Inline { inline: _ } => Some(()),
+                })
+                .enumerate()
+                .map(|(index, _)| format!("static-variables-{index}.yml"))
+                .collect()
+        })
+        .unwrap_or_default();
 
-    let connection_args = match &plan.spec.execution_strategy {
-        ExecutionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
-        ExecutionStrategy::Ssh { ssh } => vec![
+    let mut ansible_command = vec!["ansible-playbook".into()];
+
+    ansible_command.extend(
+        static_vars_filenames
+            .iter()
+            .flat_map(|path| ["--extra-vars".into(), format!("@{path}")]),
+    );
+
+    let connection_args = match &plan.spec.connection_strategy {
+        v1beta1::ConnectionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
+        v1beta1::ConnectionStrategy::Ssh { ssh } => vec![
             "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
             "--private-key".into(),
             "/ssh/id_rsa".into(),
