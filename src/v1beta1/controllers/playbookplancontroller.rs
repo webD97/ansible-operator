@@ -28,7 +28,7 @@ use crate::{
     utils::{create_or_update, upsert_condition},
     v1beta1::{
         self, ansible,
-        controllers::{nodeselector, reconcile_error::ReconcileError},
+        controllers::{inventory_resolver, reconcile_error::ReconcileError},
     },
 };
 
@@ -137,7 +137,8 @@ async fn reconcile(
 
     // Resolve groups
     info!("Resolving groups");
-    let resolved_inventories = resolve_inventories(&nodes_api, &object).await?;
+    let resolved_inventories =
+        inventory_resolver::resolve(&nodes_api, &object.spec.inventory).await?;
 
     resource_status.eligible_hosts_count = Some(
         resolved_inventories
@@ -380,42 +381,6 @@ fn count_failed(jobs: &ObjectList<Job>) -> usize {
         .count()
 }
 
-async fn resolve_inventories(
-    nodes_api: &Api<Node>,
-    object: &v1beta1::PlaybookPlan,
-) -> Result<BTreeMap<String, Vec<String>>, kube::Error> {
-    let inventories_spec = &object.spec.inventory;
-
-    let mut resolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for inventory in inventories_spec {
-        let resolved_hosts = resolve_hosts(nodes_api, &inventory.hosts).await?;
-        resolved.insert(inventory.name.clone(), resolved_hosts);
-    }
-
-    Ok(resolved)
-}
-
-async fn resolve_hosts(
-    nodes_api: &Api<Node>,
-    hosts_source: &v1beta1::Hosts,
-) -> Result<Vec<String>, kube::Error> {
-    use kube::runtime::reflector::Lookup as _;
-
-    let nodes = nodes_api.list(&ListParams::default()).await?;
-    let hosts: Vec<String> = match hosts_source {
-        v1beta1::Hosts::FromStaticList { from_list } => from_list.to_owned(),
-        v1beta1::Hosts::FromClusterNodes { from_nodes } => nodes
-            .items
-            .iter()
-            .filter(|node| nodeselector::node_matches(node, from_nodes))
-            .map(|node| node.name().unwrap_or_default().into())
-            .collect(),
-    };
-
-    Ok(hosts)
-}
-
 async fn persist_status(
     api: &Api<v1beta1::PlaybookPlan>,
     object: &v1beta1::PlaybookPlan,
@@ -525,7 +490,9 @@ fn create_job_for_ssh_playbook(
                         ..Default::default()
                     },
                 ]),
-                command: Some(render_ansible_command(plan, host)),
+                command: Some(ansible::command_renderer::render_ansible_command(
+                    plan, host,
+                )),
                 ..Default::default()
             }],
             ..Default::default()
@@ -541,52 +508,4 @@ fn create_job_for_ssh_playbook(
     job.spec = Some(job_spec);
 
     job
-}
-
-fn render_ansible_command(plan: &v1beta1::PlaybookPlan, hostname: &str) -> Vec<String> {
-    let static_vars_filenames: Vec<String> = plan
-        .spec
-        .template
-        .variables
-        .as_ref()
-        .map(|variables| {
-            variables
-                .iter()
-                .filter_map(|source| match source {
-                    v1beta1::PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
-                    v1beta1::PlaybookVariableSource::Inline { inline: _ } => Some(()),
-                })
-                .enumerate()
-                .map(|(index, _)| format!("static-variables-{index}.yml"))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut ansible_command = vec!["ansible-playbook".into()];
-
-    ansible_command.extend(
-        static_vars_filenames
-            .iter()
-            .flat_map(|path| ["--extra-vars".into(), format!("@{path}")]),
-    );
-
-    let connection_args = match &plan.spec.connection_strategy {
-        v1beta1::ConnectionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
-        v1beta1::ConnectionStrategy::Ssh { ssh } => vec![
-            "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
-            "--private-key".into(),
-            "/ssh/id_rsa".into(),
-            "--user".into(),
-            ssh.user.clone(),
-            "-i".into(),
-            "inventory.yml".into(),
-            "-l".into(),
-            format!("{hostname},"),
-        ],
-    };
-
-    ansible_command.extend(connection_args);
-    ansible_command.push("playbook.yml".into());
-
-    ansible_command
 }
