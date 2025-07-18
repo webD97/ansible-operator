@@ -27,7 +27,7 @@ async fn main() {
         .unwrap();
 
     let kubernetes_client = kube::client::Client::try_from(kubeconfig).unwrap();
-    let playbookplan_controller = v1beta1::playbookplan::new(kubernetes_client);
+    let playbookplan_controller = v1beta1::playbookplancontroller::new(kubernetes_client);
 
     playbookplan_controller
         .for_each(|res| async move {

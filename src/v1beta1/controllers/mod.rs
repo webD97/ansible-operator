@@ -1,3 +1,3 @@
 mod nodeselector;
-pub mod playbookplan;
+pub mod playbookplancontroller;
 mod reconcile_error;
