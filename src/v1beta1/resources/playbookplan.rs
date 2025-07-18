@@ -4,7 +4,7 @@ use kube::CustomResource;
 use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
 use serde::{Deserialize, Serialize};
 
-use crate::v1beta1::LabelMap;
+use crate::{utils::Condition, v1beta1::LabelMap};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 #[serde(transparent)]
@@ -201,6 +201,20 @@ pub struct PlaybookPlanCondition {
     pub reason: Option<String>,
     pub message: Option<String>,
     pub last_transition_time: Option<String>,
+}
+
+impl Condition for PlaybookPlanCondition {
+    fn type_(&self) -> &str {
+        &self.type_
+    }
+
+    fn status(&self) -> &str {
+        &self.status
+    }
+
+    fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
 }
 
 #[test]
