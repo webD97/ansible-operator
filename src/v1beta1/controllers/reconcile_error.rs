@@ -1,4 +1,4 @@
-use crate::ansible::RenderError;
+use crate::v1beta1::ansible;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ReconcileError {
@@ -9,7 +9,7 @@ pub enum ReconcileError {
     PreconditionFailed(&'static str),
 
     #[error(transparent)]
-    RenderError(#[from] RenderError),
+    RenderError(#[from] ansible::RenderError),
 
     #[error(transparent)]
     JsonSerializationError(#[from] serde_json::Error),

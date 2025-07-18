@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use kube::api::{Patch, PatchParams, PostParams};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::resources::v1beta1;
+use crate::v1beta1;
 
 pub async fn create_or_update<K>(
     api: &kube::Api<K>,

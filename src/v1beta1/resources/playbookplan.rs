@@ -4,7 +4,7 @@ use kube::CustomResource;
 use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
 use serde::{Deserialize, Serialize};
 
-use crate::resources::LabelMap;
+use crate::v1beta1::LabelMap;
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 #[serde(transparent)]

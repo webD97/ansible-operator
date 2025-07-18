@@ -7,13 +7,8 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{fmt, layer::SubscriberExt as _};
 
-use crate::resources::v1beta1;
-
-mod ansible;
-mod controllers;
-mod nodeselector;
-mod resources;
 mod utils;
+mod v1beta1;
 
 #[tokio::main]
 async fn main() {
@@ -32,7 +27,7 @@ async fn main() {
         .unwrap();
 
     let kubernetes_client = kube::client::Client::try_from(kubeconfig).unwrap();
-    let playbookplan_controller = controllers::playbookplan::new(kubernetes_client);
+    let playbookplan_controller = v1beta1::playbookplan::new(kubernetes_client);
 
     playbookplan_controller
         .for_each(|res| async move {

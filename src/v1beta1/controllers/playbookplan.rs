@@ -25,11 +25,11 @@ use kube::{
 use tracing::info;
 
 use crate::{
-    ansible::{self},
-    controllers::reconcile_error::ReconcileError,
-    nodeselector::node_matches,
-    resources::v1beta1,
     utils::{create_or_update, upsert_condition},
+    v1beta1::{
+        self, ansible,
+        controllers::{nodeselector, reconcile_error::ReconcileError},
+    },
 };
 
 struct Context {
@@ -408,7 +408,7 @@ async fn resolve_hosts(
         v1beta1::Hosts::FromClusterNodes { from_nodes } => nodes
             .items
             .iter()
-            .filter(|node| node_matches(node, from_nodes))
+            .filter(|node| nodeselector::node_matches(node, from_nodes))
             .map(|node| node.name().unwrap_or_default().into())
             .collect(),
     };
