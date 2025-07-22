@@ -3,11 +3,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::{
     api::{
-        batch::v1::{Job, JobSpec},
-        core::v1::{
-            Container, Node, PodSpec, PodTemplateSpec, Secret, SecretVolumeSource, Volume,
-            VolumeMount,
-        },
+        batch::v1::Job,
+        core::v1::{Node, Secret},
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
     chrono::Utc,
@@ -221,17 +218,16 @@ async fn reconcile(
         for (_, hosts) in resolved_inventories.iter() {
             for host in hosts {
                 let job = match &object.spec.connection_strategy {
-                    v1beta1::ConnectionStrategy::Ssh { ssh } => create_job_for_ssh_playbook(
-                        &namespace,
-                        &name,
-                        host,
-                        &generation.to_string(),
-                        &uid,
-                        &object,
-                        ssh,
-                    ),
+                    v1beta1::ConnectionStrategy::Ssh { ssh } => {
+                        super::job_builder::create_job_for_ssh_playbook(
+                            host,
+                            &object,
+                            ssh,
+                            &format_job_prefix(&name, &generation.to_string()),
+                        )
+                    }
                     v1beta1::ConnectionStrategy::Chroot {} => todo!(),
-                };
+                }?;
 
                 let job_name = job.name().ok_or(ReconcileError::PreconditionFailed(
                     "name not set in rendered job",
@@ -422,90 +418,4 @@ fn create_secret_for_playbook(pb_namespace: &str, pb_name: &str, pb_uid: &str) -
 
 fn format_job_prefix(playbookplan_name: &str, generation: &str) -> String {
     format!("apply-{playbookplan_name}-{generation}")
-}
-
-fn create_job_for_ssh_playbook(
-    pb_namespace: &str,
-    pb_name: &str,
-    host: &str,
-    generation: &str,
-    pb_uid: &str,
-    plan: &v1beta1::PlaybookPlan,
-    ssh_config: &v1beta1::SshConfig,
-) -> Job {
-    let job_prefix = format_job_prefix(pb_name, generation);
-    let mut job = Job::default();
-    job.metadata.namespace = Some(pb_namespace.into());
-    job.metadata.name = Some(format!("{job_prefix}-on-{host}"));
-
-    job.metadata.owner_references = Some(vec![OwnerReference {
-        api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
-        kind: v1beta1::PlaybookPlan::kind(&()).into(),
-        name: pb_name.into(),
-        uid: pb_uid.into(),
-        ..Default::default()
-    }]);
-
-    job.metadata.labels = Some(BTreeMap::from([(
-        "ansible.cloudbending.dev/playbookplan".into(),
-        job_prefix,
-    )]));
-
-    let pod_template = PodTemplateSpec {
-        metadata: None,
-        spec: Some(PodSpec {
-            restart_policy: Some("Never".into()),
-            volumes: Some(vec![
-                Volume {
-                    name: "playbook".into(),
-                    secret: Some(SecretVolumeSource {
-                        secret_name: Some(pb_name.into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                Volume {
-                    name: "ssh".into(),
-                    secret: Some(SecretVolumeSource {
-                        secret_name: Some(ssh_config.secret_ref.name.clone()),
-                        default_mode: Some(0o0400),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            ]),
-            containers: vec![Container {
-                name: "ansible-playbook".into(),
-                image: Some(plan.spec.image.clone()),
-                working_dir: Some("/run/ansible-operator".into()),
-                volume_mounts: Some(vec![
-                    VolumeMount {
-                        name: "playbook".into(),
-                        mount_path: "/run/ansible-operator".into(),
-                        ..Default::default()
-                    },
-                    VolumeMount {
-                        name: "ssh".into(),
-                        mount_path: "/ssh".into(),
-                        ..Default::default()
-                    },
-                ]),
-                command: Some(ansible::command_renderer::render_ansible_command(
-                    plan, host,
-                )),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }),
-    };
-
-    let job_spec = JobSpec {
-        backoff_limit: Some(0),
-        template: pod_template,
-        ..Default::default()
-    };
-
-    job.spec = Some(job_spec);
-
-    job
 }
