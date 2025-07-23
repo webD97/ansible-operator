@@ -19,13 +19,14 @@ use kube::{
         watcher,
     },
 };
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
-    utils::{create_or_update, upsert_condition},
+    utils::{self, create_or_update, upsert_condition},
     v1beta1::{
-        self, ansible,
+        self, HostStatus, ansible,
         controllers::{inventory_resolver, reconcile_error::ReconcileError},
+        playbookplancontroller::execution_evaluator::{self, must_execute},
     },
 };
 
@@ -130,7 +131,7 @@ async fn reconcile(
     let mut resource_status = object.status.clone().unwrap_or_default();
 
     // Resolve groups
-    info!("Resolving groups");
+    debug!("Resolving groups");
     let resolved_inventories =
         inventory_resolver::resolve(&nodes_api, &object.spec.inventory).await?;
 
@@ -210,16 +211,23 @@ async fn reconcile(
 
     let triggers = object.spec.execution_triggers.as_ref();
 
+    let execution_hash = execution_evaluator::calculate_execution_hash(
+        &object.spec.template.playbook,
+        std::iter::empty(),
+    );
+
     // Create jobs
     if triggers.is_none() || triggers.is_some_and(|triggers| triggers.delayed_until.is_none()) {
-        for host in resolved_inventories.values().flatten() {
+        let must_execute_on = must_execute(&resource_status, execution_hash)?;
+
+        for host in must_execute_on {
             let job = match &object.spec.connection_strategy {
                 v1beta1::ConnectionStrategy::Ssh { ssh } => {
                     super::job_builder::create_job_for_ssh_playbook(
                         host,
                         &object,
                         ssh,
-                        &format_job_prefix(&name, &generation.to_string()),
+                        &format_job_prefix(&name, execution_hash),
                     )
                 }
                 v1beta1::ConnectionStrategy::Chroot {} => todo!(),
@@ -247,7 +255,18 @@ async fn reconcile(
     }
 
     // Read managed jobs and populate status
-    let jobs = get_jobs_for_playbookplan(&jobs_api, &name, &generation.to_string()).await?;
+    let jobs = jobs_api
+        .list(
+            &ListParams::default().labels(
+                format!(
+                    "ansible.cloudbending.dev/playbookplan={}",
+                    format_job_prefix(&name, execution_hash)
+                )
+                .as_str(),
+            ),
+        )
+        .await?;
+
     let num_total = jobs.iter().count();
     let num_successful = count_successful(&jobs);
     let num_failed = count_failed(&jobs);
@@ -317,27 +336,50 @@ async fn reconcile(
         );
     }
 
+    jobs.iter()
+        .filter(|job| {
+            job.status
+                .as_ref()
+                .and_then(|status| status.conditions.as_ref())
+                .map(|conditions| {
+                    conditions.iter().any(|condition| {
+                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .for_each(|job| {
+            if resource_status.hosts_status.is_none() {
+                resource_status.hosts_status = Some(BTreeMap::new());
+            }
+
+            let binding = job.metadata.labels.clone().unwrap_or_default();
+            let target_host = binding.get("ansible.cloudbending.dev/target-host");
+
+            if target_host.is_none() {
+                return;
+            }
+
+            let target_host = target_host.unwrap();
+
+            info!(
+                "Job {} was observed with SuccessCriteriaMet condition.",
+                job.name().unwrap()
+            );
+
+            resource_status
+                .hosts_status
+                .as_mut()
+                .unwrap()
+                .entry(target_host.to_owned())
+                .or_insert(HostStatus {
+                    last_applied_hash: execution_hash.to_string(),
+                });
+        });
+
     persist_status(&playbookplan_api, &object, resource_status).await?;
 
     Ok(Action::requeue(Duration::from_secs(3600)))
-}
-
-async fn get_jobs_for_playbookplan(
-    jobs_api: &Api<Job>,
-    playbookplan_name: &str,
-    generation: &str,
-) -> Result<ObjectList<Job>, kube::Error> {
-    jobs_api
-        .list(
-            &ListParams::default().labels(
-                format!(
-                    "ansible.cloudbending.dev/playbookplan={}",
-                    format_job_prefix(playbookplan_name, generation)
-                )
-                .as_str(),
-            ),
-        )
-        .await
 }
 
 fn count_successful(jobs: &ObjectList<Job>) -> usize {
@@ -411,6 +453,6 @@ fn create_secret_for_playbook(pb_namespace: &str, pb_name: &str, pb_uid: &str) -
     secret
 }
 
-fn format_job_prefix(playbookplan_name: &str, generation: &str) -> String {
-    format!("apply-{playbookplan_name}-{generation}")
+fn format_job_prefix(playbookplan_name: &str, hash: u64) -> String {
+    format!("apply-{playbookplan_name}-{}", utils::generate_id(hash))
 }

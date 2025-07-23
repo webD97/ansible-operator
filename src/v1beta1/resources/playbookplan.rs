@@ -190,6 +190,13 @@ pub struct PlaybookPlanStatus {
     pub eligible_hosts_count: Option<usize>,
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
+    pub hosts_status: Option<BTreeMap<String, HostStatus>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostStatus {
+    pub last_applied_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

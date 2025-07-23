@@ -60,3 +60,38 @@ pub fn upsert_condition<T: Condition>(conditions: &mut Vec<T>, new_condition: T)
         conditions.push(new_condition);
     }
 }
+
+fn encode_base36(mut num: u64) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+    if num == 0 {
+        return "a".repeat(6); // return "aaaaaa" if input is zero, fixed length
+    }
+    let base = ALPHABET.len() as u64;
+    let mut chars = Vec::new();
+
+    while num > 0 {
+        let rem = (num % base) as usize;
+        chars.push(ALPHABET[rem] as char);
+        num /= base;
+    }
+
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+/// Generate a short Kubernetes-like ID for use in resource names
+pub fn generate_id(num: u64) -> String {
+    const LEN: usize = 5;
+
+    let encoded = encode_base36(num);
+
+    if encoded.len() == LEN {
+        encoded
+    } else if encoded.len() > LEN {
+        encoded[encoded.len() - LEN..].to_string()
+    } else {
+        let padding = "a".repeat(LEN - encoded.len());
+        format!("{padding}{encoded}")
+    }
+}

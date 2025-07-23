@@ -39,15 +39,18 @@ pub fn create_job_for_ssh_playbook(
         ..Default::default()
     }]);
 
-    job.metadata.labels = Some(BTreeMap::from([(
-        "ansible.cloudbending.dev/playbookplan".into(),
-        job_prefix.into(),
-    )]));
+    job.metadata.labels = Some(BTreeMap::from([
+        (
+            "ansible.cloudbending.dev/playbookplan".into(),
+            job_prefix.into(),
+        ),
+        ("ansible.cloudbending.dev/target-host".into(), host.into()),
+    ]));
 
     let pod_template = kcore::v1::PodTemplateSpec {
         metadata: None,
         spec: Some(kcore::v1::PodSpec {
-            restart_policy: Some("Never".into()),
+            restart_policy: Some("Never".into()), // todo: maybe configurable
             volumes: Some(vec![
                 kcore::v1::Volume {
                     name: "playbook".into(),
@@ -93,7 +96,7 @@ pub fn create_job_for_ssh_playbook(
     };
 
     let job_spec = batch::v1::JobSpec {
-        backoff_limit: Some(0),
+        backoff_limit: Some(0), // todo: maybe configurable
         template: pod_template,
         ..Default::default()
     };
