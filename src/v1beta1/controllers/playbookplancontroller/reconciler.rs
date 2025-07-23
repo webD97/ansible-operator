@@ -37,10 +37,7 @@ pub fn new(
     client: kube::Client,
 ) -> impl Stream<
     Item = Result<
-        (
-            kube::runtime::reflector::ObjectRef<v1beta1::PlaybookPlan>,
-            Action,
-        ),
+        (ObjectRef<v1beta1::PlaybookPlan>, Action),
         kube::runtime::controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
