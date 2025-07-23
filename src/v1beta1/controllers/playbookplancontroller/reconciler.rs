@@ -212,39 +212,37 @@ async fn reconcile(
 
     // Create jobs
     if triggers.is_none() || triggers.is_some_and(|triggers| triggers.delayed_until.is_none()) {
-        for (_, hosts) in resolved_inventories.iter() {
-            for host in hosts {
-                let job = match &object.spec.connection_strategy {
-                    v1beta1::ConnectionStrategy::Ssh { ssh } => {
-                        super::job_builder::create_job_for_ssh_playbook(
-                            host,
-                            &object,
-                            ssh,
-                            &format_job_prefix(&name, &generation.to_string()),
-                        )
-                    }
-                    v1beta1::ConnectionStrategy::Chroot {} => todo!(),
-                }?;
-
-                let job_name = job.name().ok_or(ReconcileError::PreconditionFailed(
-                    "name not set in rendered job",
-                ))?;
-
-                if jobs_api.get_opt(&job_name).await?.is_some() {
-                    continue;
-                }
-
-                info!("Creating job {job_name}");
-                jobs_api
-                    .create(
-                        &PostParams {
-                            field_manager: Some("ansible-operator".into()),
-                            ..Default::default()
-                        },
-                        &job,
+        for host in resolved_inventories.values().flatten() {
+            let job = match &object.spec.connection_strategy {
+                v1beta1::ConnectionStrategy::Ssh { ssh } => {
+                    super::job_builder::create_job_for_ssh_playbook(
+                        host,
+                        &object,
+                        ssh,
+                        &format_job_prefix(&name, &generation.to_string()),
                     )
-                    .await?;
+                }
+                v1beta1::ConnectionStrategy::Chroot {} => todo!(),
+            }?;
+
+            let job_name = job.name().ok_or(ReconcileError::PreconditionFailed(
+                "name not set in rendered job",
+            ))?;
+
+            if jobs_api.get_opt(&job_name).await?.is_some() {
+                continue;
             }
+
+            info!("Creating job {job_name}");
+            jobs_api
+                .create(
+                    &PostParams {
+                        field_manager: Some("ansible-operator".into()),
+                        ..Default::default()
+                    },
+                    &job,
+                )
+                .await?;
         }
     }
 
