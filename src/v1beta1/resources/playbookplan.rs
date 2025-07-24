@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use kube::CustomResource;
 use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
@@ -79,8 +79,24 @@ pub struct PlaybookTemplate {
     pub files: Option<Vec<FilesSource>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
-pub struct FilesSource(#[schemars(with = "GenericMap")] k8s_openapi::api::core::v1::Volume);
+#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[serde(untagged)]
+pub enum FilesSource {
+    /// Secrets get a special treatment during reconciliation
+    #[serde(rename_all = "camelCase")]
+    Secret { name: String, secret_ref: SecretRef },
+
+    /// Other volume types will be passed to the Ansible jobs as-is
+    Other(GenericNativeVolume),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
+pub struct GenericNativeVolume {
+    name: String,
+    #[serde(flatten)]
+    #[schemars(with = "GenericMap")]
+    extra: HashMap<String, serde_yaml::Value>,
+}
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -224,69 +240,154 @@ impl Condition for PlaybookPlanCondition {
     }
 }
 
-#[test]
-fn test_schema() {
-    let playbookplan = PlaybookPlan::new(
-        "blubb",
-        PlaybookPlanSpec {
-            image: "registry.tld/ansible:1.0.0".to_string(),
-            execution_triggers: Some(ExecutionTriggers {
-                delayed_until: None,
-                schedule: Some("0 1 * * *".into()),
-            }),
-            inventory: vec![
-                Inventory {
-                    name: "controlplane".into(),
-                    hosts: Hosts::FromClusterNodes {
-                        from_nodes: NodeSelectorTerm::MatchLabels {
-                            labels: {
-                                let mut labels = BTreeMap::new();
-                                labels.insert(
-                                    "node.kubernetes.io/role".into(),
-                                    "controlplane".into(),
-                                );
-                                labels
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialization() {
+        let playbookplan = PlaybookPlan::new(
+            "blubb",
+            PlaybookPlanSpec {
+                image: "registry.tld/ansible:1.0.0".to_string(),
+                execution_triggers: Some(ExecutionTriggers {
+                    delayed_until: None,
+                    schedule: Some("0 1 * * *".into()),
+                }),
+                inventory: vec![
+                    Inventory {
+                        name: "controlplane".into(),
+                        hosts: Hosts::FromClusterNodes {
+                            from_nodes: NodeSelectorTerm::MatchLabels {
+                                labels: {
+                                    let mut labels = BTreeMap::new();
+                                    labels.insert(
+                                        "node.kubernetes.io/role".into(),
+                                        "controlplane".into(),
+                                    );
+                                    labels
+                                },
                             },
                         },
                     },
-                },
-                Inventory {
-                    name: "workers".into(),
-                    hosts: Hosts::FromClusterNodes {
-                        from_nodes: NodeSelectorTerm::MatchLabels {
-                            labels: {
-                                let mut labels = BTreeMap::new();
-                                labels.insert("node.kubernetes.io/role".into(), "worker".into());
-                                labels
+                    Inventory {
+                        name: "workers".into(),
+                        hosts: Hosts::FromClusterNodes {
+                            from_nodes: NodeSelectorTerm::MatchLabels {
+                                labels: {
+                                    let mut labels = BTreeMap::new();
+                                    labels
+                                        .insert("node.kubernetes.io/role".into(), "worker".into());
+                                    labels
+                                },
                             },
                         },
                     },
-                },
-            ],
-            connection_strategy: ConnectionStrategy::Ssh {
-                ssh: SshConfig {
-                    user: "root".into(),
-                    secret_ref: SecretRef {
-                        name: "ssh-key".into(),
+                ],
+                connection_strategy: ConnectionStrategy::Ssh {
+                    ssh: SshConfig {
+                        user: "root".into(),
+                        secret_ref: SecretRef {
+                            name: "ssh-key".into(),
+                        },
                     },
                 },
-            },
-            template: PlaybookTemplate {
-                playbook: r#"
+                template: PlaybookTemplate {
+                    variables: Some(vec![PlaybookVariableSource::SecretRef {
+                        secret_ref: SecretRef {
+                            name: "some-secret".into(),
+                        },
+                    }]),
+                    files: Some(vec![FilesSource::Secret {
+                        name: "some-name".into(),
+                        secret_ref: SecretRef {
+                            name: "secret-with-files".into(),
+                        },
+                    }]),
+                    playbook: r#"
 - tasks:
     - name: Ensure httpd installed
         ansible.builtin.dnf:
             name: httpd
             state: installed
             "#
-                .into(),
-                variables: None,
-                files: None,
+                    .into(),
+                },
             },
-        },
-    );
+        );
 
-    let serialized = serde_yaml::to_string(&playbookplan).unwrap();
+        let serialized = serde_yaml::to_string(&playbookplan).unwrap();
 
-    println!("{serialized}");
+        println!("{serialized}");
+    }
+
+    #[test]
+    fn test_deserialization() {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  inventory:
+    - name: ccu
+      hosts:
+        fromList:
+          - ccu.fritz.box
+    - name: k3s
+      hosts:
+        fromNodes:
+          matchLabels:
+            node.kubernetes.io/instance-type: k3s
+  connectionStrategy:
+    ssh:
+      user: root
+      secretRef:
+        name: ssh
+  template:
+    variables:
+      - inline:
+          key: value
+          nested:
+            otherkey: othervalue
+      - secretRef:
+          name: secret-with-variables
+    files:
+      - name: some-configs
+        secretRef:
+          name: secret-with-config-files
+      - name: binary-assets
+        image:
+          reference: my.registry.tld/the-image:v2
+          pullPolicy: IfNotPresent
+    playbook: |
+      - hosts: all
+        tasks:
+          - name: Echo someting
+            ansible.builtin.command:
+              command: echo Hello
+        "#;
+
+        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+
+        assert!(pp.spec.template.files.is_some());
+
+        let files = pp.spec.template.files.as_ref().unwrap();
+
+        assert!(matches!(
+            files.first().unwrap(),
+            FilesSource::Secret {
+                name,
+                secret_ref: _
+            } if name == "some-configs"
+        ));
+
+        assert!(matches!(
+            files.get(1).unwrap(),
+            FilesSource::Other (other) if other.name == "binary-assets"
+        ));
+
+        println!("{pp:?}");
+    }
 }
