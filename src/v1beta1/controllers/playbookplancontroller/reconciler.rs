@@ -26,7 +26,10 @@ use crate::{
     v1beta1::{
         self, HostStatus, ansible,
         controllers::{inventory_resolver, reconcile_error::ReconcileError},
-        playbookplancontroller::execution_evaluator::{self, must_execute},
+        playbookplancontroller::{
+            execution_evaluator::{self, must_execute},
+            mappers,
+        },
     },
 };
 
@@ -48,10 +51,11 @@ pub fn new(
 
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
     let nodes_api: Api<Node> = Api::all(client.clone());
-    let jobs_api: Api<Job> = Api::all(client);
+    let jobs_api: Api<Job> = Api::all(client.clone());
+    let secrets_api: Api<Secret> = Api::all(client);
 
     let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
-    let playbookplan_reflector_reader = playbookplan_reflector_writer.as_reader();
+    let playbookplan_reflector_reader = Arc::new(playbookplan_reflector_writer.as_reader());
 
     let playbookplan_reflector = kube::runtime::reflector(
         playbookplan_reflector_writer,
@@ -69,27 +73,18 @@ pub fn new(
             .await;
     });
 
-    Controller::new(playbookplans_api, kube::runtime::watcher::Config::default())
-        // If a managed job updates, trigger PlaybookPlan reconciliation
+    Controller::new(playbookplans_api, watcher::Config::default())
         .owns(jobs_api, watcher::Config::default())
-        // If a node updates, trigger reconciliation of all PlaybookPlans with a `fromNodes` inventory
-        .watches(nodes_api, watcher::Config::default(), move |_| {
-            playbookplan_reflector_reader
-                .state()
-                .iter()
-                .filter(|resource| {
-                    resource
-                        .spec
-                        .inventory
-                        .iter()
-                        .any(|inventory| match &inventory.hosts {
-                            v1beta1::Hosts::FromClusterNodes { .. } => true,
-                            v1beta1::Hosts::FromStaticList { .. } => false,
-                        })
-                })
-                .map(|resource| ObjectRef::from(&**resource))
-                .collect::<Vec<_>>()
-        })
+        .watches(
+            nodes_api,
+            watcher::Config::default(),
+            mappers::node_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
+        .watches(
+            secrets_api,
+            watcher::Config::default(),
+            mappers::secret_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
         .run(
             reconcile,
             |_, _, _| Action::requeue(Duration::from_secs(15)),
