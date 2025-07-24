@@ -3,6 +3,8 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use k8s_openapi::ByteString;
+
 use crate::v1beta1::{self, controllers::reconcile_error::ReconcileError};
 
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
@@ -40,7 +42,7 @@ pub fn must_execute<'a>(
 
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
 /// With regards to the secrets, the hash is order-insensitive.
-pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<&'a str, &'a str>>>(
+pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, ByteString>>>(
     playbook: &str,
     secrets: T,
 ) -> u64 {
@@ -51,7 +53,12 @@ pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<&'a str,
     })
     .chain(secrets.into_iter().map(|secret| {
         let mut hasher = twox_hash::XxHash3_64::new();
-        secret.hash(&mut hasher);
+
+        for (key, value) in secret {
+            key.hash(&mut hasher);
+            value.0.hash(&mut hasher);
+        }
+
         hasher.finish()
     }))
     .fold(0u64, |prev, next| prev ^ next)
@@ -153,9 +160,18 @@ mod tests {
     pub fn test_calculate_execution_hash_is_order_insensitive() {
         // Given
         let playbook = "awesome playbook here";
-        let secret1_data = BTreeMap::from_iter(vec![("key-1", "data-1"), ("key-2", "value-2")]);
-        let secret2_data = BTreeMap::from_iter(vec![("meaningful_number", "73")]);
-        let secret3_data = BTreeMap::from_iter(vec![("answer", "forty-two")]);
+        let secret1_data = BTreeMap::from_iter(vec![
+            ("key-1".to_string(), ByteString(b"data-1".to_vec())),
+            ("key-2".to_string(), ByteString(b"value-2".to_vec())),
+        ]);
+        let secret2_data = BTreeMap::from_iter(vec![(
+            "meaningful_number".to_string(),
+            ByteString(b"73".to_vec()),
+        )]);
+        let secret3_data = BTreeMap::from_iter(vec![(
+            "answer".to_string(),
+            ByteString(b"forty-two".to_vec()),
+        )]);
 
         // When
         let hashed_1 =

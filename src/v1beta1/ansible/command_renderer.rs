@@ -1,6 +1,10 @@
 use crate::v1beta1::{self, PlaybookVariableSource};
 
-pub fn render_ansible_command(plan: &v1beta1::PlaybookPlan, hostname: &str) -> Vec<String> {
+pub fn render_ansible_command(
+    plan: &v1beta1::PlaybookPlan,
+    hostname: &str,
+    extra_vars_filepaths: Vec<&String>,
+) -> Vec<String> {
     let static_vars_filenames: Vec<String> = plan
         .spec
         .template
@@ -26,6 +30,8 @@ pub fn render_ansible_command(plan: &v1beta1::PlaybookPlan, hostname: &str) -> V
             .iter()
             .flat_map(|path| ["--extra-vars".into(), format!("@{path}")]),
     );
+
+    ansible_command.extend(extra_vars_filepaths.iter().map(|path| format!("@{path}")));
 
     let connection_args = match &plan.spec.connection_strategy {
         v1beta1::ConnectionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],

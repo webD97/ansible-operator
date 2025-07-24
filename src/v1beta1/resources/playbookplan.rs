@@ -76,7 +76,7 @@ pub struct PlaybookTemplate {
     pub variables: Option<Vec<PlaybookVariableSource>>,
 
     /// Files for the playbook
-    #[schemars(with = "GenericMap")]
+    #[schemars(with = "Option<Vec<GenericMap>>")]
     pub files: Option<Vec<FilesSource>>,
 }
 

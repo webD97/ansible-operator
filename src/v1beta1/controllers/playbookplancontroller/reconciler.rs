@@ -28,7 +28,7 @@ use crate::{
         controllers::{inventory_resolver, reconcile_error::ReconcileError},
         playbookplancontroller::{
             execution_evaluator::{self, must_execute},
-            mappers,
+            job_builder, mappers,
         },
     },
 };
@@ -204,12 +204,27 @@ async fn reconcile(
         resource_status.last_rendered_generation = Some(generation);
     }
 
-    let triggers = object.spec.execution_triggers.as_ref();
+    let variables_secret_names = job_builder::extract_secret_names_for_variables(&object);
+
+    let secrets = futures::future::join_all(
+        variables_secret_names
+            .iter()
+            .map(|secret_name| secrets_api.get(secret_name)),
+    )
+    .await;
+
+    let variables_secrets: Vec<BTreeMap<_, _>> = secrets
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .filter_map(|secret| secret.data.clone())
+        .collect();
 
     let execution_hash = execution_evaluator::calculate_execution_hash(
         &object.spec.template.playbook,
-        std::iter::empty(),
+        variables_secrets.iter(),
     );
+
+    let triggers = object.spec.execution_triggers.as_ref();
 
     // Create jobs
     if triggers.is_none() || triggers.is_some_and(|triggers| triggers.delayed_until.is_none()) {
