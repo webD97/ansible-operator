@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use kube::CustomResource;
 use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
@@ -76,26 +76,20 @@ pub struct PlaybookTemplate {
     pub variables: Option<Vec<PlaybookVariableSource>>,
 
     /// Files for the playbook
+    #[schemars(with = "GenericMap")]
     pub files: Option<Vec<FilesSource>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum FilesSource {
-    /// Secrets get a special treatment during reconciliation
     #[serde(rename_all = "camelCase")]
     Secret { name: String, secret_ref: SecretRef },
-
-    /// Other volume types will be passed to the Ansible jobs as-is
-    Other(GenericNativeVolume),
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
-pub struct GenericNativeVolume {
-    name: String,
-    #[serde(flatten)]
-    #[schemars(with = "GenericMap")]
-    extra: HashMap<String, serde_yaml::Value>,
+    Other {
+        name: String,
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>, // JSON preferred
+    },
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -385,7 +379,7 @@ spec:
 
         assert!(matches!(
             files.get(1).unwrap(),
-            FilesSource::Other (other) if other.name == "binary-assets"
+            FilesSource::Other {name, extra: _} if name == "binary-assets"
         ));
 
         println!("{pp:?}");
