@@ -88,7 +88,7 @@ pub enum FilesSource {
     Other {
         name: String,
         #[serde(flatten)]
-        extra: BTreeMap<String, serde_json::Value>, // JSON preferred
+        extra: BTreeMap<String, serde_json::Value>,
     },
 }
 
