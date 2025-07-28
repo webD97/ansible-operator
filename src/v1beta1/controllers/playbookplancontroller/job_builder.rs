@@ -12,22 +12,73 @@ use k8s_openapi::{
 };
 use kube::runtime::reflector::Lookup as _;
 
-use crate::v1beta1::{
-    self, FilesSource, PlaybookPlan, PlaybookVariableSource,
-    controllers::reconcile_error::ReconcileError,
+use crate::{
+    utils,
+    v1beta1::{
+        self, FilesSource, PlaybookPlan, PlaybookVariableSource,
+        controllers::reconcile_error::ReconcileError, labels,
+    },
 };
 
+pub fn create_job_for_host(
+    host: &str,
+    hash: u64,
+    object: &PlaybookPlan,
+) -> Result<batch::v1::Job, ReconcileError> {
+    let pb_name = object
+        .metadata
+        .name
+        .as_ref()
+        .expect(".metadata.name must be set here");
+
+    let pb_namespace = object
+        .metadata
+        .namespace
+        .as_ref()
+        .expect(".metadata.namespace must be set here");
+
+    let pb_uid = object
+        .metadata
+        .uid
+        .as_ref()
+        .expect(".metadata.uid must be set here");
+
+    let mut partial_job = match &object.spec.connection_strategy {
+        v1beta1::ConnectionStrategy::Ssh { ssh } => {
+            super::job_builder::create_ssh_job(host, object, ssh)
+        }
+        v1beta1::ConnectionStrategy::Chroot {} => todo!(),
+    }?;
+
+    partial_job.metadata.namespace = Some(pb_namespace.into());
+
+    partial_job.metadata.owner_references = Some(vec![OwnerReference {
+        api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
+        kind: v1beta1::PlaybookPlan::kind(&()).into(),
+        name: pb_name.to_string(),
+        uid: pb_uid.into(),
+        ..Default::default()
+    }]);
+
+    partial_job.metadata.name = Some(format!(
+        "apply-{pb_name}-{}-on-{host}",
+        utils::generate_id(hash)
+    ));
+    partial_job.metadata.labels = Some(BTreeMap::from([
+        (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
+        (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
+        (labels::PLAYBOOKPLAN_HOST.into(), host.into()),
+    ]));
+
+    Ok(partial_job)
+}
+
 /// Creates a Kubernetes Job to execute and SSH-based Ansible playbook.
-pub fn create_job_for_ssh_playbook(
+fn create_ssh_job(
     host: &str,
     plan: &v1beta1::PlaybookPlan,
     ssh_config: &v1beta1::SshConfig,
-    job_prefix: &str,
 ) -> Result<batch::v1::Job, ReconcileError> {
-    let pb_namespace = plan.namespace().ok_or(ReconcileError::PreconditionFailed(
-        "expected .metadata.namespace in PlaybookPlan",
-    ))?;
-
     let pb_name = plan.name().ok_or(ReconcileError::PreconditionFailed(
         "expected .metadata.name in PlaybookPlan",
     ))?;
@@ -38,9 +89,6 @@ pub fn create_job_for_ssh_playbook(
 
     let mut job = batch::v1::Job::default();
 
-    job.metadata.namespace = Some(pb_namespace.into());
-    job.metadata.name = Some(format!("{job_prefix}-on-{host}"));
-
     job.metadata.owner_references = Some(vec![OwnerReference {
         api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
         kind: v1beta1::PlaybookPlan::kind(&()).into(),
@@ -48,14 +96,6 @@ pub fn create_job_for_ssh_playbook(
         uid: pb_uid.into(),
         ..Default::default()
     }]);
-
-    job.metadata.labels = Some(BTreeMap::from([
-        (
-            "ansible.cloudbending.dev/playbookplan".into(),
-            job_prefix.into(),
-        ),
-        ("ansible.cloudbending.dev/target-host".into(), host.into()),
-    ]));
 
     let variable_secrets: Vec<&String> = extract_secret_names_for_variables(plan).collect();
 

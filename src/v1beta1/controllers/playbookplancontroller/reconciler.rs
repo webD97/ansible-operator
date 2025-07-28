@@ -1,17 +1,15 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-
+use crate::v1beta1::{
+    labels,
+    playbookplancontroller::workspace::{self, render_secret},
+};
 use futures_util::{Stream, StreamExt as _};
-use k8s_openapi::{
-    api::{
-        batch::v1::Job,
-        core::v1::{Node, Secret},
-    },
-    apimachinery::pkg::apis::meta::v1::OwnerReference,
-    chrono::Utc,
+use k8s_openapi::api::{
+    batch::v1::Job,
+    core::v1::{Node, Secret},
 };
 use kube::{
-    Api, Resource,
-    api::{ListParams, ObjectList, PostParams},
+    Api,
+    api::{ListParams, PostParams},
     runtime::{
         Controller,
         controller::Action,
@@ -19,21 +17,24 @@ use kube::{
         watcher,
     },
 };
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tracing::{debug, info};
 
 use crate::{
-    utils::{self, create_or_update, upsert_condition},
+    utils::create_or_update,
     v1beta1::{
-        self, HostStatus, ansible,
+        self, PlaybookPlan,
         controllers::{inventory_resolver, reconcile_error::ReconcileError},
         playbookplancontroller::{
-            execution_evaluator::{self, must_execute},
+            execution_evaluator::{self, find_outdated_hosts},
             job_builder, mappers,
+            status::{evaluate_per_host_status, evaluate_playbookplan_conditions},
+            triggers::evaluate_triggers,
         },
     },
 };
 
-struct Context {
+struct ReconciliationContext {
     client: kube::Client,
 }
 
@@ -45,7 +46,7 @@ pub fn new(
         kube::runtime::controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
-    let context = Arc::new(Context {
+    let context = Arc::new(ReconciliationContext {
         client: client.clone(),
     });
 
@@ -54,24 +55,28 @@ pub fn new(
     let jobs_api: Api<Job> = Api::all(client.clone());
     let secrets_api: Api<Secret> = Api::all(client);
 
-    let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
-    let playbookplan_reflector_reader = Arc::new(playbookplan_reflector_writer.as_reader());
+    let playbookplan_reflector_reader = {
+        let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
+        let playbookplan_reflector_reader = Arc::new(playbookplan_reflector_writer.as_reader());
 
-    let playbookplan_reflector = kube::runtime::reflector(
-        playbookplan_reflector_writer,
-        watcher(playbookplans_api.clone(), watcher::Config::default()),
-    );
+        let playbookplan_reflector = kube::runtime::reflector(
+            playbookplan_reflector_writer,
+            watcher(playbookplans_api.clone(), watcher::Config::default()),
+        );
 
-    tokio::spawn(async move {
-        playbookplan_reflector
-            .for_each(|event| async {
-                match event {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Reflector error: {e:?}"),
-                }
-            })
-            .await;
-    });
+        tokio::spawn(async move {
+            playbookplan_reflector
+                .for_each(|event| async {
+                    match event {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Reflector error: {e:?}"),
+                    }
+                })
+                .await;
+        });
+
+        playbookplan_reflector_reader
+    };
 
     Controller::new(playbookplans_api, watcher::Config::default())
         .owns(jobs_api, watcher::Config::default())
@@ -94,11 +99,11 @@ pub fn new(
 
 async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
-    context: Arc<Context>,
+    context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
-    // Check for deletion
+    // If object is being deleted, stop reonciliation
     if object.metadata.deletion_timestamp.is_some() {
         return Ok(Action::await_change());
     }
@@ -109,9 +114,6 @@ async fn reconcile(
     let name = object
         .name()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
-    let uid = object
-        .uid()
-        .ok_or(ReconcileError::PreconditionFailed("uid not set"))?;
     let generation = object
         .metadata
         .generation
@@ -140,42 +142,10 @@ async fn reconcile(
     );
     resource_status.eligible_hosts = Some(resolved_inventories.clone());
 
-    let rendered_playbook_outdated = object
-        .status
-        .as_ref()
-        .and_then(|s| s.last_rendered_generation)
-        .map(|g| g < generation)
-        .unwrap_or(true);
-
     // Render playbook if necessary
-    if secrets_api.get_opt(&name).await?.is_none() || rendered_playbook_outdated {
+    if workspace::is_missing(&secrets_api, &name).await? || workspace::is_outdated(&object) {
         info!("Rendering playbook to secret");
-        let rendered_playbook = ansible::render_playbook(&object.spec)?;
-        let rendered_inventory = ansible::render_inventory(&resolved_inventories)?;
-
-        let inlined_variables = match &object.spec.template.variables {
-            Some(variable_sources) => variable_sources
-                .iter()
-                .filter_map(|source| match source {
-                    v1beta1::PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
-                    v1beta1::PlaybookVariableSource::Inline { inline } => Some(inline),
-                })
-                .map(serde_yaml::to_string)
-                .collect(),
-            None => Vec::new(),
-        };
-
-        let mut secret = create_secret_for_playbook(&namespace, &name, &uid);
-
-        let mut string_data = BTreeMap::new();
-        string_data.insert("playbook.yml".into(), rendered_playbook);
-        string_data.insert("inventory.yml".into(), rendered_inventory);
-
-        for (index, variable_set) in inlined_variables.into_iter().enumerate() {
-            string_data.insert(format!("static-variables-{index}.yml"), variable_set?);
-        }
-
-        secret.string_data = Some(string_data);
+        let secret = render_secret(&object, &resolved_inventories)?;
 
         create_or_update(
             &secrets_api,
@@ -204,41 +174,24 @@ async fn reconcile(
         resource_status.last_rendered_generation = Some(generation);
     }
 
-    let related_secret_names: Vec<&String> =
-        job_builder::extract_secret_names_for_variables(&object)
-            .chain(job_builder::extract_secret_names_for_files(&object))
-            .collect();
-
+    let related_secrets = get_related_secrets(&object);
     let execution_hash = hash_playbook_and_secrets(
         &object.spec.template.playbook,
-        &related_secret_names,
+        &related_secrets,
         &secrets_api,
     )
     .await;
 
-    let triggers = object.spec.execution_triggers.as_ref();
-
     // Create jobs
-    if triggers.is_none() || triggers.is_some_and(|triggers| triggers.delayed_until.is_none()) {
-        let must_execute_on = must_execute(&resource_status, execution_hash)?;
+    if evaluate_triggers(object.spec.execution_triggers.as_ref()) {
+        for outdated_host in find_outdated_hosts(&resource_status, execution_hash)? {
+            let job = job_builder::create_job_for_host(outdated_host, execution_hash, &object)?;
+            let job_name = job
+                .name()
+                .expect(".metadata.name must be set at this point");
 
-        for host in must_execute_on {
-            let job = match &object.spec.connection_strategy {
-                v1beta1::ConnectionStrategy::Ssh { ssh } => {
-                    super::job_builder::create_job_for_ssh_playbook(
-                        host,
-                        &object,
-                        ssh,
-                        &format_job_prefix(&name, execution_hash),
-                    )
-                }
-                v1beta1::ConnectionStrategy::Chroot {} => todo!(),
-            }?;
-
-            let job_name = job.name().ok_or(ReconcileError::PreconditionFailed(
-                "name not set in rendered job",
-            ))?;
-
+            // Job already exists, skip creating another one
+            // TODO: Check for jobs with another hash and decide if we need to replace them
             if jobs_api.get_opt(&job_name).await?.is_some() {
                 continue;
             }
@@ -261,159 +214,29 @@ async fn reconcile(
         .list(
             &ListParams::default().labels(
                 format!(
-                    "ansible.cloudbending.dev/playbookplan={}",
-                    format_job_prefix(&name, execution_hash)
+                    "{}={name},{}={execution_hash}",
+                    labels::PLAYBOOKPLAN_NAME,
+                    labels::PLAYBOOKPLAN_HASH
                 )
                 .as_str(),
             ),
         )
         .await?;
 
-    let num_total = jobs.iter().count();
-    let num_successful = count_successful(&jobs);
-    let num_failed = count_failed(&jobs);
-    let num_finished = num_failed + num_successful;
-    let num_running = num_total - num_finished;
-
-    // Handle "Running" condition
-    if num_finished < num_total {
-        upsert_condition(
-            &mut resource_status.conditions,
-            v1beta1::PlaybookPlanCondition {
-                type_: "Running".into(),
-                status: "True".into(),
-                reason: Some("JobsRunning".into()),
-                message: Some(format!("{num_running} jobs are currently running")),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
-            },
-        );
-    } else {
-        upsert_condition(
-            &mut resource_status.conditions,
-            v1beta1::PlaybookPlanCondition {
-                type_: "Running".into(),
-                status: "False".into(),
-                reason: None,
-                message: None,
-                last_transition_time: Some(Utc::now().to_rfc3339()),
-            },
-        );
-    }
-
-    // Handle "Ready" condition
-    if num_successful == num_total {
-        upsert_condition(
-            &mut resource_status.conditions,
-            v1beta1::PlaybookPlanCondition {
-                type_: "Ready".into(),
-                status: "True".into(),
-                reason: Some("AllJobsSucceeded".into()),
-                message: Some(format!(
-                    "{num_successful}/{num_total} jobs completed successfully"
-                )),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
-            },
-        );
-    } else if num_failed > 0 {
-        upsert_condition(
-            &mut resource_status.conditions,
-            v1beta1::PlaybookPlanCondition {
-                type_: "Ready".into(),
-                status: "False".into(),
-                reason: Some("SomeOrAllJobsFailed".into()),
-                message: Some(format!("{num_failed}/{num_total} jobs have failed")),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
-            },
-        );
-    } else {
-        upsert_condition(
-            &mut resource_status.conditions,
-            v1beta1::PlaybookPlanCondition {
-                type_: "Ready".into(),
-                status: "False".into(),
-                reason: Some("AwaitingJobResults".into()),
-                message: Some(format!("{num_running} jobs are running")),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
-            },
-        );
-    }
-
-    jobs.iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .for_each(|job| {
-            if resource_status.hosts_status.is_none() {
-                resource_status.hosts_status = Some(BTreeMap::new());
-            }
-
-            let binding = job.metadata.labels.clone().unwrap_or_default();
-            let target_host = binding.get("ansible.cloudbending.dev/target-host");
-
-            if target_host.is_none() {
-                return;
-            }
-
-            let target_host = target_host.unwrap();
-
-            info!(
-                "Job {} was observed with SuccessCriteriaMet condition.",
-                job.name().unwrap()
-            );
-
-            resource_status
-                .hosts_status
-                .as_mut()
-                .unwrap()
-                .entry(target_host.to_owned())
-                .or_insert(HostStatus {
-                    last_applied_hash: execution_hash.to_string(),
-                });
-        });
+    evaluate_playbookplan_conditions(&jobs, &mut resource_status);
+    evaluate_per_host_status(&jobs, execution_hash, &mut resource_status);
 
     persist_status(&playbookplan_api, &object, resource_status).await?;
 
     Ok(Action::requeue(Duration::from_secs(3600)))
 }
 
-fn count_successful(jobs: &ObjectList<Job>) -> usize {
-    jobs.iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .count()
-}
-
-fn count_failed(jobs: &ObjectList<Job>) -> usize {
-    jobs.iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions
-                        .iter()
-                        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
-                })
-                .unwrap_or(false)
-        })
-        .count()
+/// Returns a list of all secret names that the given PlaybookPlan references. This includes for
+/// example secrets used as Ansible variables.
+fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
+    job_builder::extract_secret_names_for_variables(playbookplan)
+        .chain(job_builder::extract_secret_names_for_files(playbookplan))
+        .collect()
 }
 
 async fn persist_status(
@@ -436,27 +259,6 @@ async fn persist_status(
         .await?;
 
     Ok(())
-}
-
-fn create_secret_for_playbook(pb_namespace: &str, pb_name: &str, pb_uid: &str) -> Secret {
-    let mut secret = Secret::default();
-
-    secret.metadata.namespace = Some(pb_namespace.into());
-    secret.metadata.name = Some(pb_name.into());
-
-    secret.metadata.owner_references = Some(vec![OwnerReference {
-        api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
-        kind: v1beta1::PlaybookPlan::kind(&()).into(),
-        name: pb_name.into(),
-        uid: pb_uid.into(),
-        ..Default::default()
-    }]);
-
-    secret
-}
-
-fn format_job_prefix(playbookplan_name: &str, hash: u64) -> String {
-    format!("apply-{playbookplan_name}-{}", utils::generate_id(hash))
 }
 
 async fn hash_playbook_and_secrets(

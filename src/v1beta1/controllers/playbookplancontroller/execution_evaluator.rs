@@ -8,7 +8,7 @@ use k8s_openapi::ByteString;
 use crate::v1beta1::{self, controllers::reconcile_error::ReconcileError};
 
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
-pub fn must_execute<'a>(
+pub fn find_outdated_hosts<'a>(
     status: &'a v1beta1::PlaybookPlanStatus,
     execution_hash: u64,
 ) -> Result<Box<dyn Iterator<Item = &'a String> + Send + 'a>, ReconcileError> {
@@ -81,7 +81,7 @@ mod tests {
         };
 
         // When
-        let to_execute = must_execute(&status, 1u64);
+        let to_execute = find_outdated_hosts(&status, 1u64);
 
         // Then
         assert_eq!(to_execute.unwrap().count(), 0);
@@ -100,7 +100,7 @@ mod tests {
         };
 
         // When
-        let to_execute = must_execute(&status, 1u64);
+        let to_execute = find_outdated_hosts(&status, 1u64);
 
         // Then
         let expected_hostnames = [
@@ -146,7 +146,7 @@ mod tests {
         };
 
         // When
-        let to_execute = must_execute(&status, 2u64);
+        let to_execute = find_outdated_hosts(&status, 2u64);
 
         // Then
         let expected_hostnames = ["host-1".to_owned(), "host-3".to_owned()];
