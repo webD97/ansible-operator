@@ -105,6 +105,7 @@ pub struct ExecutionTriggers {
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum PlaybookVariableSource {
+    /// Extra variables to read from a secret. These must be within `.data."variables.yaml"`.
     #[serde(rename_all = "camelCase")]
     SecretRef {
         secret_ref: SecretRef,

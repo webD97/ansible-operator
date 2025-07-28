@@ -204,25 +204,17 @@ async fn reconcile(
         resource_status.last_rendered_generation = Some(generation);
     }
 
-    let variables_secret_names = job_builder::extract_secret_names_for_variables(&object);
+    let related_secret_names: Vec<&String> =
+        job_builder::extract_secret_names_for_variables(&object)
+            .chain(job_builder::extract_secret_names_for_files(&object))
+            .collect();
 
-    let secrets = futures::future::join_all(
-        variables_secret_names
-            .iter()
-            .map(|secret_name| secrets_api.get(secret_name)),
+    let execution_hash = hash_playbook_and_secrets(
+        &object.spec.template.playbook,
+        &related_secret_names,
+        &secrets_api,
     )
     .await;
-
-    let variables_secrets: Vec<BTreeMap<_, _>> = secrets
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .filter_map(|secret| secret.data.clone())
-        .collect();
-
-    let execution_hash = execution_evaluator::calculate_execution_hash(
-        &object.spec.template.playbook,
-        variables_secrets.iter(),
-    );
 
     let triggers = object.spec.execution_triggers.as_ref();
 
@@ -465,4 +457,25 @@ fn create_secret_for_playbook(pb_namespace: &str, pb_name: &str, pb_uid: &str) -
 
 fn format_job_prefix(playbookplan_name: &str, hash: u64) -> String {
     format!("apply-{playbookplan_name}-{}", utils::generate_id(hash))
+}
+
+async fn hash_playbook_and_secrets(
+    playbook: &str,
+    secret_names: &[&String],
+    secrets_api: &Api<Secret>,
+) -> u64 {
+    let secrets = futures::future::join_all(
+        secret_names
+            .iter()
+            .map(|secret_name| secrets_api.get(secret_name)),
+    )
+    .await;
+
+    let variables_secrets: Vec<BTreeMap<_, _>> = secrets
+        .iter()
+        .filter_map(|result| result.as_ref().ok())
+        .filter_map(|secret| secret.data.clone())
+        .collect();
+
+    execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
 }

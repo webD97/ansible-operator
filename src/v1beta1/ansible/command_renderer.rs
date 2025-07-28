@@ -31,7 +31,12 @@ pub fn render_ansible_command(
             .flat_map(|path| ["--extra-vars".into(), format!("@{path}")]),
     );
 
-    ansible_command.extend(extra_vars_filepaths.iter().map(|path| format!("@{path}")));
+    ansible_command.extend(extra_vars_filepaths.iter().flat_map(|path| {
+        [
+            "--extra-vars".into(),
+            format!("@/run/ansible-operator/vars/{path}/variables.yaml"),
+        ]
+    }));
 
     let connection_args = match &plan.spec.connection_strategy {
         v1beta1::ConnectionStrategy::Chroot {} => vec!["-i".into(), "/mnt/host,".into()],
