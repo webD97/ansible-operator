@@ -78,6 +78,9 @@ pub struct PlaybookTemplate {
     /// Files for the playbook
     #[schemars(with = "Option<Vec<GenericMap>>")]
     pub files: Option<Vec<FilesSource>>,
+
+    /// Runtime requirements (e.g. Ansible collections)
+    pub requirements: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -307,6 +310,7 @@ mod tests {
             state: installed
             "#
                     .into(),
+                    ..Default::default()
                 },
             },
         );

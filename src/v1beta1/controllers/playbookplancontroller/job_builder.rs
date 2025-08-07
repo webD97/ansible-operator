@@ -47,7 +47,11 @@ pub fn create_job_for_host(
 
     match &object.spec.connection_strategy {
         v1beta1::ConnectionStrategy::Ssh { ssh } => configure_job_for_ssh(&mut partial_job, ssh),
-        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(&mut partial_job, host),
+        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(
+            &mut partial_job,
+            host,
+            object.spec.template.requirements.is_some(),
+        ),
     };
 
     partial_job.metadata.namespace = Some(pb_namespace.into());
@@ -214,7 +218,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_config: &SshConfig) {
 pub const CHROOT_VOLUME_NAME: &str = "rootfs";
 pub const CHROOT_VOLUME_MOUNTPATH: &str = "/mnt/rootfs";
 
-fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
+fn configure_job_for_chroot(job: &mut Job, node_name: &str, with_requirements: bool) {
     let chroot_volume = kcore::v1::Volume {
         name: CHROOT_VOLUME_NAME.into(),
         host_path: Some(kcore::v1::HostPathVolumeSource {
@@ -249,17 +253,28 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
                 .first_mut()
                 .expect("job should have a container");
 
-            spec.volumes
-                .get_or_insert_default()
-                .extend_from_slice(&[chroot_volume, ansible_collections_volume]);
+            if with_requirements {
+                spec.volumes
+                    .get_or_insert_default()
+                    .extend_from_slice(&[chroot_volume, ansible_collections_volume]);
 
-            main_container
-                .volume_mounts
-                .get_or_insert_default()
-                .extend_from_slice(&[
-                    chroot_volume_mount,
-                    ansible_collections_volume_mount.clone(),
-                ]);
+                main_container
+                    .volume_mounts
+                    .get_or_insert_default()
+                    .extend_from_slice(&[
+                        chroot_volume_mount,
+                        ansible_collections_volume_mount.clone(),
+                    ]);
+            } else {
+                spec.volumes
+                    .get_or_insert_default()
+                    .extend_from_slice(&[chroot_volume]);
+
+                main_container
+                    .volume_mounts
+                    .get_or_insert_default()
+                    .extend_from_slice(&[chroot_volume_mount]);
+            }
 
             spec.host_ipc = Some(true);
             spec.host_network = Some(true);
@@ -272,20 +287,23 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
             });
 
             // Add an initcontainer to install collections (workaround until we can use image volumes)
-            let collections_installer = kcore::v1::Container {
-                name: "download-collections".into(),
-                image: main_container.image.clone(),
-                volume_mounts: Some(vec![ansible_collections_volume_mount]),
-                command: Some(vec![
-                    "ansible-galaxy".into(),
-                    "collection".into(),
-                    "install".into(),
-                    "community.general".into(),
-                ]),
-                ..Default::default()
-            };
+            if with_requirements {
+                let collections_installer = kcore::v1::Container {
+                    name: "download-collections".into(),
+                    image: main_container.image.clone(),
+                    working_dir: main_container.working_dir.clone(),
+                    volume_mounts: main_container.volume_mounts.clone(),
+                    command: Some(vec![
+                        "ansible-galaxy".into(),
+                        "install".into(),
+                        "-r".into(),
+                        "requirements.yml".into(),
+                    ]),
+                    ..Default::default()
+                };
 
-            spec.init_containers = Some(vec![collections_installer]);
+                spec.init_containers = Some(vec![collections_installer]);
+            }
 
             // Ensure scheduling on the targeted node
             spec.node_selector = Some(BTreeMap::from_iter([(

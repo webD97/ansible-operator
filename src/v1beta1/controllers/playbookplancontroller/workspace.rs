@@ -86,6 +86,10 @@ pub fn render_secret(
     string_data.insert("playbook.yml".into(), rendered_playbook);
     string_data.insert("inventory.yml".into(), rendered_inventory);
 
+    if let Some(requirements) = &object.spec.template.requirements {
+        string_data.insert("requirements.yml".into(), requirements.to_owned());
+    }
+
     for (index, variable_set) in inlined_variables.into_iter().enumerate() {
         string_data.insert(format!("static-variables-{index}.yml"), variable_set?);
     }
