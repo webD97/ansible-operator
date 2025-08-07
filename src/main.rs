@@ -22,11 +22,9 @@ async fn main() {
 
     setup_tracing();
 
-    let kubeconfig = kube::config::Config::from_kubeconfig(&KubeConfigOptions::default())
-        .await
-        .unwrap();
+    let kubernetes_client =
+        kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
 
-    let kubernetes_client = kube::client::Client::try_from(kubeconfig).unwrap();
     let playbookplan_controller =
         v1beta1::playbookplancontroller::reconciler::new(kubernetes_client);
 
@@ -48,4 +46,21 @@ fn setup_tracing() {
         .with(filter)
         .try_init()
         .expect("tracing-subscriber setup failed");
+}
+
+async fn discover_kubernetes_config() -> kube::Config {
+    let from_default_kubeconfig =
+        kube::Config::from_kubeconfig(&KubeConfigOptions::default()).await;
+
+    if let Ok(config) = from_default_kubeconfig {
+        return config;
+    }
+
+    let from_incluster_env = kube::Config::incluster_env();
+
+    if let Ok(config) = from_incluster_env {
+        return config;
+    }
+
+    panic!("Failed to find a suitable Kubernetes client config.");
 }
