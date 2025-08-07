@@ -43,15 +43,12 @@ pub fn create_job_for_host(
         .as_ref()
         .expect(".metadata.uid must be set here");
 
-    let mut partial_job = create_job_skeleton(host, object)?;
+    let mut partial_job =
+        create_job_skeleton(host, object, object.spec.template.requirements.is_some())?;
 
     match &object.spec.connection_strategy {
         v1beta1::ConnectionStrategy::Ssh { ssh } => configure_job_for_ssh(&mut partial_job, ssh),
-        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(
-            &mut partial_job,
-            host,
-            object.spec.template.requirements.is_some(),
-        ),
+        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(&mut partial_job, host),
     };
 
     partial_job.metadata.namespace = Some(pb_namespace.into());
@@ -82,6 +79,7 @@ pub fn create_job_for_host(
 fn create_job_skeleton(
     host: &str,
     plan: &v1beta1::PlaybookPlan,
+    with_requirements: bool,
     // ssh_config: &v1beta1::SshConfig,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = plan.name().ok_or(ReconcileError::PreconditionFailed(
@@ -153,19 +151,55 @@ fn create_job_skeleton(
         });
     }
 
+    let mut init_containers = Vec::new();
+
+    // Add an initcontainer to install collections (workaround until we can use image volumes)
+    if with_requirements {
+        volumes.push(kcore::v1::Volume {
+            name: "collections".into(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+
+        volume_mounts.push(kcore::v1::VolumeMount {
+            name: "collections".into(),
+            mount_path: "/etc/ansible/collections".into(),
+            ..Default::default()
+        });
+
+        let collections_installer = kcore::v1::Container {
+            name: "download-collections".into(),
+            image: Some(plan.spec.image.clone()),
+            working_dir: Some("/run/ansible-operator".into()),
+            volume_mounts: Some(volume_mounts.clone()),
+            command: Some(vec![
+                "ansible-galaxy".into(),
+                "install".into(),
+                "-r".into(),
+                "requirements.yml".into(),
+            ]),
+            ..Default::default()
+        };
+
+        init_containers.push(collections_installer);
+    }
+
+    let main_container = kcore::v1::Container {
+        name: "ansible-playbook".into(),
+        image: Some(plan.spec.image.clone()),
+        working_dir: Some("/run/ansible-operator".into()),
+        volume_mounts: Some(volume_mounts),
+        command: Some(render_ansible_command(plan, host, variable_secrets)),
+        ..Default::default()
+    };
+
     let pod_template = kcore::v1::PodTemplateSpec {
         metadata: None,
         spec: Some(kcore::v1::PodSpec {
             restart_policy: Some("Never".into()), // todo: maybe configurable
             volumes: Some(volumes),
-            containers: vec![kcore::v1::Container {
-                name: "ansible-playbook".into(),
-                image: Some(plan.spec.image.clone()),
-                working_dir: Some("/run/ansible-operator".into()),
-                volume_mounts: Some(volume_mounts),
-                command: Some(render_ansible_command(plan, host, variable_secrets)),
-                ..Default::default()
-            }],
+            containers: vec![main_container],
+            init_containers: Some(init_containers),
             ..Default::default()
         }),
     };
@@ -218,7 +252,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_config: &SshConfig) {
 pub const CHROOT_VOLUME_NAME: &str = "rootfs";
 pub const CHROOT_VOLUME_MOUNTPATH: &str = "/mnt/rootfs";
 
-fn configure_job_for_chroot(job: &mut Job, node_name: &str, with_requirements: bool) {
+fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
     let chroot_volume = kcore::v1::Volume {
         name: CHROOT_VOLUME_NAME.into(),
         host_path: Some(kcore::v1::HostPathVolumeSource {
@@ -234,18 +268,6 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str, with_requirements: b
         ..Default::default()
     };
 
-    let ansible_collections_volume = kcore::v1::Volume {
-        name: "collections".into(),
-        empty_dir: Some(EmptyDirVolumeSource::default()),
-        ..Default::default()
-    };
-
-    let ansible_collections_volume_mount = kcore::v1::VolumeMount {
-        name: "collections".into(),
-        mount_path: "/etc/ansible/collections".into(),
-        ..Default::default()
-    };
-
     job.spec.as_mut().and_then(|spec| {
         spec.template.spec.as_mut().map(|spec| {
             let main_container = spec
@@ -253,28 +275,14 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str, with_requirements: b
                 .first_mut()
                 .expect("job should have a container");
 
-            if with_requirements {
-                spec.volumes
-                    .get_or_insert_default()
-                    .extend_from_slice(&[chroot_volume, ansible_collections_volume]);
+            spec.volumes
+                .get_or_insert_default()
+                .extend_from_slice(&[chroot_volume]);
 
-                main_container
-                    .volume_mounts
-                    .get_or_insert_default()
-                    .extend_from_slice(&[
-                        chroot_volume_mount,
-                        ansible_collections_volume_mount.clone(),
-                    ]);
-            } else {
-                spec.volumes
-                    .get_or_insert_default()
-                    .extend_from_slice(&[chroot_volume]);
-
-                main_container
-                    .volume_mounts
-                    .get_or_insert_default()
-                    .extend_from_slice(&[chroot_volume_mount]);
-            }
+            main_container
+                .volume_mounts
+                .get_or_insert_default()
+                .extend_from_slice(&[chroot_volume_mount]);
 
             spec.host_ipc = Some(true);
             spec.host_network = Some(true);
@@ -285,25 +293,6 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str, with_requirements: b
                 privileged: Some(true),
                 ..Default::default()
             });
-
-            // Add an initcontainer to install collections (workaround until we can use image volumes)
-            if with_requirements {
-                let collections_installer = kcore::v1::Container {
-                    name: "download-collections".into(),
-                    image: main_container.image.clone(),
-                    working_dir: main_container.working_dir.clone(),
-                    volume_mounts: main_container.volume_mounts.clone(),
-                    command: Some(vec![
-                        "ansible-galaxy".into(),
-                        "install".into(),
-                        "-r".into(),
-                        "requirements.yml".into(),
-                    ]),
-                    ..Default::default()
-                };
-
-                spec.init_containers = Some(vec![collections_installer]);
-            }
 
             // Ensure scheduling on the targeted node
             spec.node_selector = Some(BTreeMap::from_iter([(
