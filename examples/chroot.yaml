@@ -1,0 +1,27 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: k3s-update-worker
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  connectionStrategy:
+    chroot:
+  inventory:
+    - name: workers
+      hosts:
+        fromNodes:
+          matchLabels:
+            kubernetes.io/hostname: homelab-worker-1
+  template:
+    playbook: |
+      - hosts: all
+
+        tasks:
+          - name: Ensure test file exists
+            ansible.builtin.copy:
+              dest: /var/home/admin/a-file
+              owner: admin
+              group: admin
+              mode: "0640"
+              content: |
+                Hello, world!

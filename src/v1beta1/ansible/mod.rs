@@ -1,4 +1,3 @@
-pub mod command_renderer;
 mod inventory_renderer;
 mod playbook_renderer;
 mod render_error;

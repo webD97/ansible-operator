@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::{
     api::{
-        batch,
+        batch::{self, v1::Job},
         core::{
             self as kcore,
-            v1::{KeyToPath, SecretVolumeSource, Volume},
+            v1::{EmptyDirVolumeSource, KeyToPath, SecretVolumeSource, Volume},
         },
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
@@ -15,7 +15,7 @@ use kube::runtime::reflector::Lookup as _;
 use crate::{
     utils,
     v1beta1::{
-        self, FilesSource, PlaybookPlan, PlaybookVariableSource,
+        self, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
         controllers::reconcile_error::ReconcileError, labels,
     },
 };
@@ -43,12 +43,12 @@ pub fn create_job_for_host(
         .as_ref()
         .expect(".metadata.uid must be set here");
 
-    let mut partial_job = match &object.spec.connection_strategy {
-        v1beta1::ConnectionStrategy::Ssh { ssh } => {
-            super::job_builder::create_ssh_job(host, object, ssh)
-        }
-        v1beta1::ConnectionStrategy::Chroot {} => todo!(),
-    }?;
+    let mut partial_job = create_job_skeleton(host, object)?;
+
+    match &object.spec.connection_strategy {
+        v1beta1::ConnectionStrategy::Ssh { ssh } => configure_job_for_ssh(&mut partial_job, ssh),
+        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(&mut partial_job, host),
+    };
 
     partial_job.metadata.namespace = Some(pb_namespace.into());
 
@@ -73,11 +73,12 @@ pub fn create_job_for_host(
     Ok(partial_job)
 }
 
-/// Creates a Kubernetes Job to execute and SSH-based Ansible playbook.
-fn create_ssh_job(
+/// Creates a Kubernetes Job that includes everything we need for basic Ansible execution
+/// but without any connection-specifics like SSH key, chroots etc.
+fn create_job_skeleton(
     host: &str,
     plan: &v1beta1::PlaybookPlan,
-    ssh_config: &v1beta1::SshConfig,
+    // ssh_config: &v1beta1::SshConfig,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = plan.name().ok_or(ReconcileError::PreconditionFailed(
         "expected .metadata.name in PlaybookPlan",
@@ -99,38 +100,20 @@ fn create_ssh_job(
 
     let variable_secrets: Vec<&String> = extract_secret_names_for_variables(plan).collect();
 
-    let mut volumes = vec![
-        kcore::v1::Volume {
-            name: "playbook".into(),
-            secret: Some(kcore::v1::SecretVolumeSource {
-                secret_name: Some(pb_name.into()),
-                ..Default::default()
-            }),
+    let mut volumes = vec![kcore::v1::Volume {
+        name: "playbook".into(),
+        secret: Some(kcore::v1::SecretVolumeSource {
+            secret_name: Some(pb_name.into()),
             ..Default::default()
-        },
-        kcore::v1::Volume {
-            name: "ssh".into(),
-            secret: Some(kcore::v1::SecretVolumeSource {
-                secret_name: Some(ssh_config.secret_ref.name.clone()),
-                default_mode: Some(0o0400),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    ];
+        }),
+        ..Default::default()
+    }];
 
-    let mut volume_mounts = vec![
-        kcore::v1::VolumeMount {
-            name: "playbook".into(),
-            mount_path: "/run/ansible-operator".into(),
-            ..Default::default()
-        },
-        kcore::v1::VolumeMount {
-            name: "ssh".into(),
-            mount_path: "/ssh".into(),
-            ..Default::default()
-        },
-    ];
+    let mut volume_mounts = vec![kcore::v1::VolumeMount {
+        name: "playbook".into(),
+        mount_path: "/run/ansible-operator".into(),
+        ..Default::default()
+    }];
 
     for secret_name in &variable_secrets {
         volumes.push(kcore::v1::Volume {
@@ -176,11 +159,7 @@ fn create_ssh_job(
                 image: Some(plan.spec.image.clone()),
                 working_dir: Some("/run/ansible-operator".into()),
                 volume_mounts: Some(volume_mounts),
-                command: Some(v1beta1::ansible::command_renderer::render_ansible_command(
-                    plan,
-                    host,
-                    variable_secrets,
-                )),
+                command: Some(render_ansible_command(plan, host, variable_secrets)),
                 ..Default::default()
             }],
             ..Default::default()
@@ -196,6 +175,125 @@ fn create_ssh_job(
     job.spec = Some(job_spec);
 
     Ok(job)
+}
+
+pub const SSH_VOLUME_NAME: &str = "ssh";
+pub const SSH_VOLUME_MOUNTPATH: &str = "/ssh";
+
+/// Configures an Ansible job so that it can run via SSH
+fn configure_job_for_ssh(job: &mut Job, ssh_config: &SshConfig) {
+    let ssh_key_volume = kcore::v1::Volume {
+        name: SSH_VOLUME_NAME.into(),
+        secret: Some(kcore::v1::SecretVolumeSource {
+            secret_name: Some(ssh_config.secret_ref.name.clone()),
+            default_mode: Some(0o0400),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let ssh_key_volume_mount = kcore::v1::VolumeMount {
+        name: SSH_VOLUME_NAME.into(),
+        mount_path: SSH_VOLUME_MOUNTPATH.into(),
+        ..Default::default()
+    };
+
+    job.spec.as_mut().and_then(|spec| {
+        spec.template.spec.as_mut().map(|spec| {
+            spec.volumes.get_or_insert_default().push(ssh_key_volume);
+            spec.containers
+                .first_mut()
+                .expect("job should have a container")
+                .volume_mounts
+                .get_or_insert_default()
+                .push(ssh_key_volume_mount);
+        })
+    });
+}
+
+pub const CHROOT_VOLUME_NAME: &str = "rootfs";
+pub const CHROOT_VOLUME_MOUNTPATH: &str = "/mnt/rootfs";
+
+fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
+    let chroot_volume = kcore::v1::Volume {
+        name: CHROOT_VOLUME_NAME.into(),
+        host_path: Some(kcore::v1::HostPathVolumeSource {
+            type_: Some("Directory".into()),
+            path: "/".into(),
+        }),
+        ..Default::default()
+    };
+
+    let chroot_volume_mount = kcore::v1::VolumeMount {
+        name: CHROOT_VOLUME_NAME.into(),
+        mount_path: CHROOT_VOLUME_MOUNTPATH.into(),
+        ..Default::default()
+    };
+
+    let ansible_collections_volume = kcore::v1::Volume {
+        name: "collections".into(),
+        empty_dir: Some(EmptyDirVolumeSource::default()),
+        ..Default::default()
+    };
+
+    let ansible_collections_volume_mount = kcore::v1::VolumeMount {
+        name: "collections".into(),
+        mount_path: "/etc/ansible/collections".into(),
+        ..Default::default()
+    };
+
+    job.spec.as_mut().and_then(|spec| {
+        spec.template.spec.as_mut().map(|spec| {
+            let main_container = spec
+                .containers
+                .first_mut()
+                .expect("job should have a container");
+
+            spec.volumes
+                .get_or_insert_default()
+                .extend_from_slice(&[chroot_volume, ansible_collections_volume]);
+
+            main_container
+                .volume_mounts
+                .get_or_insert_default()
+                .extend_from_slice(&[
+                    chroot_volume_mount,
+                    ansible_collections_volume_mount.clone(),
+                ]);
+
+            spec.host_ipc = Some(true);
+            spec.host_network = Some(true);
+            spec.host_pid = Some(true);
+            spec.host_users = Some(true);
+
+            main_container.security_context = Some(kcore::v1::SecurityContext {
+                privileged: Some(true),
+                ..Default::default()
+            });
+
+            // Add an initcontainer to install collections (workaround until we can use image volumes)
+            let collections_installer = kcore::v1::Container {
+                name: "download-collections".into(),
+                image: main_container.image.clone(),
+                volume_mounts: Some(vec![ansible_collections_volume_mount]),
+                command: Some(vec![
+                    "ansible-galaxy".into(),
+                    "collection".into(),
+                    "install".into(),
+                    "community.general".into(),
+                ]),
+                ..Default::default()
+            };
+
+            spec.init_containers = Some(vec![collections_installer]);
+
+            // Ensure scheduling on the targeted node
+            spec.node_selector = Some(BTreeMap::from_iter([(
+                "kubernetes.io/hostname".into(),
+                node_name.into(),
+            )]));
+        })
+    });
 }
 
 pub fn extract_secret_names_for_variables(pp: &PlaybookPlan) -> impl Iterator<Item = &String> {
@@ -258,6 +356,70 @@ fn extract_file_volumes(
 
             serde_json::from_value::<Volume>(volume)
         })
+}
+
+fn render_ansible_command(
+    plan: &v1beta1::PlaybookPlan,
+    hostname: &str,
+    extra_vars_filepaths: Vec<&String>,
+) -> Vec<String> {
+    let static_vars_filenames: Vec<String> = plan
+        .spec
+        .template
+        .variables
+        .as_ref()
+        .map(|variables| {
+            variables
+                .iter()
+                .filter_map(|source| match source {
+                    PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
+                    PlaybookVariableSource::Inline { inline: _ } => Some(()),
+                })
+                .enumerate()
+                .map(|(index, _)| format!("static-variables-{index}.yml"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut ansible_command = vec!["ansible-playbook".into()];
+
+    ansible_command.extend(
+        static_vars_filenames
+            .iter()
+            .flat_map(|path| ["--extra-vars".into(), format!("@{path}")]),
+    );
+
+    ansible_command.extend(extra_vars_filepaths.iter().flat_map(|path| {
+        [
+            "--extra-vars".into(),
+            format!("@/run/ansible-operator/vars/{path}/variables.yaml"),
+        ]
+    }));
+
+    let connection_args = match &plan.spec.connection_strategy {
+        v1beta1::ConnectionStrategy::Chroot {} => vec![
+            "-c".into(),
+            "community.general.chroot".into(),
+            "-i".into(),
+            format!("{CHROOT_VOLUME_MOUNTPATH},"),
+        ],
+        v1beta1::ConnectionStrategy::Ssh { ssh } => vec![
+            "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
+            "--private-key".into(),
+            "/ssh/id_rsa".into(),
+            "--user".into(),
+            ssh.user.clone(),
+            "-i".into(),
+            "inventory.yml".into(),
+            "-l".into(),
+            format!("{hostname},"),
+        ],
+    };
+
+    ansible_command.extend(connection_args);
+    ansible_command.push("playbook.yml".into());
+
+    ansible_command
 }
 
 #[cfg(test)]
