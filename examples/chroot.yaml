@@ -1,7 +1,7 @@
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: PlaybookPlan
 metadata:
-  name: k3s-update-worker
+  name: chroot-example
 spec:
   image: docker.io/serversideup/ansible-core:2.18
   connectionStrategy:
