@@ -1,5 +1,9 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    hash::{Hash as _, Hasher},
+};
 
+use chrono::{DateTime, Utc};
 use k8s_openapi::{
     api::{
         batch::{self, v1::Job},
@@ -17,12 +21,14 @@ use crate::{
     v1beta1::{
         self, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
         controllers::reconcile_error::ReconcileError, labels,
+        playbookplancontroller::execution_evaluator::ExecutionHash,
     },
 };
 
 pub fn create_job_for_host(
     host: &str,
-    hash: u64,
+    hash: &ExecutionHash,
+    start: &DateTime<Utc>,
     object: &PlaybookPlan,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = object
@@ -61,9 +67,15 @@ pub fn create_job_for_host(
         ..Default::default()
     }]);
 
+    let start_time_hash = {
+        let mut hasher = twox_hash::XxHash3_64::new();
+        (*start).hash(&mut hasher);
+        hasher.finish()
+    };
+
     partial_job.metadata.name = Some(format!(
         "apply-{pb_name}-{}-on-{host}",
-        utils::generate_id(hash)
+        utils::generate_id(**hash ^ start_time_hash),
     ));
     partial_job.metadata.labels = Some(BTreeMap::from([
         (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
@@ -442,6 +454,7 @@ metadata:
   name: an-example
 spec:
   image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
   inventory:
     - name: ccu
       hosts:

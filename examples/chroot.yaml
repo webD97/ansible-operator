@@ -4,6 +4,8 @@ metadata:
   name: chroot-example
 spec:
   image: docker.io/serversideup/ansible-core:2.18
+  schedule: "*/2 * * * *"
+  timeZone: Europe/Berlin
   connectionStrategy:
     chroot:
   inventory:
