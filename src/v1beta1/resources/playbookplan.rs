@@ -45,8 +45,13 @@ impl JsonSchema for GenericMap {
     namespaced,
     status = "PlaybookPlanStatus",
     printcolumn = r#"{"name":"Hosts","type":"number","jsonPath":".status.eligibleHostsCount"}"#,
+    printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
+    printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
+    printcolumn = r#"{"name":"Next run","type":"string","jsonPath":".status.nextRun"}"#,
+    printcolumn = r#"{"name":"Current hash","type":"string","jsonPath":".status.currentHash"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Running","type":"string","jsonPath":".status.conditions[?(@.type==\"Running\")].status"}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -54,8 +59,15 @@ pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
     pub image: String,
 
-    /// Controls when a playbook is executed. If omitted, the playbook will execute once when the resource is applied or updated
-    pub execution_triggers: Option<ExecutionTriggers>,
+    /// Controls if a playbook is executed once or repeatedly
+    #[schemars(default)]
+    pub mode: ExecutionMode,
+
+    /// Cron expression that tells at which time the playbook may execute
+    pub schedule: Option<String>,
+
+    /// Time zone for the _schedule_ field, if unset UTC is assumed
+    pub time_zone: Option<String>,
 
     /// These host groups will be available in our playbook
     pub inventory: Vec<Inventory>,
@@ -65,6 +77,13 @@ pub struct PlaybookPlanSpec {
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub enum ExecutionMode {
+    #[default]
+    OneShot,
+    Recurring,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
@@ -103,6 +122,9 @@ pub struct ExecutionTriggers {
     pub delayed_until: Option<String>,
     /// Set this to a cron expression to execute the playbook on a recurring basis.
     pub schedule: Option<String>,
+
+    /// Time zone to use for cron evaluation, defaults to UTC if unset
+    pub time_zone: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
@@ -198,6 +220,26 @@ pub struct Variables {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+// #[serde(rename_all = "PascalCase")]
+pub enum Phase {
+    /// Triggers have not yet been evaluated
+    #[default]
+    Pending,
+
+    /// Playbook execution has been delayed.
+    Delayed,
+
+    /// Playbook has not yet been applied to all hosts.
+    Applying,
+
+    /// Playbook is scheduled for reexecution.
+    Scheduled,
+
+    /// Jobs for all hosts have run either successfully or not.
+    Finished,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
@@ -205,6 +247,9 @@ pub struct PlaybookPlanStatus {
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
     pub hosts_status: Option<BTreeMap<String, HostStatus>>,
+    pub next_run: Option<String>,
+    pub phase: Option<Phase>,
+    pub current_hash: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -248,10 +293,9 @@ mod tests {
             "blubb",
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
-                execution_triggers: Some(ExecutionTriggers {
-                    delayed_until: None,
-                    schedule: Some("0 1 * * *".into()),
-                }),
+                mode: ExecutionMode::Recurring,
+                schedule: Some("0 1 * * *".into()),
+                time_zone: None,
                 inventory: vec![
                     Inventory {
                         name: "controlplane".into(),

@@ -7,19 +7,36 @@ use k8s_openapi::ByteString;
 
 use crate::v1beta1::{self, controllers::reconcile_error::ReconcileError};
 
+#[derive(PartialEq, Debug)]
+pub struct ExecutionHash(u64);
+
+impl std::fmt::Display for ExecutionHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:x}", self.0)
+    }
+}
+
+impl std::ops::Deref for ExecutionHash {
+    type Target = u64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
-pub fn find_outdated_hosts<'a>(
-    status: &'a v1beta1::PlaybookPlanStatus,
-    execution_hash: u64,
-) -> Result<Box<dyn Iterator<Item = &'a String> + Send + 'a>, ReconcileError> {
+pub fn find_outdated_hosts(
+    status: &v1beta1::PlaybookPlanStatus,
+    execution_hash: &ExecutionHash,
+) -> Result<Vec<String>, ReconcileError> {
     // If we have no eligible hosts, we don't need to execute the playbook anywhere
     let Some(hosts) = &status.eligible_hosts else {
-        return Ok(Box::new(std::iter::empty()));
+        return Ok(vec![]);
     };
 
     // If we don't have any hosts_status yet, simply return all hosts for execution
     let Some(hosts_status) = &status.hosts_status else {
-        return Ok(Box::new(hosts.values().flatten()));
+        return Ok(hosts.values().flatten().cloned().collect());
     };
 
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
@@ -34,10 +51,18 @@ pub fn find_outdated_hosts<'a>(
         let host_status = host_status.unwrap();
 
         // Otherwise just compare the hashes
-        host_status.last_applied_hash != execution_hash.to_string()
+        host_status.last_applied_hash != *execution_hash.to_string()
     });
 
-    Ok(Box::new(outdated_hosts))
+    Ok(outdated_hosts.cloned().collect())
+}
+
+pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
+    let Some(hosts) = &status.eligible_hosts else {
+        return vec![];
+    };
+
+    hosts.values().flatten().cloned().collect()
 }
 
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
@@ -45,8 +70,8 @@ pub fn find_outdated_hosts<'a>(
 pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, ByteString>>>(
     playbook: &str,
     secrets: T,
-) -> u64 {
-    std::iter::once({
+) -> ExecutionHash {
+    let hash = std::iter::once({
         let mut hasher = twox_hash::XxHash3_64::new();
         playbook.hash(&mut hasher);
         hasher.finish()
@@ -61,7 +86,9 @@ pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, 
 
         hasher.finish()
     }))
-    .fold(0u64, |prev, next| prev ^ next)
+    .fold(0u64, |prev, next| prev ^ next);
+
+    ExecutionHash(hash)
 }
 
 #[cfg(test)]
@@ -81,10 +108,10 @@ mod tests {
         };
 
         // When
-        let to_execute = find_outdated_hosts(&status, 1u64);
+        let to_execute = find_outdated_hosts(&status, &ExecutionHash(1));
 
         // Then
-        assert_eq!(to_execute.unwrap().count(), 0);
+        assert_eq!(to_execute.unwrap().len(), 0);
     }
 
     #[test]
@@ -100,7 +127,7 @@ mod tests {
         };
 
         // When
-        let to_execute = find_outdated_hosts(&status, 1u64);
+        let to_execute = find_outdated_hosts(&status, &ExecutionHash(1));
 
         // Then
         let expected_hostnames = [
@@ -108,8 +135,8 @@ mod tests {
             "host-2".to_owned(),
             "host-3".to_owned(),
         ];
-        let expected: Vec<&String> = expected_hostnames.iter().collect();
-        let actual: Vec<&String> = to_execute.unwrap().collect();
+        let expected: Vec<String> = expected_hostnames.to_vec();
+        let actual: Vec<String> = to_execute.unwrap();
 
         assert!(expected.eq(&actual));
     }
@@ -146,12 +173,12 @@ mod tests {
         };
 
         // When
-        let to_execute = find_outdated_hosts(&status, 2u64);
+        let to_execute = find_outdated_hosts(&status, &ExecutionHash(2));
 
         // Then
         let expected_hostnames = ["host-1".to_owned(), "host-3".to_owned()];
-        let expected: Vec<&String> = expected_hostnames.iter().collect();
-        let actual: Vec<&String> = to_execute.unwrap().collect();
+        let expected: Vec<String> = expected_hostnames.to_vec();
+        let actual: Vec<String> = to_execute.unwrap();
 
         assert_eq!(expected, actual);
     }
@@ -184,5 +211,17 @@ mod tests {
         // Then
         assert_eq!(hashed_1, hashed_2);
         assert_eq!(hashed_2, hashed_3);
+    }
+
+    #[test]
+    pub fn test_execution_hash_display() {
+        // Given
+        let hash = ExecutionHash(255);
+
+        // When
+        let as_string = hash.to_string();
+
+        // Then
+        assert_eq!("ff", as_string)
     }
 }
