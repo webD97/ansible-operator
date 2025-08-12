@@ -2,11 +2,14 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::{api::batch, chrono::Utc};
 use kube::{api::ObjectList, runtime::reflector::Lookup as _};
-use tracing::info;
+use tracing::debug;
 
 use crate::{
     utils::upsert_condition,
-    v1beta1::{HostStatus, PlaybookPlanCondition, PlaybookPlanStatus, labels},
+    v1beta1::{
+        HostStatus, PlaybookPlanCondition, PlaybookPlanStatus, labels,
+        playbookplancontroller::execution_evaluator::ExecutionHash,
+    },
 };
 
 fn count_successful(jobs: &ObjectList<batch::v1::Job>) -> usize {
@@ -109,7 +112,7 @@ pub fn evaluate_playbookplan_conditions(
 /// Updates the per-host status based on the passed jobs
 pub fn evaluate_per_host_status(
     jobs: &ObjectList<batch::v1::Job>,
-    hash: u64,
+    hash: &ExecutionHash,
     status: &mut PlaybookPlanStatus,
 ) {
     jobs.iter()
@@ -138,7 +141,7 @@ pub fn evaluate_per_host_status(
 
             let target_host = target_host.unwrap();
 
-            info!(
+            debug!(
                 "Job {} was observed with SuccessCriteriaMet condition.",
                 job.name().unwrap()
             );
@@ -152,4 +155,24 @@ pub fn evaluate_per_host_status(
                     last_applied_hash: hash.to_string(),
                 });
         });
+}
+
+pub fn all_jobs_finished(jobs: &ObjectList<batch::v1::Job>) -> bool {
+    jobs.iter().all(|job| {
+        job.status
+            .as_ref()
+            .map(|status| {
+                status
+                    .conditions
+                    .as_ref()
+                    .map(|conditions| {
+                        conditions.iter().any(|condition| {
+                            (condition.type_ == "Failed" || condition.type_ == "SuccessCriteriaMet")
+                                && condition.status == "True"
+                        })
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    })
 }

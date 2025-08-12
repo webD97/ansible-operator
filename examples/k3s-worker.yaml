@@ -4,9 +4,8 @@ metadata:
   name: k3s-update-worker
 spec:
   image: docker.io/serversideup/ansible-core:2.18
-  executionTriggers:
-    delayedUntil: "0 1 * * *"
-    schedule: "0 1 * * *"
+  schedule: "0 1 * * *"
+  timeZone: Europe/Berlin
   connectionStrategy:
     ssh:
       user: admin
