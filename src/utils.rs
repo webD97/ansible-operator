@@ -61,8 +61,8 @@ pub fn upsert_condition<T: Condition>(conditions: &mut Vec<T>, new_condition: T)
     }
 }
 
-fn encode_base36(mut num: u64) -> String {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+fn encode_kubelike(mut num: u64) -> String {
+    const ALPHABET: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
 
     if num == 0 {
         return "a".repeat(6); // return "aaaaaa" if input is zero, fixed length
@@ -84,7 +84,7 @@ fn encode_base36(mut num: u64) -> String {
 pub fn generate_id(num: u64) -> String {
     const LEN: usize = 5;
 
-    let encoded = encode_base36(num);
+    let encoded = encode_kubelike(num);
 
     if encoded.len() == LEN {
         encoded
