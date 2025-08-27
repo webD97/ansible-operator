@@ -382,8 +382,9 @@ fn extract_file_volumes(
                     .as_object_mut()
                     .unwrap()
                     .entry("name")
-                    .or_insert(serde_json::to_value(name)?)
-                    .take()
+                    .or_insert(serde_json::to_value(name)?);
+
+                volume
             }
         };
         serde_json::from_value::<Volume>(value)
@@ -516,15 +517,23 @@ spec:
 
         let volumes: Vec<_> = oks.into_iter().map(Result::unwrap).collect();
         let volume1 = volumes.first().unwrap();
+        let volume2 = volumes.get(1).unwrap();
 
-        assert_eq!("binary-assets", volume1.name);
-        assert!(volume1.image.is_some());
+        assert_eq!("some-configs", volume1.name);
+        assert!(volume1.secret.is_some());
         assert_eq!(
-            volume1.image.as_ref().unwrap().reference,
+            volume1.secret.as_ref().unwrap().secret_name,
+            Some("secret-with-config-files".into())
+        );
+
+        assert_eq!("binary-assets", volume2.name);
+        assert!(volume2.image.is_some());
+        assert_eq!(
+            volume2.image.as_ref().unwrap().reference,
             Some("my.registry.tld/the-image:v2".into())
         );
         assert_eq!(
-            volume1.image.as_ref().unwrap().pull_policy,
+            volume2.image.as_ref().unwrap().pull_policy,
             Some("IfNotPresent".into())
         );
     }
