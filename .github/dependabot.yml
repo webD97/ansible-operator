@@ -12,10 +12,6 @@ updates:
     groups:
       kube-stack:
         patterns:
-          - "^kube$"
-          - "^k8s-openapi$"
-          - "^schemars$"
-        update-types:
-          - "major"
-          - "minor"
-          - "patch"
+          - "kube"
+          - "k8s-openapi"
+          - "schemars"
