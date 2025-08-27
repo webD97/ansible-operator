@@ -190,7 +190,10 @@ async fn reconcile(
     )
     .await;
 
-    resource_status.current_hash = Some(execution_hash.to_string());
+    if resource_status.current_hash != Some(execution_hash.to_string()) {
+        resource_status.phase = None;
+        resource_status.current_hash = Some(execution_hash.to_string());
+    }
 
     let tz = object
         .spec
@@ -325,6 +328,13 @@ async fn reconcile(
 fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
     job_builder::extract_secret_names_for_variables(playbookplan)
         .chain(job_builder::extract_secret_names_for_files(playbookplan))
+        .chain(std::iter::once(
+            playbookplan
+                .metadata
+                .name
+                .as_ref()
+                .expect(".metadata.name must be set here"),
+        ))
         .collect()
 }
 
