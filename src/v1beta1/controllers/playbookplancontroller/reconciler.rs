@@ -2,7 +2,7 @@ use crate::v1beta1::{
     ExecutionMode, Phase, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
-        status::all_jobs_finished,
+        status::{all_jobs_finished, count_successful},
         triggers::{Timing, evaluate_schedule, forecast_next_run},
         workspace::{self, render_secret},
     },
@@ -278,25 +278,30 @@ async fn reconcile(
     evaluate_playbookplan_conditions(&jobs, &mut resource_status);
     evaluate_per_host_status(&jobs, &execution_hash, &mut resource_status);
 
-    // For recurring playbooks, update .status.nextRun and ensure requeue
-    if matches!(mode, ExecutionMode::Recurring) && all_jobs_finished(&jobs) {
-        if let Some(schedule) = &object.spec.schedule {
-            resource_status.phase = Some(Phase::Scheduled);
-            let next = forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+    let success_count = count_successful(&jobs);
+    let total_count = jobs.items.len();
 
-            requeue_after = (next - now()).to_std().unwrap();
-            resource_status.next_run = Some(next.fixed_offset());
-        } else {
-            warn!("Mode is Recurring but schedule is not set!");
+    if total_count > 0 && all_jobs_finished(&jobs) {
+        resource_status.last_result = Some(format!("{success_count}/{total_count} successful"));
+
+        match mode {
+            ExecutionMode::OneShot => {
+                resource_status.next_run = None;
+                resource_status.phase = Some(Phase::Finished);
+            }
+            ExecutionMode::Recurring => {
+                if let Some(schedule) = &object.spec.schedule {
+                    resource_status.phase = Some(Phase::Scheduled);
+                    let next =
+                        forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+
+                    requeue_after = (next - now()).to_std().unwrap();
+                    resource_status.next_run = Some(next.fixed_offset());
+                } else {
+                    warn!("Mode is Recurring but schedule is not set!");
+                }
+            }
         }
-    }
-
-    // For oneshot playbooks, check if finished
-    if matches!(mode, ExecutionMode::OneShot)
-        && find_outdated_hosts(&resource_status, &execution_hash)?.is_empty()
-    {
-        resource_status.next_run = None;
-        resource_status.phase = Some(Phase::Finished);
     }
 
     persist_status(&playbookplan_api, &object, resource_status).await?;

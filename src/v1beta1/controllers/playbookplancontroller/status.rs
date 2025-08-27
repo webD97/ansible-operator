@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-fn count_successful(jobs: &ObjectList<batch::v1::Job>) -> usize {
+pub fn count_successful(jobs: &ObjectList<batch::v1::Job>) -> usize {
     jobs.iter()
         .filter(|job| {
             job.status

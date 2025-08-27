@@ -52,6 +52,7 @@ impl JsonSchema for GenericMap {
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Running","type":"string","jsonPath":".status.conditions[?(@.type==\"Running\")].status"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Last result","type":"string","jsonPath":".status.lastResult"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -252,6 +253,7 @@ pub struct PlaybookPlanStatus {
     pub next_run: Option<DateTime<FixedOffset>>,
     pub phase: Option<Phase>,
     pub current_hash: Option<String>,
+    pub last_result: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
