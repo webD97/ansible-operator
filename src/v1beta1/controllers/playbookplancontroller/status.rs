@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::{
     utils::upsert_condition,
     v1beta1::{
-        HostStatus, PlaybookPlanCondition, PlaybookPlanStatus, labels,
+        PlaybookPlanCondition, PlaybookPlanStatus, labels,
         playbookplancontroller::execution_evaluator::ExecutionHash,
     },
 };
