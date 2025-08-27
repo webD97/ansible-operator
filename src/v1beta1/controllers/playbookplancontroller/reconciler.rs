@@ -1,7 +1,14 @@
 use crate::v1beta1::{
-    labels,
-    playbookplancontroller::workspace::{self, render_secret},
+    ExecutionMode, Phase, labels,
+    playbookplancontroller::{
+        execution_evaluator::{ExecutionHash, find_all_hosts},
+        status::all_jobs_finished,
+        triggers::{Timing, evaluate_schedule, forecast_next_run},
+        workspace::{self, render_secret},
+    },
 };
+use chrono::Utc;
+use chrono_tz::Tz;
 use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
     batch::v1::Job,
@@ -17,8 +24,8 @@ use kube::{
         watcher,
     },
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tracing::{debug, info};
+use std::{collections::BTreeMap, sync::Arc};
+use tracing::{debug, info, warn};
 
 use crate::{
     utils::create_or_update,
@@ -29,7 +36,6 @@ use crate::{
             execution_evaluator::{self, find_outdated_hosts},
             job_builder, mappers,
             status::{evaluate_per_host_status, evaluate_playbookplan_conditions},
-            triggers::evaluate_triggers,
         },
     },
 };
@@ -92,7 +98,7 @@ pub fn new(
         )
         .run(
             reconcile,
-            |_, _, _| Action::requeue(Duration::from_secs(15)),
+            |_, _, _| Action::requeue(std::time::Duration::from_secs(15)),
             Arc::clone(&context),
         )
 }
@@ -107,6 +113,8 @@ async fn reconcile(
     if object.metadata.deletion_timestamp.is_some() {
         return Ok(Action::await_change());
     }
+
+    let mut requeue_after = std::time::Duration::from_secs(3600);
 
     let namespace = object
         .namespace()
@@ -182,31 +190,80 @@ async fn reconcile(
     )
     .await;
 
-    // Create jobs
-    if evaluate_triggers(object.spec.execution_triggers.as_ref()) {
-        for outdated_host in find_outdated_hosts(&resource_status, execution_hash)? {
-            let job = job_builder::create_job_for_host(outdated_host, execution_hash, &object)?;
-            let job_name = job
-                .name()
-                .expect(".metadata.name must be set at this point");
+    resource_status.current_hash = Some(execution_hash.to_string());
 
-            // Job already exists, skip creating another one
-            // TODO: Check for jobs with another hash and decide if we need to replace them
-            if jobs_api.get_opt(&job_name).await?.is_some() {
-                continue;
+    let tz = object
+        .spec
+        .time_zone
+        .as_ref()
+        .map(|tz| tz.parse::<Tz>().unwrap())
+        .unwrap_or(Tz::UTC);
+
+    let now = || Utc::now().with_timezone(&tz);
+    let time_window = chrono::Duration::seconds(15);
+    let timing = evaluate_schedule(object.spec.schedule.as_deref(), now(), time_window);
+    let mode = &object.spec.mode;
+    let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash)?;
+
+    if !outdated_hosts.is_empty()
+        && !matches!(
+            resource_status.phase,
+            Some(Phase::Failed) | Some(Phase::Succeeded) | Some(Phase::Applying)
+        )
+    {
+        match timing {
+            Timing::Delayed(until) => {
+                requeue_after = (until - now()).to_std().unwrap();
+                resource_status.phase = Some(Phase::Scheduled);
+                resource_status.next_run = Some(until.fixed_offset());
             }
+            Timing::Now(start) => {
+                let hosts_to_trigger = match mode {
+                    ExecutionMode::OneShot => outdated_hosts,
+                    ExecutionMode::Recurring => find_all_hosts(&resource_status),
+                };
 
-            info!("Creating job {job_name}");
-            jobs_api
-                .create(
-                    &PostParams {
-                        field_manager: Some("ansible-operator".into()),
-                        ..Default::default()
-                    },
-                    &job,
-                )
-                .await?;
-        }
+                if hosts_to_trigger.is_empty() {
+                    // resource_status.phase = Some(Phase::Finished);
+                    resource_status.next_run = None;
+                }
+
+                for host in hosts_to_trigger {
+                    let job = job_builder::create_job_for_host(
+                        &host,
+                        &execution_hash,
+                        start.map(|t| t.to_utc()).as_ref(),
+                        &object,
+                    )?;
+                    let job_name = job
+                        .name()
+                        .expect(".metadata.name must be set at this point");
+
+                    // Job already exists, skip creating another one
+                    // TODO: Check for jobs with another hash and decide if we need to replace them
+                    if jobs_api.get_opt(&job_name).await?.is_some() {
+                        info!("Job for {host} already exists");
+                        continue;
+                    }
+
+                    // Now that we finally know that there are hosts where we need to apply something,
+                    // set the status accordingly.
+                    resource_status.phase = Some(Phase::Applying);
+                    resource_status.next_run = None;
+
+                    info!("Creating job {job_name}");
+                    jobs_api
+                        .create(
+                            &PostParams {
+                                field_manager: Some("ansible-operator".into()),
+                                ..Default::default()
+                            },
+                            &job,
+                        )
+                        .await?;
+                }
+            }
+        };
     }
 
     // Read managed jobs and populate status
@@ -224,11 +281,43 @@ async fn reconcile(
         .await?;
 
     evaluate_playbookplan_conditions(&jobs, &mut resource_status);
-    evaluate_per_host_status(&jobs, execution_hash, &mut resource_status);
+    evaluate_per_host_status(&jobs, &execution_hash, &mut resource_status);
+
+    if all_jobs_finished(&jobs) && !jobs.items.is_empty() {
+        let total_count = resource_status.eligible_hosts_count.unwrap_or_default();
+        let outdated_count = find_outdated_hosts(&resource_status, &execution_hash)?.len();
+
+        resource_status.summary = match outdated_count {
+            0 => Some(format!("{total_count}/{total_count} up-to-date")),
+            n => Some(format!("{n}/{total_count} outdated")),
+        };
+
+        match mode {
+            ExecutionMode::OneShot => {
+                resource_status.next_run = None;
+                resource_status.phase = match outdated_count {
+                    0 => Some(Phase::Succeeded),
+                    _ => Some(Phase::Failed),
+                };
+            }
+            ExecutionMode::Recurring => {
+                if let Some(schedule) = &object.spec.schedule {
+                    resource_status.phase = Some(Phase::Scheduled);
+                    let next =
+                        forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+
+                    requeue_after = (next - now()).to_std().unwrap();
+                    resource_status.next_run = Some(next.fixed_offset());
+                } else {
+                    warn!("Mode is Recurring but schedule is not set!");
+                }
+            }
+        }
+    }
 
     persist_status(&playbookplan_api, &object, resource_status).await?;
 
-    Ok(Action::requeue(Duration::from_secs(3600)))
+    Ok(Action::requeue(requeue_after))
 }
 
 /// Returns a list of all secret names that the given PlaybookPlan references. This includes for
@@ -265,7 +354,7 @@ async fn hash_playbook_and_secrets(
     playbook: &str,
     secret_names: &[&String],
     secrets_api: &Api<Secret>,
-) -> u64 {
+) -> ExecutionHash {
     let secrets = futures::future::join_all(
         secret_names
             .iter()

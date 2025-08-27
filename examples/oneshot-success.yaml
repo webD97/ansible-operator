@@ -1,0 +1,29 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: oneshot-success
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  schedule: "* * * * *"
+  timeZone: Europe/Berlin
+  connectionStrategy:
+    chroot:
+  inventory:
+    - name: workers
+      hosts:
+        fromNodes:
+          matchLabels:
+            kubernetes.io/hostname: homelab-worker-1
+  template:
+    requirements: |
+      collections:
+        - name: community.general
+          version: ">=6.0.0"
+    playbook: |
+      - hosts: all
+
+        tasks:
+          - name: Echo something
+            ansible.builtin.command:
+              cmd: |
+                echo Hello

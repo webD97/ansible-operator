@@ -1,5 +1,9 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    hash::{Hash as _, Hasher},
+};
 
+use chrono::{DateTime, Utc};
 use k8s_openapi::{
     api::{
         batch::{self, v1::Job},
@@ -15,14 +19,16 @@ use kube::runtime::reflector::Lookup as _;
 use crate::{
     utils,
     v1beta1::{
-        self, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
+        self, ChrootConfig, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
         controllers::reconcile_error::ReconcileError, labels,
+        playbookplancontroller::execution_evaluator::ExecutionHash,
     },
 };
 
 pub fn create_job_for_host(
     host: &str,
-    hash: u64,
+    hash: &ExecutionHash,
+    start: Option<&DateTime<Utc>>,
     object: &PlaybookPlan,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = object
@@ -48,7 +54,9 @@ pub fn create_job_for_host(
 
     match &object.spec.connection_strategy {
         v1beta1::ConnectionStrategy::Ssh { ssh } => configure_job_for_ssh(&mut partial_job, ssh),
-        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(&mut partial_job, host),
+        v1beta1::ConnectionStrategy::Chroot { chroot } => {
+            configure_job_for_chroot(&mut partial_job, host, chroot)
+        }
     };
 
     partial_job.metadata.namespace = Some(pb_namespace.into());
@@ -61,9 +69,18 @@ pub fn create_job_for_host(
         ..Default::default()
     }]);
 
+    let start_time_hash = match start {
+        Some(start) => {
+            let mut hasher = twox_hash::XxHash3_64::new();
+            (*start).hash(&mut hasher);
+            hasher.finish()
+        }
+        None => 1,
+    };
+
     partial_job.metadata.name = Some(format!(
         "apply-{pb_name}-{}-on-{host}",
-        utils::generate_id(hash)
+        utils::generate_id(**hash ^ start_time_hash),
     ));
     partial_job.metadata.labels = Some(BTreeMap::from([
         (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
@@ -252,7 +269,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_config: &SshConfig) {
 pub const CHROOT_VOLUME_NAME: &str = "rootfs";
 pub const CHROOT_VOLUME_MOUNTPATH: &str = "/mnt/rootfs";
 
-fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
+fn configure_job_for_chroot(job: &mut Job, node_name: &str, chroot_config: &ChrootConfig) {
     let chroot_volume = kcore::v1::Volume {
         name: CHROOT_VOLUME_NAME.into(),
         host_path: Some(kcore::v1::HostPathVolumeSource {
@@ -299,6 +316,11 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
                 "kubernetes.io/hostname".into(),
                 node_name.into(),
             )]));
+
+            spec.tolerations = chroot_config
+                .tolerations
+                .as_ref()
+                .map(|tolerations| tolerations.iter().map(|t| t.clone().into()).collect());
         })
     });
 }
@@ -404,7 +426,7 @@ fn render_ansible_command(
     }));
 
     let connection_args = match &plan.spec.connection_strategy {
-        v1beta1::ConnectionStrategy::Chroot {} => vec![
+        v1beta1::ConnectionStrategy::Chroot { .. } => vec![
             "-c".into(),
             "community.general.chroot".into(),
             "-i".into(),
@@ -442,6 +464,7 @@ metadata:
   name: an-example
 spec:
   image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
   inventory:
     - name: ccu
       hosts:

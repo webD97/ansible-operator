@@ -1,15 +1,18 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::{api::batch, chrono::Utc};
+use k8s_openapi::api::batch;
 use kube::{api::ObjectList, runtime::reflector::Lookup as _};
-use tracing::info;
+use tracing::debug;
 
 use crate::{
     utils::upsert_condition,
-    v1beta1::{HostStatus, PlaybookPlanCondition, PlaybookPlanStatus, labels},
+    v1beta1::{
+        HostStatus, PlaybookPlanCondition, PlaybookPlanStatus, labels,
+        playbookplancontroller::execution_evaluator::ExecutionHash,
+    },
 };
 
-fn count_successful(jobs: &ObjectList<batch::v1::Job>) -> usize {
+pub fn count_successful(jobs: &ObjectList<batch::v1::Job>) -> usize {
     jobs.iter()
         .filter(|job| {
             job.status
@@ -59,7 +62,7 @@ pub fn evaluate_playbookplan_conditions(
                 status: "True".into(),
                 reason: Some("JobsRunning".into()),
                 message: Some(format!("{num_running} jobs are currently running")),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
+                last_transition_time: Some(chrono::Local::now().fixed_offset()),
             }
         } else {
             PlaybookPlanCondition {
@@ -67,7 +70,7 @@ pub fn evaluate_playbookplan_conditions(
                 status: "False".into(),
                 reason: None,
                 message: None,
-                last_transition_time: Some(Utc::now().to_rfc3339()),
+                last_transition_time: Some(chrono::Local::now().fixed_offset()),
             }
         }
     };
@@ -81,7 +84,7 @@ pub fn evaluate_playbookplan_conditions(
                 message: Some(format!(
                     "{num_successful}/{num_total} jobs completed successfully"
                 )),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
+                last_transition_time: Some(chrono::Local::now().fixed_offset()),
             }
         } else if num_failed > 0 {
             PlaybookPlanCondition {
@@ -89,7 +92,7 @@ pub fn evaluate_playbookplan_conditions(
                 status: "False".into(),
                 reason: Some("SomeOrAllJobsFailed".into()),
                 message: Some(format!("{num_failed}/{num_total} jobs have failed")),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
+                last_transition_time: Some(chrono::Local::now().fixed_offset()),
             }
         } else {
             PlaybookPlanCondition {
@@ -97,7 +100,7 @@ pub fn evaluate_playbookplan_conditions(
                 status: "False".into(),
                 reason: Some("AwaitingJobResults".into()),
                 message: Some(format!("{num_running} jobs are running")),
-                last_transition_time: Some(Utc::now().to_rfc3339()),
+                last_transition_time: Some(chrono::Local::now().fixed_offset()),
             }
         }
     };
@@ -109,7 +112,7 @@ pub fn evaluate_playbookplan_conditions(
 /// Updates the per-host status based on the passed jobs
 pub fn evaluate_per_host_status(
     jobs: &ObjectList<batch::v1::Job>,
-    hash: u64,
+    hash: &ExecutionHash,
     status: &mut PlaybookPlanStatus,
 ) {
     jobs.iter()
@@ -138,7 +141,7 @@ pub fn evaluate_per_host_status(
 
             let target_host = target_host.unwrap();
 
-            info!(
+            debug!(
                 "Job {} was observed with SuccessCriteriaMet condition.",
                 job.name().unwrap()
             );
@@ -152,4 +155,24 @@ pub fn evaluate_per_host_status(
                     last_applied_hash: hash.to_string(),
                 });
         });
+}
+
+pub fn all_jobs_finished(jobs: &ObjectList<batch::v1::Job>) -> bool {
+    jobs.iter().all(|job| {
+        job.status
+            .as_ref()
+            .map(|status| {
+                status
+                    .conditions
+                    .as_ref()
+                    .map(|conditions| {
+                        conditions.iter().any(|condition| {
+                            (condition.type_ == "Failed" || condition.type_ == "SuccessCriteriaMet")
+                                && condition.status == "True"
+                        })
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    })
 }
