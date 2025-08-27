@@ -2,7 +2,7 @@ use crate::v1beta1::{
     ExecutionMode, Phase, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
-        status::{all_jobs_finished, count_successful},
+        status::all_jobs_finished,
         triggers::{Timing, evaluate_schedule, forecast_next_run},
         workspace::{self, render_secret},
     },
@@ -205,7 +205,12 @@ async fn reconcile(
     let mode = &object.spec.mode;
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash)?;
 
-    if !outdated_hosts.is_empty() && !matches!(resource_status.phase, Some(Phase::Finished)) {
+    if !outdated_hosts.is_empty()
+        && !matches!(
+            resource_status.phase,
+            Some(Phase::Failed) | Some(Phase::Succeeded) | Some(Phase::Applying)
+        )
+    {
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
@@ -219,7 +224,7 @@ async fn reconcile(
                 };
 
                 if hosts_to_trigger.is_empty() {
-                    resource_status.phase = Some(Phase::Finished);
+                    // resource_status.phase = Some(Phase::Finished);
                     resource_status.next_run = None;
                 }
 
@@ -278,16 +283,22 @@ async fn reconcile(
     evaluate_playbookplan_conditions(&jobs, &mut resource_status);
     evaluate_per_host_status(&jobs, &execution_hash, &mut resource_status);
 
-    let success_count = count_successful(&jobs);
-    let total_count = jobs.items.len();
+    if all_jobs_finished(&jobs) && !jobs.items.is_empty() {
+        let total_count = resource_status.eligible_hosts_count.unwrap_or_default();
+        let outdated_count = find_outdated_hosts(&resource_status, &execution_hash)?.len();
 
-    if total_count > 0 && all_jobs_finished(&jobs) {
-        resource_status.last_result = Some(format!("{success_count}/{total_count} successful"));
+        resource_status.summary = match outdated_count {
+            0 => Some(format!("{total_count}/{total_count} up-to-date")),
+            n => Some(format!("{n}/{total_count} outdated")),
+        };
 
         match mode {
             ExecutionMode::OneShot => {
                 resource_status.next_run = None;
-                resource_status.phase = Some(Phase::Finished);
+                resource_status.phase = match outdated_count {
+                    0 => Some(Phase::Succeeded),
+                    _ => Some(Phase::Failed),
+                };
             }
             ExecutionMode::Recurring => {
                 if let Some(schedule) = &object.spec.schedule {

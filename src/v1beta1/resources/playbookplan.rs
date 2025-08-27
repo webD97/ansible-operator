@@ -44,15 +44,14 @@ impl JsonSchema for GenericMap {
     kind = "PlaybookPlan",
     namespaced,
     status = "PlaybookPlanStatus",
-    printcolumn = r#"{"name":"Hosts","type":"number","jsonPath":".status.eligibleHostsCount"}"#,
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
     printcolumn = r#"{"name":"Next run","type":"string","jsonPath":".status.nextRun"}"#,
     printcolumn = r#"{"name":"Current hash","type":"string","jsonPath":".status.currentHash"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Running","type":"string","jsonPath":".status.conditions[?(@.type==\"Running\")].status"}"#,
+    printcolumn = r#"{"name":"Summary","type":"string","jsonPath":".status.summary"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
-    printcolumn = r#"{"name":"Last result","type":"string","jsonPath":".status.lastResult"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -236,8 +235,11 @@ pub enum Phase {
     /// Playbook is scheduled for reexecution.
     Scheduled,
 
-    /// Jobs for all hosts have run either successfully or not.
-    Finished,
+    /// Jobs for all hosts ran successfully (for OneShot mode only)
+    Failed,
+
+    /// Some or all jobs failed (for OneShot mode only)
+    Succeeded,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -253,7 +255,7 @@ pub struct PlaybookPlanStatus {
     pub next_run: Option<DateTime<FixedOffset>>,
     pub phase: Option<Phase>,
     pub current_hash: Option<String>,
-    pub last_result: Option<String>,
+    pub summary: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
