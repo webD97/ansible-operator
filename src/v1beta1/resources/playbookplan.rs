@@ -191,12 +191,14 @@ impl Default for NodeSelectorTerm {
 #[serde(rename_all = "camelCase")]
 pub enum ConnectionStrategy {
     Ssh { ssh: SshConfig },
-    Chroot {},
+    Chroot { chroot: ChrootConfig },
 }
 
 impl Default for ConnectionStrategy {
     fn default() -> Self {
-        Self::Chroot {}
+        Self::Chroot {
+            chroot: ChrootConfig { tolerations: None },
+        }
     }
 }
 
@@ -205,6 +207,12 @@ impl Default for ConnectionStrategy {
 pub struct SshConfig {
     pub user: String,
     pub secret_ref: SecretRef,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChrootConfig {
+    pub tolerations: Option<Vec<Toleration>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -240,6 +248,39 @@ pub enum Phase {
 
     /// Some or all jobs failed (for OneShot mode only)
     Succeeded,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub struct Toleration {
+    pub effect: Option<String>,
+    pub key: Option<String>,
+    pub operator: Option<String>,
+    pub toleration_seconds: Option<i64>,
+    pub value: Option<String>,
+}
+
+impl From<k8s_openapi::api::core::v1::Toleration> for Toleration {
+    fn from(other: k8s_openapi::api::core::v1::Toleration) -> Self {
+        Self {
+            effect: other.effect,
+            key: other.key,
+            operator: other.operator,
+            toleration_seconds: other.toleration_seconds,
+            value: other.value,
+        }
+    }
+}
+
+impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
+    fn from(t: Toleration) -> Self {
+        k8s_openapi::api::core::v1::Toleration {
+            key: t.key,
+            value: t.value,
+            effect: t.effect,
+            operator: t.operator,
+            toleration_seconds: t.toleration_seconds,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

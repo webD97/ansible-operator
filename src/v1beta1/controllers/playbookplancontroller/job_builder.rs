@@ -19,7 +19,7 @@ use kube::runtime::reflector::Lookup as _;
 use crate::{
     utils,
     v1beta1::{
-        self, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
+        self, ChrootConfig, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
         controllers::reconcile_error::ReconcileError, labels,
         playbookplancontroller::execution_evaluator::ExecutionHash,
     },
@@ -54,7 +54,9 @@ pub fn create_job_for_host(
 
     match &object.spec.connection_strategy {
         v1beta1::ConnectionStrategy::Ssh { ssh } => configure_job_for_ssh(&mut partial_job, ssh),
-        v1beta1::ConnectionStrategy::Chroot {} => configure_job_for_chroot(&mut partial_job, host),
+        v1beta1::ConnectionStrategy::Chroot { chroot } => {
+            configure_job_for_chroot(&mut partial_job, host, chroot)
+        }
     };
 
     partial_job.metadata.namespace = Some(pb_namespace.into());
@@ -267,7 +269,7 @@ fn configure_job_for_ssh(job: &mut Job, ssh_config: &SshConfig) {
 pub const CHROOT_VOLUME_NAME: &str = "rootfs";
 pub const CHROOT_VOLUME_MOUNTPATH: &str = "/mnt/rootfs";
 
-fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
+fn configure_job_for_chroot(job: &mut Job, node_name: &str, chroot_config: &ChrootConfig) {
     let chroot_volume = kcore::v1::Volume {
         name: CHROOT_VOLUME_NAME.into(),
         host_path: Some(kcore::v1::HostPathVolumeSource {
@@ -314,6 +316,11 @@ fn configure_job_for_chroot(job: &mut Job, node_name: &str) {
                 "kubernetes.io/hostname".into(),
                 node_name.into(),
             )]));
+
+            spec.tolerations = chroot_config
+                .tolerations
+                .as_ref()
+                .map(|tolerations| tolerations.iter().map(|t| t.clone().into()).collect());
         })
     });
 }
@@ -419,7 +426,7 @@ fn render_ansible_command(
     }));
 
     let connection_args = match &plan.spec.connection_strategy {
-        v1beta1::ConnectionStrategy::Chroot {} => vec![
+        v1beta1::ConnectionStrategy::Chroot { .. } => vec![
             "-c".into(),
             "community.general.chroot".into(),
             "-i".into(),
