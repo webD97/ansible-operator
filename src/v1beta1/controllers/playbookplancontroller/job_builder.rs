@@ -364,27 +364,30 @@ pub fn extract_secret_names_for_files(pp: &PlaybookPlan) -> impl Iterator<Item =
 fn extract_file_volumes(
     pp: &PlaybookPlan,
 ) -> impl Iterator<Item = Result<Volume, serde_json::Error>> {
-    pp.spec
-        .template
-        .files
-        .as_ref()
-        .into_iter()
-        .flat_map(|files| {
-            files.iter().filter_map(|v| match v {
-                FilesSource::Secret { .. } => None,
-                FilesSource::Other { name, extra } => Some((name, extra)),
-            })
-        })
-        .map(|(name, volume)| {
-            let mut volume = serde_json::to_value(volume)?;
-            volume
-                .as_object_mut()
-                .unwrap()
-                .entry("name")
-                .or_insert(serde_json::to_value(name)?);
+    let files = pp.spec.template.files.as_ref();
 
-            serde_json::from_value::<Volume>(volume)
-        })
+    files.into_iter().flatten().map(|source| {
+        let value = match source {
+            FilesSource::Secret { name, secret_ref } => serde_json::to_value(kcore::v1::Volume {
+                name: name.to_owned(),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(secret_ref.name.to_owned()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })?,
+            FilesSource::Other { name, extra } => {
+                let mut volume = serde_json::to_value(extra)?;
+                volume
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("name")
+                    .or_insert(serde_json::to_value(name)?)
+                    .take()
+            }
+        };
+        serde_json::from_value::<Volume>(value)
+    })
 }
 
 fn render_ansible_command(
