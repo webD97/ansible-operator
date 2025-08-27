@@ -151,9 +151,8 @@ pub fn evaluate_per_host_status(
                 .as_mut()
                 .unwrap()
                 .entry(target_host.to_owned())
-                .or_insert(HostStatus {
-                    last_applied_hash: hash.to_string(),
-                });
+                .or_default()
+                .last_applied_hash = hash.to_string();
         });
 }
 
