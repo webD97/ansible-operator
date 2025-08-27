@@ -227,7 +227,7 @@ async fn reconcile(
                     let job = job_builder::create_job_for_host(
                         &host,
                         &execution_hash,
-                        &start.to_utc(),
+                        start.map(|t| t.to_utc()).as_ref(),
                         &object,
                     )?;
                     let job_name = job

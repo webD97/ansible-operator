@@ -28,7 +28,7 @@ use crate::{
 pub fn create_job_for_host(
     host: &str,
     hash: &ExecutionHash,
-    start: &DateTime<Utc>,
+    start: Option<&DateTime<Utc>>,
     object: &PlaybookPlan,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = object
@@ -67,10 +67,13 @@ pub fn create_job_for_host(
         ..Default::default()
     }]);
 
-    let start_time_hash = {
-        let mut hasher = twox_hash::XxHash3_64::new();
-        (*start).hash(&mut hasher);
-        hasher.finish()
+    let start_time_hash = match start {
+        Some(start) => {
+            let mut hasher = twox_hash::XxHash3_64::new();
+            (*start).hash(&mut hasher);
+            hasher.finish()
+        }
+        None => 1,
     };
 
     partial_job.metadata.name = Some(format!(

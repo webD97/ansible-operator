@@ -5,9 +5,9 @@ use chrono::{DateTime, Duration, TimeZone};
 /// Whether a playbook should run now or later
 #[derive(PartialEq, Eq, Debug)]
 pub enum Timing<Tz: TimeZone> {
-    /// The playbook should run _now_ due to some reason. The inner DateTime represents the targeted time
-    /// and is to be expected in the recent past.
-    Now(DateTime<Tz>),
+    /// The playbook should run _now_ due to some reason. If the inner DateTime is set, the timing
+    /// is based on a recurring schedule and the DateTime is the start of the current window.
+    Now(Option<DateTime<Tz>>),
 
     /// The playbook will be delayed until some time in the future
     Delayed(DateTime<Tz>),
@@ -19,7 +19,7 @@ pub fn evaluate_schedule<Tz: TimeZone>(
     window: Duration,
 ) -> Timing<Tz> {
     if schedule.is_none() {
-        return Timing::Now(now);
+        return Timing::Now(None);
     }
 
     let schedule = schedule.unwrap();
@@ -29,7 +29,7 @@ pub fn evaluate_schedule<Tz: TimeZone>(
     let diff = next_run.clone() - offset_now;
 
     if diff <= window {
-        return Timing::Now(next_run);
+        return Timing::Now(Some(next_run));
     }
 
     Timing::Delayed(next_run)
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn test_delayed_triggers() {
         // Given
-        let schedule = Some("0 0 20 * * *");
+        let schedule = Some("0 20 * * *");
         let window = Duration::seconds(60);
 
         // When
@@ -67,8 +67,8 @@ mod tests {
 
         // Then
         assert_eq!(Timing::Delayed(parse("2025-08-12T20:00:00Z")), too_early);
-        assert_eq!(Timing::Now(parse("2025-08-12T20:00:00Z")), on_time);
-        assert_eq!(Timing::Now(parse("2025-08-12T20:00:00Z")), latest);
+        assert_eq!(Timing::Now(Some(parse("2025-08-12T20:00:00Z"))), on_time);
+        assert_eq!(Timing::Now(Some(parse("2025-08-12T20:00:00Z"))), latest);
         assert_eq!(Timing::Delayed(parse("2025-08-13T20:00:00Z")), too_late);
     }
 }
