@@ -352,9 +352,7 @@ async fn persist_status(
         .name()
         .ok_or(ReconcileError::PreconditionFailed("expected a name"))?;
 
-    let data = serde_json::to_vec(&patch_object)?;
-
-    api.replace_status(name, &PostParams::default(), data)
+    api.replace_status(name, &PostParams::default(), &patch_object)
         .await?;
 
     Ok(())
