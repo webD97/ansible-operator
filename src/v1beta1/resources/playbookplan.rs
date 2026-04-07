@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use crate::{utils::Condition, v1beta1::LabelMap};
 use chrono::{DateTime, FixedOffset};
 use kube::CustomResource;
-use schemars::{JsonSchema, SchemaGenerator, schema::Schema};
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -11,29 +11,16 @@ use serde::{Deserialize, Serialize};
 pub struct GenericMap(pub serde_json::Value);
 
 impl JsonSchema for GenericMap {
-    fn schema_name() -> String {
-        "GenericMap".to_string()
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("GenericMap")
     }
 
     fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
-        use schemars::schema::InstanceType;
-        use schemars::schema::SchemaObject;
-        use serde_json::json;
-
-        let schema_obj = SchemaObject {
-            instance_type: Some(InstanceType::Object.into()),
-            ..Default::default()
-        };
-
-        // Inject the Kubernetes extension
-        let mut raw = serde_json::to_value(&schema_obj).unwrap();
-        let obj = raw.as_object_mut().unwrap();
-        obj.insert(
-            "x-kubernetes-preserve-unknown-fields".to_string(),
-            json!(true),
-        );
-
-        serde_json::from_value(raw).unwrap()
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true
+        }))
+        .unwrap()
     }
 }
 
