@@ -61,16 +61,16 @@ pub fn secret_to_playbookplans(
             .iter()
             .filter(|resource| resource.metadata.namespace == secret.metadata.namespace)
             .filter(|plan| {
-                if let Some(vars) = &plan.spec.template.variables {
-                    if vars.iter().any(|var| {
+                if let Some(vars) = &plan.spec.template.variables
+                    && vars.iter().any(|var| {
                         matches!(
                             var,
                             v1beta1::PlaybookVariableSource::SecretRef { secret_ref }
                             if secret_ref.name == secret_name
                         )
-                    }) {
-                        return true;
-                    }
+                    })
+                {
+                    return true;
                 }
 
                 if let Some(files) = &plan.spec.template.files {

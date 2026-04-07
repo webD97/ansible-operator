@@ -101,19 +101,6 @@ pub enum FilesSource {
     },
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ExecutionTriggers {
-    /// Set this to a cron expression to delay playbook execution after the PlaybookPlan or a related secret have changed.
-    /// If omitted, the playbook will be applied immediately.
-    pub delayed_until: Option<String>,
-    /// Set this to a cron expression to execute the playbook on a recurring basis.
-    pub schedule: Option<String>,
-
-    /// Time zone to use for cron evaluation, defaults to UTC if unset
-    pub time_zone: Option<String>,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum PlaybookVariableSource {
@@ -206,12 +193,6 @@ pub struct ChrootConfig {
 #[serde(rename_all = "camelCase")]
 pub struct SecretRef {
     pub name: String,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct Variables {
-    pub inline: GenericMap,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
