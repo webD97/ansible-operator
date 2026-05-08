@@ -1,18 +1,15 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::Node;
+use kube::api::PartialObjectMeta;
 
 use crate::v1beta1;
 
-pub fn node_matches(node: &Node, selector: &v1beta1::NodeSelectorTerm) -> bool {
-    match selector {
-        v1beta1::NodeSelectorTerm::MatchLabels { labels } => {
-            node_matches_match_labels(node, labels)
-        }
-    }
+pub fn node_matches(node: &PartialObjectMeta<Node>, selector: &v1beta1::NodeSelectorTerm) -> bool {
+    node_matches_match_labels(node, &selector.match_labels)
 }
 
-fn node_matches_match_labels(node: &Node, labels: &v1beta1::LabelMap) -> bool {
+fn node_matches_match_labels(node: &PartialObjectMeta<Node>, labels: &v1beta1::LabelMap) -> bool {
     const EMPTY_LABELS: &v1beta1::LabelMap = &BTreeMap::new();
 
     let actual_labels = node.metadata.labels.as_ref().unwrap_or(EMPTY_LABELS);
@@ -27,6 +24,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use k8s_openapi::api::core::v1::Node;
+    use kube::{Resource as _, api::PartialObjectMeta};
 
     use crate::v1beta1::controllers::nodeselector::node_matches_match_labels;
 
@@ -55,6 +53,11 @@ mod tests {
             let mut selector = BTreeMap::new();
             selector.insert("key-z".to_string(), "value-z".to_string());
             selector
+        };
+
+        let node = PartialObjectMeta {
+            metadata: node.meta().clone(),
+            ..Default::default()
         };
 
         let selector1_matches = node_matches_match_labels(&node, &selector1);

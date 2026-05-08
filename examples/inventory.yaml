@@ -1,0 +1,23 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: Inventory
+metadata:
+  name: example
+spec:
+  hosts:
+    - name: controlplanes
+      fromClusterNodes:
+        matchLabels:
+          node-role.kubernetes.io/control-plane: "true"
+    - name: others
+      fromHostnames:
+        - ccu.fritz.box
+status:
+  resolvedHosts:
+    - name: controlplanes
+      hosts:
+        - homelab-ctrl-0
+        - homelab-ctrl-1
+        - homelab-ctrl-2
+    - name: others
+      hosts:
+        - ccu.fritz.box

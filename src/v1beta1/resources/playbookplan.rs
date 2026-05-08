@@ -1,6 +1,9 @@
 use std::{borrow::Cow, collections::BTreeMap};
 
-use crate::{utils::Condition, v1beta1::LabelMap};
+use crate::{
+    utils::Condition,
+    v1beta1::{LabelMap, NodeSelectorTerm},
+};
 use chrono::{DateTime, FixedOffset};
 use kube::CustomResource;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -138,24 +141,6 @@ impl Default for Hosts {
     fn default() -> Self {
         Self::FromClusterNodes {
             from_nodes: NodeSelectorTerm::default(),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-#[serde(untagged)]
-pub enum NodeSelectorTerm {
-    MatchLabels {
-        #[serde(rename = "matchLabels")]
-        labels: LabelMap,
-    },
-}
-
-impl Default for NodeSelectorTerm {
-    fn default() -> Self {
-        Self::MatchLabels {
-            labels: BTreeMap::new(),
         }
     }
 }
@@ -317,8 +302,8 @@ mod tests {
                     Inventory {
                         name: "controlplane".into(),
                         hosts: Hosts::FromClusterNodes {
-                            from_nodes: NodeSelectorTerm::MatchLabels {
-                                labels: {
+                            from_nodes: NodeSelectorTerm {
+                                match_labels: {
                                     let mut labels = BTreeMap::new();
                                     labels.insert(
                                         "node.kubernetes.io/role".into(),
@@ -332,8 +317,8 @@ mod tests {
                     Inventory {
                         name: "workers".into(),
                         hosts: Hosts::FromClusterNodes {
-                            from_nodes: NodeSelectorTerm::MatchLabels {
-                                labels: {
+                            from_nodes: NodeSelectorTerm {
+                                match_labels: {
                                     let mut labels = BTreeMap::new();
                                     labels
                                         .insert("node.kubernetes.io/role".into(), "worker".into());

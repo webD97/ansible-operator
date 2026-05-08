@@ -15,8 +15,16 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.contains(&"--crd".into()) {
-        let crd = v1beta1::PlaybookPlan::crd();
-        println!("{}", serde_yaml::to_string(&crd).unwrap());
+        let playbookplan = v1beta1::PlaybookPlan::crd();
+        let inventory = v1beta1::AnsibleInventory::crd();
+        println!(
+            "{}",
+            [
+                serde_yaml::to_string(&playbookplan).unwrap(),
+                serde_yaml::to_string(&inventory).unwrap()
+            ]
+            .join("---\n")
+        );
         std::process::exit(0);
     }
 
@@ -25,10 +33,21 @@ async fn main() {
     let kubernetes_client =
         kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
 
-    let playbookplan_controller =
-        v1beta1::playbookplancontroller::reconciler::new(kubernetes_client);
+    // let playbookplan_controller =
+    //     v1beta1::playbookplancontroller::reconciler::new(kubernetes_client);
 
-    playbookplan_controller
+    let inventory_controller = v1beta1::inventorycontroller::new(kubernetes_client);
+
+    // playbookplan_controller
+    //     .for_each(|res| async move {
+    //         match res {
+    //             Ok(o) => debug!("reconciled {:?}", o),
+    //             Err(e) => warn!("reconcile failed: {:?}", e),
+    //         }
+    //     })
+    //     .await;
+
+    inventory_controller
         .for_each(|res| async move {
             match res {
                 Ok(o) => debug!("reconciled {:?}", o),

@@ -25,7 +25,7 @@ async fn resolve_hosts(
 ) -> Result<Vec<String>, kube::Error> {
     use kube::runtime::reflector::Lookup as _;
 
-    let nodes = nodes_api.list(&ListParams::default()).await?;
+    let nodes = nodes_api.list_metadata(&ListParams::default()).await?;
     let hosts: Vec<String> = match hosts_source {
         v1beta1::Hosts::FromStaticList { from_list } => from_list.to_owned(),
         v1beta1::Hosts::FromClusterNodes { from_nodes } => nodes
