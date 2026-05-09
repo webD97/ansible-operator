@@ -4,7 +4,8 @@ use k8s_openapi::{api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::Owne
 use kube::runtime::reflector::Lookup;
 
 use crate::v1beta1::{
-    PlaybookPlan, PlaybookVariableSource, ansible, controllers::reconcile_error::ReconcileError,
+    PlaybookPlan, PlaybookVariableSource, ResolvedHosts, ansible,
+    controllers::reconcile_error::ReconcileError,
 };
 
 pub fn is_outdated(object: &PlaybookPlan) -> bool {
@@ -34,7 +35,7 @@ pub async fn is_missing(secrets_api: &kube::Api<Secret>, name: &str) -> Result<b
 ///
 pub fn render_secret(
     object: &PlaybookPlan,
-    inventories: &BTreeMap<String, Vec<String>>,
+    inventories: &[ResolvedHosts],
 ) -> Result<Secret, ReconcileError> {
     let pb_namespace = object
         .metadata

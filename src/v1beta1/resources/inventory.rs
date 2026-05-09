@@ -67,7 +67,7 @@ pub enum HostSource<'a> {
     },
 }
 
-#[cfg(debug_assertions)]
+#[cfg(test)]
 mod tests {
     use super::*;
 

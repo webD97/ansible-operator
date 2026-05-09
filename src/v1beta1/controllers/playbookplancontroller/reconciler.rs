@@ -1,5 +1,5 @@
 use crate::v1beta1::{
-    ExecutionMode, Phase, labels,
+    AnsibleInventory, ExecutionMode, Phase, ResolvedHosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         status::all_jobs_finished,
@@ -10,10 +10,7 @@ use crate::v1beta1::{
 use chrono::Utc;
 use chrono_tz::Tz;
 use futures_util::{Stream, StreamExt as _};
-use k8s_openapi::api::{
-    batch::v1::Job,
-    core::v1::{Node, Secret},
-};
+use k8s_openapi::api::{batch::v1::Job, core::v1::Secret};
 use kube::{
     Api,
     api::{ListParams, PostParams},
@@ -31,7 +28,7 @@ use crate::{
     utils::create_or_update,
     v1beta1::{
         self, PlaybookPlan,
-        controllers::{inventory_resolver, reconcile_error::ReconcileError},
+        controllers::reconcile_error::ReconcileError,
         playbookplancontroller::{
             execution_evaluator::{self, find_outdated_hosts},
             job_builder, mappers,
@@ -57,7 +54,6 @@ pub fn new(
     });
 
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
-    let nodes_api: Api<Node> = Api::all(client.clone());
     let jobs_api: Api<Job> = Api::all(client.clone());
     let secrets_api: Api<Secret> = Api::all(client);
 
@@ -86,11 +82,6 @@ pub fn new(
 
     Controller::new(playbookplans_api, watcher::Config::default())
         .owns(jobs_api, watcher::Config::default())
-        .watches(
-            nodes_api,
-            watcher::Config::default(),
-            mappers::node_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
-        )
         .watches(
             secrets_api,
             watcher::Config::default(),
@@ -127,33 +118,18 @@ async fn reconcile(
         .generation
         .ok_or(ReconcileError::PreconditionFailed("generation not set"))?;
 
-    let playbookplan_api =
-        Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), &namespace);
+    let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), &namespace);
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), &namespace);
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), &namespace);
-    let nodes_api = Api::<Node>::all(context.client.clone());
 
     let mut resource_status = object.status.clone().unwrap_or_default();
 
-    // Resolve groups
-    debug!("Resolving groups");
-    let resolved_inventories =
-        inventory_resolver::resolve(&nodes_api, &object.spec.inventory).await?;
-
-    resource_status.eligible_hosts_count = Some(
-        resolved_inventories
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<std::collections::HashSet<String>>()
-            .len(),
-    );
-    resource_status.eligible_hosts = Some(resolved_inventories.clone());
+    let resolved_hosts = resolve_inventory(&context, &object).await?;
 
     // Render playbook if necessary
     if workspace::is_missing(&secrets_api, &name).await? || workspace::is_outdated(&object) {
         info!("Rendering playbook to secret");
-        let secret = render_secret(&object, &resolved_inventories)?;
+        let secret = render_secret(&object, &resolved_hosts)?;
 
         create_or_update(
             &secrets_api,
@@ -318,7 +294,7 @@ async fn reconcile(
         }
     }
 
-    persist_status(&playbookplan_api, &object, resource_status).await?;
+    persist_status(&api, &object, resource_status).await?;
 
     Ok(Action::requeue(requeue_after))
 }
@@ -377,4 +353,41 @@ async fn hash_playbook_and_secrets(
         .collect();
 
     execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
+}
+
+async fn resolve_inventory(
+    context: &ReconciliationContext,
+    object: &PlaybookPlan,
+) -> Result<Vec<ResolvedHosts>, ReconcileError> {
+    use kube::ResourceExt;
+
+    let namespace = object
+        .namespace()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+
+    let inventory_api: Api<AnsibleInventory> = Api::namespaced(context.client.clone(), &namespace);
+    let inventory_refs = &object.spec.inventory_refs;
+    let inventories = inventory_refs
+        .iter()
+        .map(|inventory_ref| &inventory_ref.name)
+        .map(|name| inventory_api.get_status(name));
+
+    let (inventories, errors): (Vec<_>, Vec<_>) = futures::future::join_all(inventories)
+        .await
+        .into_iter()
+        .partition(Result::is_ok);
+
+    let errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
+    let resolved_hosts: Vec<_> = inventories
+        .into_iter()
+        .map(Result::unwrap)
+        .flat_map(|i| i.status)
+        .flat_map(|i| i.resolved_hosts)
+        .collect();
+
+    if let Some(first) = errors.into_iter().next() {
+        return Err(ReconcileError::KubeError(first));
+    }
+
+    Ok(resolved_hosts)
 }

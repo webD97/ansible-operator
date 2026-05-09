@@ -60,13 +60,19 @@ pub struct PlaybookPlanSpec {
     pub time_zone: Option<String>,
 
     /// These host groups will be available in our playbook
-    pub inventory: Vec<Inventory>,
+    pub inventory_refs: Vec<InventoryRef>,
 
     /// Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
     pub connection_strategy: ConnectionStrategy,
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+pub struct InventoryRef {
+    /// Name of the inventory resource being referenced
+    pub name: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -298,36 +304,9 @@ mod tests {
                 mode: ExecutionMode::Recurring,
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,
-                inventory: vec![
-                    Inventory {
-                        name: "controlplane".into(),
-                        hosts: Hosts::FromClusterNodes {
-                            from_nodes: NodeSelectorTerm {
-                                match_labels: {
-                                    let mut labels = BTreeMap::new();
-                                    labels.insert(
-                                        "node.kubernetes.io/role".into(),
-                                        "controlplane".into(),
-                                    );
-                                    labels
-                                },
-                            },
-                        },
-                    },
-                    Inventory {
-                        name: "workers".into(),
-                        hosts: Hosts::FromClusterNodes {
-                            from_nodes: NodeSelectorTerm {
-                                match_labels: {
-                                    let mut labels = BTreeMap::new();
-                                    labels
-                                        .insert("node.kubernetes.io/role".into(), "worker".into());
-                                    labels
-                                },
-                            },
-                        },
-                    },
-                ],
+                inventory_refs: vec![InventoryRef {
+                    name: "controlplanes".into(),
+                }],
                 connection_strategy: ConnectionStrategy::Ssh {
                     ssh: SshConfig {
                         user: "root".into(),
@@ -375,16 +354,8 @@ metadata:
   name: an-example
 spec:
   image: docker.io/serversideup/ansible-core:2.18
-  inventory:
-    - name: ccu
-      hosts:
-        fromList:
-          - ccu.fritz.box
-    - name: k3s
-      hosts:
-        fromNodes:
-          matchLabels:
-            node.kubernetes.io/instance-type: k3s
+  inventoryRefs:
+    - name: controlplanes
   mode: OneShot
   connectionStrategy:
     ssh:

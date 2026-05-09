@@ -1,45 +1,10 @@
 use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::{Node, Secret};
+use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector::ObjectRef;
 use tracing::debug;
 
 use crate::v1beta1;
-
-/// Returns a closure that maps a Node to all PlaybookPlans that might reference it, i.e. all nodes
-/// with and inventory that contains Hosts::FromClusterNodes.
-///
-/// # Panics
-///
-/// Panics if the node returned from the apiserver does not have a name.
-pub fn node_to_playbookplans(
-    node_reflector_reader: Arc<kube::runtime::reflector::Store<v1beta1::PlaybookPlan>>,
-) -> impl Fn(Node) -> Vec<ObjectRef<v1beta1::PlaybookPlan>> {
-    move |node| {
-        node_reflector_reader
-            .state()
-            .iter()
-            .filter(|resource| {
-                resource
-                    .spec
-                    .inventory
-                    .iter()
-                    .any(|inventory| match &inventory.hosts {
-                        v1beta1::Hosts::FromClusterNodes { .. } => true,
-                        v1beta1::Hosts::FromStaticList { .. } => false,
-                    })
-            })
-            .map(|resource| ObjectRef::from(&**resource))
-            .inspect(|object_ref| {
-                debug!(
-                    "Reconcile of {} triggered by node {}",
-                    object_ref,
-                    node.metadata.name.as_ref().unwrap()
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-}
 
 /// Returns a closure that maps a Secret to all PlaybookPlans that reference it.
 ///
