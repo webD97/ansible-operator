@@ -202,10 +202,10 @@ pub enum Phase {
     /// Playbook is scheduled for reexecution.
     Scheduled,
 
-    /// Jobs for all hosts ran successfully (for OneShot mode only)
+    /// Some or all jobs failed (for OneShot mode only)
     Failed,
 
-    /// Some or all jobs failed (for OneShot mode only)
+    /// Jobs for all hosts ran successfully (for OneShot mode only)
     Succeeded,
 }
 
