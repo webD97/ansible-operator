@@ -16,12 +16,14 @@ async fn main() {
 
     if args.contains(&"--crd".into()) {
         let playbookplan = v1beta1::PlaybookPlan::crd();
-        let inventory = v1beta1::AnsibleInventory::crd();
+        let cluster_inventory = v1beta1::ClusterInventory::crd();
+        let static_inventory = v1beta1::StaticInventory::crd();
         println!(
             "{}",
             [
                 serde_yaml::to_string(&playbookplan).unwrap(),
-                serde_yaml::to_string(&inventory).unwrap()
+                serde_yaml::to_string(&cluster_inventory).unwrap(),
+                serde_yaml::to_string(&static_inventory).unwrap()
             ]
             .join("---\n")
         );
@@ -36,7 +38,7 @@ async fn main() {
     // let playbookplan_controller =
     //     v1beta1::playbookplancontroller::reconciler::new(kubernetes_client);
 
-    let inventory_controller = v1beta1::inventorycontroller::new(kubernetes_client);
+    let inventory_controller = v1beta1::clusterinventorycontroller::new(kubernetes_client);
 
     // playbookplan_controller
     //     .for_each(|res| async move {

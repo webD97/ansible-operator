@@ -1,0 +1,11 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: StaticInventory
+metadata:
+  name: static-inventory-example
+spec:
+  hosts:
+    - name: webservers
+      hosts:
+        - server1.somedomain.example
+        - server1.somedomain.example
+        - 192.168.73.42

@@ -15,9 +15,9 @@ use kube::{
 use tracing::error;
 
 use crate::v1beta1::{
-    self, AnsibleInventory, AnsibleInventorySpec, AnsibleInventoryStatus,
+    self, ClusterInventory, ClusterInventorySpec, ClusterInventoryStatus,
+    clusterinventorycontroller::mappers,
     controllers::{nodeselector::node_matches, reconcile_error::ReconcileError},
-    inventorycontroller::mappers,
 };
 
 struct ReconciliationContext {
@@ -27,7 +27,7 @@ pub fn new(
     client: kube::Client,
 ) -> impl Stream<
     Item = Result<
-        (ObjectRef<v1beta1::AnsibleInventory>, Action),
+        (ObjectRef<v1beta1::ClusterInventory>, Action),
         controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
@@ -35,11 +35,11 @@ pub fn new(
         client: client.clone(),
     });
 
-    let inventories_api: Api<v1beta1::AnsibleInventory> = Api::all(client.clone());
+    let inventories_api: Api<v1beta1::ClusterInventory> = Api::all(client.clone());
     let nodes_api: Api<Node> = Api::all(client.clone());
 
     let inventory_reflector_reader = {
-        let inventory_reflector_writer = Writer::<v1beta1::AnsibleInventory>::default();
+        let inventory_reflector_writer = Writer::<v1beta1::ClusterInventory>::default();
         let inventory_reflector_reader = Arc::new(inventory_reflector_writer.as_reader());
 
         let inventory_reflector = kube::runtime::reflector(
@@ -75,7 +75,7 @@ pub fn new(
 }
 
 async fn reconcile(
-    object: Arc<v1beta1::AnsibleInventory>,
+    object: Arc<v1beta1::ClusterInventory>,
     context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
     let namespace = object
@@ -90,19 +90,11 @@ async fn reconcile(
         .iter()
         .map(|group| {
             let name = group.name.to_owned();
-            let hosts = match group.source() {
-                Err(_) => Vec::new(),
-                Ok(source) => match source {
-                    v1beta1::HostSource::FromClusterNodes { from_cluster_nodes } => all_nodes
-                        .iter()
-                        .filter(|node| node_matches(node, from_cluster_nodes))
-                        .map(|node| node.name().expect("name is set").to_string())
-                        .collect(),
-                    v1beta1::HostSource::FromHostnames { from_hostnames } => {
-                        from_hostnames.to_vec()
-                    }
-                },
-            };
+            let hosts = all_nodes
+                .iter()
+                .filter(|node| node_matches(node, group.match_labels.as_ref()))
+                .map(|node| node.name().expect("name is set").to_string())
+                .collect();
 
             v1beta1::ResolvedHosts { name, hosts }
         })
@@ -110,29 +102,29 @@ async fn reconcile(
 
     let host_count: usize = resolved_hosts.iter().map(|group| group.hosts.len()).sum();
 
-    let next_status = AnsibleInventoryStatus {
+    let next_status = ClusterInventoryStatus {
         host_count,
         resolved_hosts,
     };
 
-    let api: Api<AnsibleInventory> = Api::namespaced(context.client.clone(), &namespace);
+    let api: Api<ClusterInventory> = Api::namespaced(context.client.clone(), &namespace);
     replace_status(api, &object, next_status).await?;
 
     Ok(Action::requeue(Duration::from_hours(1)))
 }
 
 async fn replace_status(
-    api: Api<AnsibleInventory>,
-    target: &AnsibleInventory,
-    status: AnsibleInventoryStatus,
+    api: Api<ClusterInventory>,
+    target: &ClusterInventory,
+    status: ClusterInventoryStatus,
 ) -> Result<(), ReconcileError> {
     let name = target
         .name()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
 
-    let patch_object = AnsibleInventory {
+    let patch_object = ClusterInventory {
         metadata: target.metadata.clone(),
-        spec: AnsibleInventorySpec::default(),
+        spec: ClusterInventorySpec::default(),
         status: Some(status),
     };
 

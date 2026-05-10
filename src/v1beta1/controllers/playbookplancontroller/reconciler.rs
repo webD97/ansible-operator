@@ -1,5 +1,6 @@
 use crate::v1beta1::{
-    AnsibleInventory, ExecutionMode, Phase, ResolvedHosts, labels,
+    AnsibleInventory, ClusterInventory, ExecutionMode, Phase, ResolvedHosts, StaticInventory,
+    labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         status::all_jobs_finished,
@@ -365,27 +366,55 @@ async fn resolve_inventory(
         .namespace()
         .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
 
-    let inventory_api: Api<AnsibleInventory> = Api::namespaced(context.client.clone(), &namespace);
+    let cluster_inventory_api: Api<ClusterInventory> =
+        Api::namespaced(context.client.clone(), &namespace);
+    let static_inventory_api: Api<StaticInventory> =
+        Api::namespaced(context.client.clone(), &namespace);
+
     let inventory_refs = &object.spec.inventory_refs;
-    let inventories = inventory_refs
+
+    let cluster_inventories = inventory_refs
         .iter()
-        .map(|inventory_ref| &inventory_ref.name)
-        .map(|name| inventory_api.get_status(name));
+        .filter_map(|inventory_ref| inventory_ref.cluster_inventory.as_ref())
+        .map(|name| cluster_inventory_api.get(name));
 
-    let (inventories, errors): (Vec<_>, Vec<_>) = futures::future::join_all(inventories)
-        .await
-        .into_iter()
-        .partition(Result::is_ok);
+    let (cluster_inventories, errors): (Vec<_>, Vec<_>) =
+        futures::future::join_all(cluster_inventories)
+            .await
+            .into_iter()
+            .partition(Result::is_ok);
 
-    let errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
-    let resolved_hosts: Vec<_> = inventories
+    let cluster_inventory_errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
+
+    let static_inventories = inventory_refs
+        .iter()
+        .filter_map(|inventory_ref| inventory_ref.static_inventory.as_ref())
+        .map(|name| static_inventory_api.get(name));
+
+    let (static_inventories, errors): (Vec<_>, Vec<_>) =
+        futures::future::join_all(static_inventories)
+            .await
+            .into_iter()
+            .partition(Result::is_ok);
+
+    let static_inventory_errors: Vec<_> = errors.into_iter().map(Result::unwrap_err).collect();
+
+    let resolved_hosts: Vec<_> = cluster_inventories
         .into_iter()
-        .map(Result::unwrap)
-        .flat_map(|i| i.status)
-        .flat_map(|i| i.resolved_hosts)
+        .map(|r| Box::new(r.unwrap()) as Box<dyn AnsibleInventory>)
+        .chain(
+            static_inventories
+                .into_iter()
+                .map(|r| Box::new(r.unwrap()) as Box<dyn AnsibleInventory>),
+        )
+        .flat_map(|i| i.get_hosts())
         .collect();
 
-    if let Some(first) = errors.into_iter().next() {
+    let mut all_errors = cluster_inventory_errors
+        .into_iter()
+        .chain(static_inventory_errors);
+
+    if let Some(first) = all_errors.next() {
         return Err(ReconcileError::KubeError(first));
     }
 

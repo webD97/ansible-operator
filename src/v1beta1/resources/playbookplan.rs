@@ -71,8 +71,10 @@ pub struct PlaybookPlanSpec {
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 pub struct InventoryRef {
-    /// Name of the inventory resource being referenced
-    pub name: String,
+    /// Name of the ClusterInventory resource being referenced
+    pub cluster_inventory: Option<String>,
+    /// Name of the StaticInventory resource being referenced
+    pub static_inventory: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -305,7 +307,8 @@ mod tests {
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,
                 inventory_refs: vec![InventoryRef {
-                    name: "controlplanes".into(),
+                    cluster_inventory: Some("controlplanes".into()),
+                    static_inventory: Some("others".into()),
                 }],
                 connection_strategy: ConnectionStrategy::Ssh {
                     ssh: SshConfig {

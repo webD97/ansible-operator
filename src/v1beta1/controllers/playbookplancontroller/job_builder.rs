@@ -461,16 +461,9 @@ metadata:
 spec:
   image: docker.io/serversideup/ansible-core:2.18
   mode: OneShot
-  inventory:
-    - name: ccu
-      hosts:
-        fromList:
-          - ccu.fritz.box
-    - name: k3s
-      hosts:
-        fromNodes:
-          matchLabels:
-            node.kubernetes.io/instance-type: k3s
+  inventoryRefs:
+    - name: something
+      staticInventory: blubb
   connectionStrategy:
     ssh:
       user: root

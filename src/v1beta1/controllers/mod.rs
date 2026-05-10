@@ -1,5 +1,8 @@
+mod ansible_inventory;
+pub mod clusterinventorycontroller;
 mod inventory_resolver;
-pub mod inventorycontroller;
 mod nodeselector;
 pub mod playbookplancontroller;
 mod reconcile_error;
+
+pub use ansible_inventory::*;

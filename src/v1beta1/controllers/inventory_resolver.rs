@@ -31,7 +31,7 @@ async fn resolve_hosts(
         v1beta1::Hosts::FromClusterNodes { from_nodes } => nodes
             .items
             .iter()
-            .filter(|node| nodeselector::node_matches(node, from_nodes))
+            .filter(|node| nodeselector::node_matches(node, Some(from_nodes)))
             .map(|node| node.name().unwrap_or_default().into())
             .collect(),
     };
