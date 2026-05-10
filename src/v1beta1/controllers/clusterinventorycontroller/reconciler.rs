@@ -108,13 +108,13 @@ async fn reconcile(
     };
 
     let api: Api<ClusterInventory> = Api::namespaced(context.client.clone(), &namespace);
-    replace_status(api, &object, next_status).await?;
+    replace_status(&api, &object, next_status).await?;
 
     Ok(Action::requeue(Duration::from_hours(1)))
 }
 
 async fn replace_status(
-    api: Api<ClusterInventory>,
+    api: &Api<ClusterInventory>,
     target: &ClusterInventory,
     status: ClusterInventoryStatus,
 ) -> Result<(), ReconcileError> {

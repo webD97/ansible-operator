@@ -1,6 +1,6 @@
 use crate::v1beta1::{
-    AnsibleInventory, ClusterInventory, ExecutionMode, Phase, ResolvedHosts, StaticInventory,
-    labels,
+    AnsibleInventory, ClusterInventory, ExecutionMode, Phase, PlaybookPlanSpec, PlaybookPlanStatus,
+    ResolvedHosts, StaticInventory, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         status::all_jobs_finished,
@@ -291,7 +291,7 @@ async fn reconcile(
         }
     }
 
-    persist_status(&api, &object, resource_status).await?;
+    replace_status(&api, &object, resource_status).await?;
 
     Ok(Action::requeue(requeue_after))
 }
@@ -311,21 +311,24 @@ fn get_related_secrets(playbookplan: &PlaybookPlan) -> Vec<&String> {
         .collect()
 }
 
-async fn persist_status(
-    api: &Api<v1beta1::PlaybookPlan>,
-    object: &v1beta1::PlaybookPlan,
-    status: v1beta1::PlaybookPlanStatus,
+async fn replace_status(
+    api: &Api<PlaybookPlan>,
+    target: &PlaybookPlan,
+    status: PlaybookPlanStatus,
 ) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
-    let mut patch_object = object.clone();
-    patch_object.status = Some(status);
-
-    let name = &object
+    let name = target
         .name()
-        .ok_or(ReconcileError::PreconditionFailed("expected a name"))?;
+        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
 
-    api.replace_status(name, &PostParams::default(), &patch_object)
+    let patch_object = PlaybookPlan {
+        metadata: target.metadata.clone(),
+        spec: PlaybookPlanSpec::default(),
+        status: Some(status),
+    };
+
+    api.replace_status(&name, &PostParams::default(), &patch_object)
         .await?;
 
     Ok(())
