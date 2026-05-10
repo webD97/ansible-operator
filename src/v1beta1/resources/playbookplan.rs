@@ -2,6 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 
 use crate::{utils::Condition, v1beta1::ResolvedHosts};
 use chrono::{DateTime, FixedOffset};
+use chrono_tz::Tz;
 use kube::CustomResource;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
@@ -224,7 +225,7 @@ pub struct PlaybookPlanStatus {
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
     pub phase: Phase,
-    pub current_hash: Option<String>,
+    pub current_hash: String,
     pub summary: Option<String>,
 }
 
@@ -258,6 +259,16 @@ impl Condition for PlaybookPlanCondition {
 
     fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
+    }
+}
+
+impl PlaybookPlan {
+    pub fn timezone(&self) -> Result<Tz, chrono_tz::ParseError> {
+        self.spec
+            .time_zone
+            .as_ref()
+            .map(|tz| tz.parse::<Tz>())
+            .unwrap_or(Ok(Tz::UTC))
     }
 }
 

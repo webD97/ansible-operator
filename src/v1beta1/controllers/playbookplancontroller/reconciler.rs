@@ -8,7 +8,7 @@ use crate::v1beta1::{
         workspace::{self, render_secret},
     },
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{batch::v1::Job, core::v1::Secret};
@@ -23,7 +23,7 @@ use kube::{
     },
 };
 use std::{collections::BTreeMap, sync::Arc};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     utils::create_or_update,
@@ -99,92 +99,48 @@ async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
-    use kube::runtime::reflector::Lookup as _;
-
-    // If object is being deleted, stop reonciliation
+    // If object is being deleted, stop reconciliation
     if object.metadata.deletion_timestamp.is_some() {
         return Ok(Action::await_change());
     }
 
+    let (namespace, name, generation) = extract_resource_info(&object)?;
+
+    let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), namespace);
+    let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
+
+    // These may be updated as needed during reconciliation
     let mut requeue_after = std::time::Duration::from_secs(3600);
-
-    let namespace = object
-        .namespace()
-        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
-    let name = object
-        .name()
-        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
-    let generation = object
-        .metadata
-        .generation
-        .ok_or(ReconcileError::PreconditionFailed("generation not set"))?;
-
-    let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), &namespace);
-    let secrets_api = Api::<Secret>::namespaced(context.client.clone(), &namespace);
-    let jobs_api = Api::<Job>::namespaced(context.client.clone(), &namespace);
-
     let mut resource_status = object.status.clone().unwrap_or_default();
 
-    let resolved_hosts = resolve_inventory(&context, &object).await?;
+    let target_hosts = resolve_inventory(&context, &object).await?;
 
-    resource_status.eligible_hosts = resolved_hosts.clone();
+    resource_status.eligible_hosts = target_hosts.clone();
 
-    // Render playbook if necessary
-    if workspace::is_missing(&secrets_api, &name).await? || workspace::is_outdated(&object) {
-        info!("Rendering playbook to secret");
-        let secret = render_secret(&object, &resolved_hosts)?;
-
-        create_or_update(
-            &secrets_api,
-            "ansible-operator",
-            &name,
-            secret,
-            |existing, desired_state| {
-                desired_state.metadata.managed_fields = None;
-
-                // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
-                desired_state.data = {
-                    let desired_data = desired_state.string_data.clone().unwrap_or_default();
-
-                    existing.data.map(|d| {
-                        BTreeMap::from_iter(
-                            d.iter()
-                                .filter(|(key, _)| !desired_data.contains_key(*key))
-                                .map(|(key, value)| (key.clone(), value.clone())),
-                        )
-                    })
-                };
-            },
-        )
-        .await?;
-
+    if workspace::is_missing(&secrets_api, name).await? || workspace::is_outdated(&object) {
+        debug!("Rendering playbook to secret");
+        upsert_workspace_secret(&secrets_api, name, render_secret(&object, &target_hosts)?).await?;
         resource_status.last_rendered_generation = Some(generation);
     }
 
     let related_secrets = get_related_secrets(&object);
-    let execution_hash = hash_playbook_and_secrets(
+    let execution_hash = hash_playbook_inputs(
         &object.spec.template.playbook,
         &related_secrets,
         &secrets_api,
     )
     .await;
 
-    if resource_status.current_hash != Some(execution_hash.to_string()) {
+    if resource_status.current_hash != execution_hash.to_string() {
         resource_status.phase = Phase::Pending;
-        resource_status.current_hash = Some(execution_hash.to_string());
+        resource_status.current_hash = execution_hash.to_string();
     }
 
-    let tz = object
-        .spec
-        .time_zone
-        .as_ref()
-        .map(|tz| tz.parse::<Tz>().unwrap())
-        .unwrap_or(Tz::UTC);
-
+    let tz = object.timezone().unwrap();
     let now = || Utc::now().with_timezone(&tz);
     let time_window = chrono::Duration::seconds(15);
     let timing = evaluate_schedule(object.spec.schedule.as_deref(), now(), time_window);
-    let mode = &object.spec.mode;
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash)?;
 
     if !outdated_hosts.is_empty() && resource_status.phase != Phase::Applying {
@@ -195,49 +151,17 @@ async fn reconcile(
                 resource_status.next_run = Some(until.fixed_offset());
             }
             Timing::Now(start) => {
-                let hosts_to_trigger = match mode {
-                    ExecutionMode::OneShot => outdated_hosts,
-                    ExecutionMode::Recurring => find_all_hosts(&resource_status),
-                };
-
-                if hosts_to_trigger.is_empty() {
-                    resource_status.next_run = None;
-                }
-
-                for host in hosts_to_trigger {
-                    let job = job_builder::create_job_for_host(
-                        &host,
-                        &execution_hash,
-                        start.map(|t| t.to_utc()).as_ref(),
-                        &object,
-                    )?;
-                    let job_name = job
-                        .name()
-                        .expect(".metadata.name must be set at this point");
-
-                    // Job already exists, skip creating another one
-                    // TODO: Check for jobs with another hash and decide if we need to replace them
-                    if jobs_api.get_opt(&job_name).await?.is_some() {
-                        info!("Job for {host} already exists");
-                        continue;
-                    }
-
-                    // Now that we finally know that there are hosts where we need to apply something,
-                    // set the status accordingly.
-                    resource_status.phase = Phase::Applying;
-                    resource_status.next_run = None;
-
-                    info!("Creating job {job_name}");
-                    jobs_api
-                        .create(
-                            &PostParams {
-                                field_manager: Some("ansible-operator".into()),
-                                ..Default::default()
-                            },
-                            &job,
-                        )
-                        .await?;
-                }
+                let all_hosts = find_all_hosts(&resource_status);
+                spawn_ansible_jobs(
+                    &jobs_api,
+                    start,
+                    execution_hash,
+                    outdated_hosts,
+                    all_hosts,
+                    &object,
+                    &mut resource_status,
+                )
+                .await?;
             }
         };
     }
@@ -260,7 +184,7 @@ async fn reconcile(
     evaluate_per_host_status(&jobs, &execution_hash, &mut resource_status);
 
     if all_jobs_finished(&jobs) && !jobs.items.is_empty() {
-        let total_count: usize = resolved_hosts.iter().map(|g| g.hosts.len()).sum();
+        let total_count: usize = target_hosts.iter().map(|g| g.hosts.len()).sum();
         let outdated_count = find_outdated_hosts(&resource_status, &execution_hash)?.len();
 
         resource_status.summary = match outdated_count {
@@ -268,7 +192,7 @@ async fn reconcile(
             n => Some(format!("{n}/{total_count} outdated")),
         };
 
-        match mode {
+        match &object.spec.mode {
             ExecutionMode::OneShot => {
                 resource_status.next_run = None;
                 resource_status.phase = match outdated_count {
@@ -294,6 +218,36 @@ async fn reconcile(
     replace_status(&api, &object, resource_status).await?;
 
     Ok(Action::requeue(requeue_after))
+}
+
+async fn upsert_workspace_secret(
+    api: &Api<Secret>,
+    secret_name: &str,
+    secret: Secret,
+) -> Result<(), ReconcileError> {
+    Ok(create_or_update(
+        api,
+        "ansible-operator",
+        secret_name,
+        secret,
+        |existing, desired_state| {
+            desired_state.metadata.managed_fields = None;
+
+            // `string_data` contains our new or updated keys. If they exist in `data`, remove them from there so that `string_data` can take precedence.
+            desired_state.data = {
+                const EMPTY: &BTreeMap<String, String> = &BTreeMap::new();
+                let desired_data = desired_state.string_data.as_ref().unwrap_or(EMPTY);
+
+                existing.data.map(|d| {
+                    BTreeMap::from_iter(
+                        d.into_iter()
+                            .filter(|(key, _)| !desired_data.contains_key(key)),
+                    )
+                })
+            };
+        },
+    )
+    .await?)
 }
 
 /// Returns a list of all secret names that the given PlaybookPlan references. This includes for
@@ -334,7 +288,7 @@ async fn replace_status(
     Ok(())
 }
 
-async fn hash_playbook_and_secrets(
+async fn hash_playbook_inputs(
     playbook: &str,
     secret_names: &[&String],
     secrets_api: &Api<Secret>,
@@ -418,4 +372,82 @@ async fn resolve_inventory(
     }
 
     Ok(resolved_hosts)
+}
+
+fn extract_resource_info(object: &PlaybookPlan) -> Result<(&str, &str, i64), ReconcileError> {
+    let namespace = object
+        .metadata
+        .namespace
+        .as_deref()
+        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
+
+    let name = object
+        .metadata
+        .name
+        .as_deref()
+        .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
+
+    let generation = object
+        .metadata
+        .generation
+        .ok_or(ReconcileError::PreconditionFailed("generation not set"))?;
+
+    Ok((namespace, name, generation))
+}
+
+async fn spawn_ansible_jobs(
+    api: &Api<Job>,
+    start: Option<DateTime<Tz>>,
+    hash: ExecutionHash,
+    outdated_hosts: Vec<String>,
+    all_hosts: Vec<String>,
+    playbookplan: &PlaybookPlan,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<(), ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+
+    let hosts_to_trigger = match &playbookplan.spec.mode {
+        ExecutionMode::OneShot => outdated_hosts,
+        ExecutionMode::Recurring => all_hosts,
+    };
+
+    if hosts_to_trigger.is_empty() {
+        resource_status.next_run = None;
+    }
+
+    for host in hosts_to_trigger {
+        let job = job_builder::create_job_for_host(
+            &host,
+            &hash,
+            start.map(|t| t.to_utc()).as_ref(),
+            playbookplan,
+        )?;
+        let job_name = job
+            .name()
+            .expect(".metadata.name must be set at this point");
+
+        // Job already exists, skip creating another one
+        // TODO: Check for jobs with another hash and decide if we need to replace them
+        if api.get_opt(&job_name).await?.is_some() {
+            info!("Job for {host} already exists");
+            continue;
+        }
+
+        // Now that we finally know that there are hosts where we need to apply something,
+        // set the status accordingly.
+        resource_status.phase = Phase::Applying;
+        resource_status.next_run = None;
+
+        info!("Creating job {job_name}");
+        api.create(
+            &PostParams {
+                field_manager: Some("ansible-operator".into()),
+                ..Default::default()
+            },
+            &job,
+        )
+        .await?;
+    }
+
+    Ok(())
 }

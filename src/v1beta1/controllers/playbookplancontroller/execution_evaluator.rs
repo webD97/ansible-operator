@@ -7,7 +7,7 @@ use k8s_openapi::ByteString;
 
 use crate::v1beta1::{self, controllers::reconcile_error::ReconcileError};
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Copy, Clone)]
 pub struct ExecutionHash(u64);
 
 impl std::fmt::Display for ExecutionHash {
