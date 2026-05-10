@@ -24,5 +24,7 @@ pub struct SelectorExpression {
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, PartialEq)]
 pub enum SelectorOperator {
     In,
+    NotIn,
+    Exists,
     DoesNotExist,
 }

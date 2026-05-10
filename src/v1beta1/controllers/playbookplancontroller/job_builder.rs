@@ -43,12 +43,6 @@ pub fn create_job_for_host(
         .as_ref()
         .expect(".metadata.namespace must be set here");
 
-    let pb_uid = object
-        .metadata
-        .uid
-        .as_ref()
-        .expect(".metadata.uid must be set here");
-
     let mut partial_job =
         create_job_skeleton(host, object, object.spec.template.requirements.is_some())?;
 

@@ -29,18 +29,19 @@ pub fn find_outdated_hosts(
     status: &v1beta1::PlaybookPlanStatus,
     execution_hash: &ExecutionHash,
 ) -> Result<Vec<String>, ReconcileError> {
-    // If we have no eligible hosts, we don't need to execute the playbook anywhere
-    let Some(hosts) = &status.eligible_hosts else {
-        return Ok(vec![]);
-    };
+    let hosts: Vec<_> = status
+        .eligible_hosts
+        .iter()
+        .flat_map(|g| g.hosts.iter().cloned())
+        .collect();
 
     // If we don't have any hosts_status yet, simply return all hosts for execution
     let Some(hosts_status) = &status.hosts_status else {
-        return Ok(hosts.values().flatten().cloned().collect());
+        return Ok(hosts);
     };
 
     // For each host, check if it already has the current execution hash in the PlaybookPlan's status
-    let outdated_hosts = hosts.values().flatten().filter(move |host| {
+    let outdated_hosts = hosts.iter().filter(move |host| {
         let host_status = hosts_status.get(*host);
 
         // We don't have a status for this host yet so we must execute the playbook
@@ -58,11 +59,13 @@ pub fn find_outdated_hosts(
 }
 
 pub fn find_all_hosts(status: &v1beta1::PlaybookPlanStatus) -> Vec<String> {
-    let Some(hosts) = &status.eligible_hosts else {
-        return vec![];
-    };
+    let hosts: Vec<_> = status
+        .eligible_hosts
+        .iter()
+        .flat_map(|g| g.hosts.iter().cloned())
+        .collect();
 
-    hosts.values().flatten().cloned().collect()
+    hosts
 }
 
 /// Given a playbook and some secrets, calculate a hash that only changes if the inputs change.
@@ -95,7 +98,7 @@ pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, 
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::v1beta1::{HostStatus, PlaybookPlanStatus};
+    use crate::v1beta1::{HostStatus, PlaybookPlanStatus, ResolvedHosts};
 
     use super::*;
 
@@ -103,7 +106,7 @@ mod tests {
     pub fn test_must_execute_returns_none_when_eligible_hosts_empty() {
         // Given
         let status = PlaybookPlanStatus {
-            eligible_hosts: None,
+            eligible_hosts: Vec::new(),
             ..Default::default()
         };
 
@@ -118,10 +121,10 @@ mod tests {
     pub fn test_must_execute_returns_all_when_hosts_status_empty() {
         // Given
         let status = PlaybookPlanStatus {
-            eligible_hosts: Some(BTreeMap::from_iter(vec![(
-                "test-inventory".into(),
-                vec!["host-1".into(), "host-2".into(), "host-3".into()],
-            )])),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "test-inventory".into(),
+                hosts: vec!["host-1".into(), "host-2".into(), "host-3".into()],
+            }],
             hosts_status: None,
             ..Default::default()
         };
@@ -145,10 +148,10 @@ mod tests {
     pub fn test_must_execute_returns_correct_hosts() {
         // Given
         let status = PlaybookPlanStatus {
-            eligible_hosts: Some(BTreeMap::from_iter(vec![(
-                "test-inventory".into(),
-                vec!["host-1".into(), "host-2".into(), "host-3".into()],
-            )])),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "test-inventory".into(),
+                hosts: vec!["host-1".into(), "host-2".into(), "host-3".into()],
+            }],
             hosts_status: Some(BTreeMap::from_iter(vec![
                 (
                     "host-1".to_owned(),

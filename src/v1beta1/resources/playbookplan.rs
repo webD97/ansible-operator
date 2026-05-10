@@ -1,9 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap};
 
-use crate::{
-    utils::Condition,
-    v1beta1::{LabelMap, NodeSelectorTerm},
-};
+use crate::{utils::Condition, v1beta1::ResolvedHosts};
 use chrono::{DateTime, FixedOffset};
 use kube::CustomResource;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -70,6 +67,7 @@ pub struct PlaybookPlanSpec {
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct InventoryRef {
     /// Name of the ClusterInventory resource being referenced
     pub cluster_inventory: Option<String>,
@@ -123,34 +121,6 @@ pub enum PlaybookVariableSource {
     Inline {
         inline: GenericMap,
     },
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct Inventory {
-    pub name: String,
-    pub hosts: Hosts,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(untagged)]
-pub enum Hosts {
-    FromClusterNodes {
-        #[serde(rename = "fromNodes")]
-        from_nodes: NodeSelectorTerm,
-    },
-    FromStaticList {
-        #[serde(rename = "fromList")]
-        from_list: Vec<String>,
-    },
-}
-
-impl Default for Hosts {
-    fn default() -> Self {
-        Self::FromClusterNodes {
-            from_nodes: NodeSelectorTerm::default(),
-        }
-    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -247,7 +217,7 @@ impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
-    pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
+    pub eligible_hosts: Vec<ResolvedHosts>,
     pub eligible_hosts_count: Option<usize>,
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
@@ -255,7 +225,7 @@ pub struct PlaybookPlanStatus {
     #[serde(with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
-    pub phase: Option<Phase>,
+    pub phase: Phase,
     pub current_hash: Option<String>,
     pub summary: Option<String>,
 }

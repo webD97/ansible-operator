@@ -1,6 +1,7 @@
 use futures_util::StreamExt as _;
 use kube::CustomResourceExt as _;
 use kube::config::KubeConfigOptions;
+use tokio::join;
 use tracing::{debug, warn};
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -32,31 +33,25 @@ async fn main() {
 
     setup_tracing();
 
-    let kubernetes_client =
-        kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
+    let client = kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
 
-    // let playbookplan_controller =
-    //     v1beta1::playbookplancontroller::reconciler::new(kubernetes_client);
-
-    let inventory_controller = v1beta1::clusterinventorycontroller::new(kubernetes_client);
-
-    // playbookplan_controller
-    //     .for_each(|res| async move {
-    //         match res {
-    //             Ok(o) => debug!("reconciled {:?}", o),
-    //             Err(e) => warn!("reconcile failed: {:?}", e),
-    //         }
-    //     })
-    //     .await;
-
-    inventory_controller
+    let playbookplan_controller = v1beta1::playbookplancontroller::reconciler::new(client.clone())
         .for_each(|res| async move {
             match res {
                 Ok(o) => debug!("reconciled {:?}", o),
                 Err(e) => warn!("reconcile failed: {:?}", e),
             }
-        })
-        .await;
+        });
+
+    let inventory_controller =
+        v1beta1::clusterinventorycontroller::new(client).for_each(|res| async move {
+            match res {
+                Ok(o) => debug!("reconciled {:?}", o),
+                Err(e) => warn!("reconcile failed: {:?}", e),
+            }
+        });
+
+    join!(playbookplan_controller, inventory_controller);
 }
 
 fn setup_tracing() {

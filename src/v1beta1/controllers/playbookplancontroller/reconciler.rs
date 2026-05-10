@@ -23,7 +23,7 @@ use kube::{
     },
 };
 use std::{collections::BTreeMap, sync::Arc};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     utils::create_or_update,
@@ -127,6 +127,8 @@ async fn reconcile(
 
     let resolved_hosts = resolve_inventory(&context, &object).await?;
 
+    resource_status.eligible_hosts = resolved_hosts.clone();
+
     // Render playbook if necessary
     if workspace::is_missing(&secrets_api, &name).await? || workspace::is_outdated(&object) {
         info!("Rendering playbook to secret");
@@ -168,7 +170,7 @@ async fn reconcile(
     .await;
 
     if resource_status.current_hash != Some(execution_hash.to_string()) {
-        resource_status.phase = None;
+        resource_status.phase = Phase::Pending;
         resource_status.current_hash = Some(execution_hash.to_string());
     }
 
@@ -188,13 +190,13 @@ async fn reconcile(
     if !outdated_hosts.is_empty()
         && !matches!(
             resource_status.phase,
-            Some(Phase::Failed) | Some(Phase::Succeeded) | Some(Phase::Applying)
+            Phase::Failed | Phase::Succeeded | Phase::Applying
         )
     {
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
-                resource_status.phase = Some(Phase::Scheduled);
+                resource_status.phase = Phase::Scheduled;
                 resource_status.next_run = Some(until.fixed_offset());
             }
             Timing::Now(start) => {
@@ -228,7 +230,7 @@ async fn reconcile(
 
                     // Now that we finally know that there are hosts where we need to apply something,
                     // set the status accordingly.
-                    resource_status.phase = Some(Phase::Applying);
+                    resource_status.phase = Phase::Applying;
                     resource_status.next_run = None;
 
                     info!("Creating job {job_name}");
@@ -264,7 +266,7 @@ async fn reconcile(
     evaluate_per_host_status(&jobs, &execution_hash, &mut resource_status);
 
     if all_jobs_finished(&jobs) && !jobs.items.is_empty() {
-        let total_count = resource_status.eligible_hosts_count.unwrap_or_default();
+        let total_count: usize = resolved_hosts.iter().map(|g| g.hosts.len()).sum();
         let outdated_count = find_outdated_hosts(&resource_status, &execution_hash)?.len();
 
         resource_status.summary = match outdated_count {
@@ -276,13 +278,13 @@ async fn reconcile(
             ExecutionMode::OneShot => {
                 resource_status.next_run = None;
                 resource_status.phase = match outdated_count {
-                    0 => Some(Phase::Succeeded),
-                    _ => Some(Phase::Failed),
+                    0 => Phase::Succeeded,
+                    _ => Phase::Failed,
                 };
             }
             ExecutionMode::Recurring => {
                 if let Some(schedule) = &object.spec.schedule {
-                    resource_status.phase = Some(Phase::Scheduled);
+                    resource_status.phase = Phase::Scheduled;
                     let next =
                         forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
 

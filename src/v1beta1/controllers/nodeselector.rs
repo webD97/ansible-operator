@@ -5,6 +5,13 @@ use kube::api::PartialObjectMeta;
 
 use crate::v1beta1::{self, SelectorExpression, SelectorOperator};
 
+/// Returns `true` if the node satisfies the given selector term.
+///
+/// A node satisfies a term when it matches **all** `matchLabels` key-value
+/// pairs and **all** `matchExpressions` expressions. Missing fields are
+/// treated as empty and therefore always satisfied.
+///
+/// If `selector` is `None` the node is considered a match unconditionally.
 pub fn node_matches(
     node: &PartialObjectMeta<Node>,
     selector: Option<&v1beta1::NodeSelectorTerm>,
@@ -45,11 +52,13 @@ fn node_matches_match_expressions(
     let labels = node.labels();
 
     exprs.iter().all(|expr| match expr.operator {
-        SelectorOperator::In => matches_expression_in(
-            labels,
-            &expr.key,
-            expr.values.as_ref().unwrap_or(&Vec::new()),
-        ),
+        SelectorOperator::In => {
+            matches_expression_in(labels, &expr.key, expr.values.as_deref().unwrap_or(&[]))
+        }
+        SelectorOperator::NotIn => {
+            matches_expression_notin(labels, &expr.key, expr.values.as_deref().unwrap_or(&[]))
+        }
+        SelectorOperator::Exists => matches_expression_exists(labels, &expr.key),
         SelectorOperator::DoesNotExist => matches_expression_doesnotexist(labels, &expr.key),
     })
 }
@@ -62,6 +71,20 @@ fn matches_expression_in(
     map.get(key)
         .map(|v| values.iter().any(|s| s.as_ref() == v.as_str()))
         .unwrap_or(false)
+}
+
+fn matches_expression_notin(
+    map: &BTreeMap<String, String>,
+    key: &str,
+    values: &[impl AsRef<str>],
+) -> bool {
+    map.get(key)
+        .map(|v| !values.iter().any(|s| s.as_ref() == v.as_str()))
+        .unwrap_or(true)
+}
+
+fn matches_expression_exists(map: &BTreeMap<String, String>, key: &str) -> bool {
+    map.contains_key(key)
 }
 
 fn matches_expression_doesnotexist(map: &BTreeMap<String, String>, key: &str) -> bool {
@@ -303,5 +326,83 @@ mod tests {
             },
         ];
         assert!(!node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_exists_key_present() {
+        let node = make_node([("env", "prod")]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::Exists,
+            key: "env".to_string(),
+            values: None,
+        }];
+        assert!(node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_exists_key_absent() {
+        let node = make_node([("env", "prod")]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::Exists,
+            key: "spot".to_string(),
+            values: None,
+        }];
+        assert!(!node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_exists_node_has_no_labels() {
+        let node = make_node([]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::Exists,
+            key: "env".to_string(),
+            values: None,
+        }];
+        assert!(!node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_notin_key_absent_always_matches() {
+        let node = make_node([("env", "prod")]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::NotIn,
+            key: "zone".to_string(),
+            values: Some(vec!["eu-west-1".to_string()]),
+        }];
+        assert!(node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_notin_key_present_value_not_in_list() {
+        let node = make_node([("zone", "us-east-1")]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::NotIn,
+            key: "zone".to_string(),
+            values: Some(vec!["eu-west-1".to_string(), "eu-central-1".to_string()]),
+        }];
+        assert!(node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_notin_key_present_value_in_list() {
+        let node = make_node([("zone", "eu-west-1")]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::NotIn,
+            key: "zone".to_string(),
+            values: Some(vec!["eu-west-1".to_string(), "eu-central-1".to_string()]),
+        }];
+        assert!(!node_matches_match_expressions(&node, &exprs));
+    }
+
+    #[test]
+    fn expressions_notin_empty_values_always_matches() {
+        // NotIn [] means "value is not in the empty set" → always true
+        let node = make_node([("zone", "eu-west-1")]);
+        let exprs = vec![SelectorExpression {
+            operator: SelectorOperator::NotIn,
+            key: "zone".to_string(),
+            values: None,
+        }];
+        assert!(node_matches_match_expressions(&node, &exprs));
     }
 }

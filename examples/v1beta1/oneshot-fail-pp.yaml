@@ -1,4 +1,15 @@
 apiVersion: ansible.cloudbending.dev/v1beta1
+kind: StaticInventory
+metadata:
+  name: oneshot-fail
+spec:
+  hosts:
+    - name: all
+      hosts:
+        - homelab-worker-0
+        - homelab-worker-1
+---
+apiVersion: ansible.cloudbending.dev/v1beta1
 kind: PlaybookPlan
 metadata:
   name: oneshot-fail
@@ -7,13 +18,9 @@ spec:
   schedule: "* * * * *"
   timeZone: Europe/Berlin
   connectionStrategy:
-    chroot:
-  inventory:
-    - name: workers
-      hosts:
-        fromNodes:
-          matchLabels:
-            kubernetes.io/hostname: homelab-worker-1
+    chroot: {}
+  inventoryRefs:
+    - staticInventory: oneshot-fail
   template:
     requirements: |
       collections:
