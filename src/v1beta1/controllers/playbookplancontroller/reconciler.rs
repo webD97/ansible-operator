@@ -187,12 +187,7 @@ async fn reconcile(
     let mode = &object.spec.mode;
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash)?;
 
-    if !outdated_hosts.is_empty()
-        && !matches!(
-            resource_status.phase,
-            Phase::Failed | Phase::Succeeded | Phase::Applying
-        )
-    {
+    if !outdated_hosts.is_empty() && resource_status.phase != Phase::Applying {
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
@@ -206,7 +201,6 @@ async fn reconcile(
                 };
 
                 if hosts_to_trigger.is_empty() {
-                    // resource_status.phase = Some(Phase::Finished);
                     resource_status.next_run = None;
                 }
 

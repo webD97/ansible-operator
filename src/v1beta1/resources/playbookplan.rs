@@ -158,8 +158,7 @@ pub struct SecretRef {
     pub name: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-// #[serde(rename_all = "PascalCase")]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 pub enum Phase {
     /// Triggers have not yet been evaluated
     #[default]
@@ -218,7 +217,6 @@ impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Vec<ResolvedHosts>,
-    pub eligible_hosts_count: Option<usize>,
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
     pub hosts_status: Option<BTreeMap<String, HostStatus>>,
