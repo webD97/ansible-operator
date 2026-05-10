@@ -22,7 +22,7 @@ use kube::{
     },
 };
 use std::{collections::BTreeMap, sync::Arc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     utils::create_or_update,
@@ -71,7 +71,7 @@ pub fn new(
                 .for_each(|event| async {
                     match event {
                         Ok(_) => {}
-                        Err(e) => eprintln!("Reflector error: {e:?}"),
+                        Err(e) => error!("Reflector error: {e:?}"),
                     }
                 })
                 .await;

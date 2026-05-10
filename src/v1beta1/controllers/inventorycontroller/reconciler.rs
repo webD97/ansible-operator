@@ -12,6 +12,7 @@ use kube::{
         watcher,
     },
 };
+use tracing::error;
 
 use crate::v1beta1::{
     self, AnsibleInventory, AnsibleInventorySpec, AnsibleInventoryStatus,
@@ -51,7 +52,7 @@ pub fn new(
                 .for_each(|event| async {
                     match event {
                         Ok(_) => {}
-                        Err(e) => eprintln!("Reflector error: {e:?}"),
+                        Err(e) => error!("Reflector error: {e:?}"),
                     }
                 })
                 .await;

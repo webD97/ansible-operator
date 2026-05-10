@@ -61,14 +61,6 @@ pub fn create_job_for_host(
 
     partial_job.metadata.namespace = Some(pb_namespace.into());
 
-    partial_job.metadata.owner_references = Some(vec![OwnerReference {
-        api_version: v1beta1::PlaybookPlan::api_version(&()).into(),
-        kind: v1beta1::PlaybookPlan::kind(&()).into(),
-        name: pb_name.to_string(),
-        uid: pb_uid.into(),
-        ..Default::default()
-    }]);
-
     let start_time_hash = match start {
         Some(start) => {
             let mut hasher = twox_hash::XxHash3_64::new();

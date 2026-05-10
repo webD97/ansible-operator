@@ -86,7 +86,7 @@ pub fn calculate_execution_hash<'a, T: IntoIterator<Item = &'a BTreeMap<String, 
 
         hasher.finish()
     }))
-    .fold(0u64, |prev, next| prev ^ next);
+    .fold(0u64, u64::wrapping_add);
 
     ExecutionHash(hash)
 }
