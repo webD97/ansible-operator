@@ -2,3 +2,6 @@
 .ansible
 .vscode
 ssh.yaml
+
+skills-lock.json
+.agents/
