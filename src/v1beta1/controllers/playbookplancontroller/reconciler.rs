@@ -1,3 +1,25 @@
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
+use futures_util::{Stream, StreamExt as _};
+use k8s_openapi::api::{
+    batch::v1::Job,
+    core::v1::{Pod, Secret},
+};
+use kube::{
+    Api,
+    api::{ListParams, LogParams, PostParams},
+    runtime::{
+        Controller,
+        controller::Action,
+        reflector::{ObjectRef, store::Writer},
+        watcher,
+    },
+};
+use lazy_static::lazy_static;
+use regex::Regex;
+use std::{collections::BTreeMap, sync::Arc};
+use tracing::{debug, error, info, warn};
+
 use crate::v1beta1::{
     AnsibleInventory, ClusterInventory, ExecutionMode, Phase, PlaybookPlanSpec, PlaybookPlanStatus,
     ResolvedHosts, StaticInventory, labels,
@@ -8,23 +30,6 @@ use crate::v1beta1::{
         workspace::{self, render_secret},
     },
 };
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
-use futures_util::{Stream, StreamExt as _};
-use k8s_openapi::api::{batch::v1::Job, core::v1::Secret};
-use kube::{
-    Api,
-    api::{ListParams, PostParams},
-    runtime::{
-        Controller,
-        controller::Action,
-        reflector::{ObjectRef, store::Writer},
-        watcher,
-    },
-};
-use std::{collections::BTreeMap, sync::Arc};
-use tracing::{debug, error, info, warn};
-
 use crate::{
     utils::create_or_update,
     v1beta1::{
@@ -40,6 +45,14 @@ use crate::{
 
 struct ReconciliationContext {
     client: kube::Client,
+}
+
+lazy_static! {
+    /// Extracts task information from an Ansible play recap line like:
+    /// ```txt
+    /// some-host : ok=1    changed=0    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+    /// ```
+    static ref PLAY_RECAP_RE: Regex = Regex::new(r"^(?<host>[^\s]+)\s*:\s+ok=(?<ok>\d+)\s+changed=(?<changed>\d+)\s+unreachable=(?<unreachable>\d+)\s+failed=(?<failed>\d+)\s+skipped=(?<skipped>\d+)\s+rescued=(?<rescued>\d+)\s+ignored=(?<ignored>\d+)\s*$").unwrap();
 }
 
 pub fn new(
@@ -184,6 +197,65 @@ async fn reconcile(
     evaluate_per_host_status(&jobs, &execution_hash, &mut resource_status);
 
     if all_jobs_finished(&jobs) && !jobs.items.is_empty() {
+        let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
+        for job in &jobs {
+            let job_name = job.metadata.name.as_ref().unwrap();
+            let pod_name = pods_api
+                .list(&ListParams {
+                    label_selector: Some(format!("job-name={}", job_name)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let pod_name = pod_name
+                .items
+                .first()
+                .unwrap()
+                .metadata
+                .name
+                .as_ref()
+                .unwrap();
+
+            let logs = pods_api
+                .logs(
+                    pod_name,
+                    &LogParams {
+                        tail_lines: Some(10 + target_hosts.len() as i64),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            info!("Job: {job_name}");
+            for line in logs.split("\n") {
+                if let Some(matches) = PLAY_RECAP_RE.captures(line) {
+                    let (
+                        _,
+                        [
+                            _,
+                            ok,
+                            changed,
+                            unreachable,
+                            failed,
+                            skipped,
+                            rescued,
+                            ignored,
+                        ],
+                    ) = matches.extract();
+                    println!("ok: {ok}");
+                    println!("changed: {changed}");
+                    println!("unreachable: {unreachable}");
+                    println!("failed: {failed}");
+                    println!("skipped: {skipped}");
+                    println!("rescued: {rescued}");
+                    println!("ignored: {ignored}");
+                }
+            }
+        }
+
+        //
+
         let total_count: usize = target_hosts.iter().map(|g| g.hosts.len()).sum();
         let outdated_count = find_outdated_hosts(&resource_status, &execution_hash)?.len();
 
