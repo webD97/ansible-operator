@@ -2,29 +2,30 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// Must match the marker strings printed by `ansible/callback_plugin.py`.
-const MARKER_START: &str = "===ANSIBLE-OPERATOR-RECAP-START===";
-const MARKER_END: &str = "===ANSIBLE-OPERATOR-RECAP-END===";
-
-// Only `failed`/`unreachable` are consulted today (via `is_failure`); the rest mirror the
-// callback's full JSON contract and are groundwork for future per-task progression info.
+/// Per-host outcome counters, deserialized from the compact fixed-order array the callback plugin
+/// writes: `[ok, changed, unreachable, failed, skipped, rescued, ignored]`. Only `failed`/
+/// `unreachable` are consulted today (via `is_failure`); the rest mirror ansible's stats and are
+/// groundwork for future per-task progression info.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
+#[serde(from = "[u32; 7]")]
 pub struct HostStats {
-    #[serde(default)]
     pub ok: u32,
-    #[serde(default)]
     pub changed: u32,
-    #[serde(default)]
     pub unreachable: u32,
-    #[serde(default)]
     pub failed: u32,
-    #[serde(default)]
     pub skipped: u32,
-    #[serde(default)]
     pub rescued: u32,
-    #[serde(default)]
     pub ignored: u32,
+}
+
+impl From<[u32; 7]> for HostStats {
+    /// Fixed wire order — must stay in lockstep with `ansible_operator_recap.py`. Changing it is
+    /// a *shape*-compatible edit that would silently misread an in-flight message, so don't
+    /// reorder: only ever add/remove positions (which changes the length and fails to parse).
+    fn from([ok, changed, unreachable, failed, skipped, rescued, ignored]: [u32; 7]) -> Self {
+        Self { ok, changed, unreachable, failed, skipped, rescued, ignored }
+    }
 }
 
 impl HostStats {
@@ -33,56 +34,60 @@ impl HostStats {
     }
 }
 
+/// The recap the callback plugin writes to the Job pod's `/dev/termination-log`: a bare map of
+/// hostname -> per-host counter array. Read back from the finished container's terminated state.
 #[derive(Deserialize, Debug, Clone, Default)]
+#[serde(transparent)]
 pub struct CallbackOutput {
     pub processed: BTreeMap<String, HostStats>,
 }
 
-/// Scans the full pod log output for the callback plugin's delimited JSON block. Returns `None`
-/// if the marker is missing or the JSON inside is malformed/truncated — callers must surface that
-/// as `HostOutcome::Unknown`, not `NotReached` (which means Ansible legitimately never got there).
-pub fn parse_callback_output(logs: &str) -> Option<CallbackOutput> {
-    let after_start = logs.find(MARKER_START)? + MARKER_START.len();
-    let rest = &logs[after_start..];
-    let end = rest.find(MARKER_END)?;
-    let json_str = rest[..end].trim();
-
-    serde_json::from_str(json_str).ok()
+/// Parses the container's termination message. Returns `None` if the message is empty or not
+/// parseable — truncated at the kubelet's size cap, or a hard crash (OOM/SIGKILL) before the
+/// stats hook ran. Callers must surface that as `HostOutcome::Unknown`, not `NotReached` (which
+/// means Ansible legitimately never got there).
+pub fn parse_callback_output(message: &str) -> Option<CallbackOutput> {
+    serde_json::from_str(message.trim()).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn wrap(json: &str) -> String {
-        format!("some task output\n{MARKER_START}\n{json}\n{MARKER_END}\nmore output\n")
+    #[test]
+    fn parses_bare_host_array_map_positionally() {
+        let msg = r#"{"host-1":[2,1,0,0,0,0,0],"host-2":[2,0,0,1,0,0,0]}"#;
+
+        let parsed = parse_callback_output(msg).unwrap();
+        assert_eq!(parsed.processed.len(), 2);
+
+        // [ok, changed, unreachable, failed, skipped, rescued, ignored]
+        let h1 = &parsed.processed["host-1"];
+        assert_eq!((h1.ok, h1.changed), (2, 1));
+        assert!(!h1.is_failure());
+
+        let h2 = &parsed.processed["host-2"];
+        assert_eq!(h2.failed, 1);
+        assert!(h2.is_failure());
     }
 
     #[test]
-    fn parses_well_formed_marker_block() {
-        let logs = wrap(r#"{"processed":{"host-1":{"ok":2,"changed":1,"unreachable":0,"failed":0,"skipped":0,"rescued":0,"ignored":0}}}"#);
-
-        let parsed = parse_callback_output(&logs).unwrap();
-        assert_eq!(parsed.processed.len(), 1);
-        assert!(!parsed.processed["host-1"].is_failure());
+    fn empty_message_returns_none() {
+        assert!(parse_callback_output("").is_none());
+        assert!(parse_callback_output("   ").is_none());
     }
 
     #[test]
-    fn missing_marker_returns_none() {
-        let logs = "just some regular ansible task output, no recap here\n";
-        assert!(parse_callback_output(logs).is_none());
+    fn malformed_or_truncated_message_returns_none_not_panic() {
+        // A tail-truncated object is no longer valid JSON.
+        assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0"#).is_none());
+        assert!(parse_callback_output("not json").is_none());
     }
 
     #[test]
-    fn malformed_json_inside_marker_returns_none_not_panic() {
-        let logs = wrap("{not valid json");
-        assert!(parse_callback_output(&logs).is_none());
-    }
-
-    #[test]
-    fn truncated_log_missing_end_marker_returns_none() {
-        let logs = format!("some output\n{MARKER_START}\n{{\"processed\": {{}}");
-        assert!(parse_callback_output(&logs).is_none());
+    fn wrong_length_array_returns_none() {
+        // A shape change (here 6 elements, not 7) fails to parse -> Unknown, never a silent misread.
+        assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0]}"#).is_none());
     }
 
     #[test]

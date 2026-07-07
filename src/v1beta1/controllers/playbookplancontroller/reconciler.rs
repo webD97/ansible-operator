@@ -7,7 +7,7 @@ use k8s_openapi::api::{
 };
 use kube::{
     Api,
-    api::{ListParams, LogParams, Patch, PatchParams, PostParams},
+    api::{ListParams, Patch, PatchParams, PostParams},
     runtime::{
         Controller,
         controller::Action,
@@ -351,23 +351,20 @@ async fn advance_applying_run(
     let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
     let job_name = job.metadata.name.as_ref().unwrap();
 
-    let pod_name = pods_api
+    // The recap is read from the finished container's termination message (what the callback wrote
+    // to /dev/termination-log), not its logs — a dedicated channel that isn't interleaved with
+    // playbook output and needs no `pods/log` access.
+    let recap = pods_api
         .list(&ListParams {
             label_selector: Some(format!("job-name={job_name}")),
             ..Default::default()
         })
         .await?
         .items
-        .into_iter()
-        .next()
-        .and_then(|pod| pod.metadata.name);
+        .iter()
+        .find_map(termination_message);
 
-    let logs = match &pod_name {
-        Some(pod_name) => pods_api.logs(pod_name, &LogParams::default()).await.ok(),
-        None => None,
-    };
-
-    let parsed = logs.as_deref().and_then(callback_output::parse_callback_output);
+    let parsed = recap.as_deref().and_then(callback_output::parse_callback_output);
 
     status::evaluate_host_outcomes(
         run.hosts_to_trigger,
@@ -422,6 +419,21 @@ async fn advance_applying_run(
             }
         },
     })
+}
+
+/// The `ansible-playbook` container's termination message — the recap the callback wrote to
+/// `/dev/termination-log`, surfaced by the kubelet as `state.terminated.message`. `None` if the
+/// pod has no such terminated container yet or it wrote nothing (hard crash before the stats hook).
+fn termination_message(pod: &Pod) -> Option<String> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|cs| cs.name == job_builder::ANSIBLE_CONTAINER_NAME)
+        .and_then(|cs| cs.state.as_ref())
+        .and_then(|state| state.terminated.as_ref())
+        .and_then(|terminated| terminated.message.clone())
 }
 
 /// Filters a run's resolved groups down to only the hosts actually targeted this run

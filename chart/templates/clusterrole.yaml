@@ -20,16 +20,14 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch", "create"]
-  # Reading the run's Job-owned pod to fetch its logs (parsed for the recap callback's marker
-  # block) — read-only, across all namespaces. Creating pods directly only ever happens for
-  # managed-ssh proxy pods, which is namespace-scoped to the operator's own namespace (see the
-  # Role, not this ClusterRole).
+  # Reading the run's Job-owned pod for its container termination message (the recap the callback
+  # wrote to /dev/termination-log) — read-only, across all namespaces. No pods/log access is
+  # needed since the recap comes from the pod's status, not its logs. Creating pods directly only
+  # ever happens for managed-ssh proxy pods, which is namespace-scoped to the operator's own
+  # namespace (see the Role, not this ClusterRole).
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
   # The workspace Secret (playbook/inventory/callback plugin/vars) is created via server-side
   # apply (patch) in whichever namespace the PlaybookPlan lives in; variable/file Secrets
   # referenced by a PlaybookPlan are only ever read.

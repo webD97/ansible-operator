@@ -12,6 +12,10 @@ use k8s_openapi::{
 };
 use kube::runtime::reflector::Lookup as _;
 
+/// Name of the Job pod's main container — the one running `ansible-playbook`, and the one whose
+/// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_applying_run`).
+pub const ANSIBLE_CONTAINER_NAME: &str = "ansible-playbook";
+
 use crate::{
     utils,
     v1beta1::{
@@ -193,11 +197,16 @@ fn create_job_skeleton(
     }
 
     let main_container = kcore::v1::Container {
-        name: "ansible-playbook".into(),
+        name: ANSIBLE_CONTAINER_NAME.into(),
         image: Some(plan.spec.image.clone()),
         working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
         volume_mounts: Some(volume_mounts),
         command: Some(render_ansible_command(plan, variable_secrets)),
+        // The recap callback writes to /dev/termination-log and the reconciler reads it back from
+        // this container's state.terminated.message. These are the Kubernetes defaults, set
+        // explicitly so the dependency is legible and can't be silently mutated away.
+        termination_message_path: Some("/dev/termination-log".into()),
+        termination_message_policy: Some("File".into()),
         ..Default::default()
     };
 
