@@ -17,7 +17,10 @@ use k8s_openapi::{
         util::intstr::IntOrString,
     },
 };
-use kube::{Api, api::PostParams};
+use kube::{
+    Api,
+    api::{DeleteParams, ListParams, PostParams},
+};
 
 use super::paths;
 use crate::{
@@ -480,31 +483,30 @@ pub async fn ensure_proxy_infra(
     })
 }
 
-/// Deletes every proxy pod/Secret/NetworkPolicy belonging to this run. Not reliant on
-/// ownerReferences, since Kubernetes GC doesn't act on references that cross namespaces (these
-/// live in the operator's namespace, the Job/PlaybookPlan live in the target namespace).
+/// Deletes every operator-namespace resource belonging to this run — proxy pods, their per-host
+/// Secrets, the run's NetworkPolicy, and the shared client-cert Secret — with one label-scoped
+/// `delete_collection` per kind on the `PLAYBOOKPLAN_HASH` label they all carry. This is why the
+/// host list isn't needed: GC-by-label catches everything tagged with the run's hash regardless of
+/// how the inventory drifted since the run started. The CA Secret carries no such label, so it's
+/// never swept up. Not reliant on ownerReferences, since Kubernetes GC doesn't act on references
+/// that cross namespaces (these live in the operator's namespace, the Job/PlaybookPlan live in the
+/// target namespace). Best-effort: delete errors are ignored, the next run's cleanup retries.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
     execution_hash: &ExecutionHash,
-    hosts: &[String],
 ) -> Result<(), ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
 
-    for host in hosts {
-        let name = resource_name(host, execution_hash);
-        let _ = pods_api.delete(&name, &Default::default()).await;
-        let _ = secrets_api.delete(&name, &Default::default()).await;
-    }
+    let dp = DeleteParams::default();
+    let lp = ListParams::default().labels(&format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH));
 
-    let netpol_name = format!("managed-ssh-{:x}", {
-        let mut hasher = twox_hash::XxHash3_64::new();
-        execution_hash.to_string().hash(&mut hasher);
-        hasher.finish()
-    });
-    let _ = netpol_api.delete(&netpol_name, &Default::default()).await;
+    // Secrets covers both the per-host host-cert Secrets and the shared client-cert Secret.
+    let _ = pods_api.delete_collection(&dp, &lp).await;
+    let _ = secrets_api.delete_collection(&dp, &lp).await;
+    let _ = netpol_api.delete_collection(&dp, &lp).await;
 
     Ok(())
 }

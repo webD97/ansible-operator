@@ -24,7 +24,7 @@ pub struct ClusterInventorySpec {
     pub tolerations: Option<Vec<Toleration>>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 pub struct Toleration {
     pub effect: Option<String>,
     pub key: Option<String>,

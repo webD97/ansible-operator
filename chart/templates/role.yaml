@@ -15,16 +15,19 @@ rules:
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
   # Managed-ssh proxy pods. Read verbs (get/list/watch) already come from the cluster-wide
-  # ClusterRole; only create/delete are namespace-scoped additions here.
+  # ClusterRole; only create/delete are namespace-scoped additions here. deletecollection backs
+  # the label-scoped run cleanup in managed_ssh::cleanup_proxy_infra.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "delete"]
+    verbs: ["create", "delete", "deletecollection"]
   # Scopes each run's proxy-pod ingress to only that run's ansible Job pod.
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
   # The CA Secret, and per-run managed-ssh host/client cert Secrets. get/list/watch/create/patch
-  # already come from the cluster-wide ClusterRole; only delete (cleanup) is added here.
+  # already come from the cluster-wide ClusterRole; only delete/deletecollection (cleanup) is added
+  # here. Cleanup's deletecollection is scoped to a run's PLAYBOOKPLAN_HASH label, which the CA
+  # Secret doesn't carry, so it's never swept up.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["delete"]
+    verbs: ["delete", "deletecollection"]

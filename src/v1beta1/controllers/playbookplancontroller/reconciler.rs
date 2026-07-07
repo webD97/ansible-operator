@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
     AnsibleInventory, ClusterInventory, ExecutionMode, Phase, PlaybookPlanStatus,
-    ResolvedInventoryGroup, StaticInventory, Toleration, ansible, flatten_hosts,
+    ResolvedInventoryGroup, StaticInventory, Toleration, ansible, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
@@ -50,6 +50,14 @@ struct ReconciliationContext {
     /// The operator's self-managed SSH certificate authority — generated once at startup if
     /// missing, no auto-rotation in v1.
     ca: Arc<CertificateAuthority>,
+}
+
+/// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: which hosts this
+/// run targets, its execution hash, and the Lease holder identity derived from it.
+struct RunContext<'a> {
+    execution_hash: ExecutionHash,
+    hosts_to_trigger: &'a [String],
+    holder_identity: &'a str,
 }
 
 pub fn new(
@@ -112,10 +120,11 @@ pub fn new(
 /// Reconciles one PlaybookPlan. Level-triggered/idempotent "ensure" style — every step re-derives
 /// what's needed from observed cluster state and short-circuits with a short `Action::requeue`
 /// rather than a persisted "current step" state machine. Pipeline (each step re-run every tick):
-///   0. resolve inventory, 1. compute outdated hosts/evaluate schedule, 2. ensure locks held,
-///   3. ensure managed-ssh proxy infra ready, 4. ensure workspace secret reflects this run,
-///   5. ensure the one Job exists, 6. ensure Job finished then parse+record results,
-///   7. ensure cleanup (locks released, proxy infra torn down).
+///   0. resolve inventory, 1. compute outdated hosts/evaluate schedule, 2-5. `try_start_run`
+///   (locks, managed-ssh proxy infra, workspace secret, the one Job), 6-7. `advance_applying_run`
+///   (once the Job is finished: parse+record results, cleanup). A single tick can walk through
+///   both halves — e.g. Pending -> locks acquired -> proxy ready -> Job created -> immediately
+///   checked for completion — since nothing here is gated on a persisted step, only on `Phase`.
 async fn reconcile(
     object: Arc<v1beta1::PlaybookPlan>,
     context: Arc<ReconciliationContext>,
@@ -168,6 +177,11 @@ async fn reconcile(
     };
 
     let holder_identity = format!("{namespace}/{name}/{execution_hash}");
+    let run = RunContext {
+        execution_hash,
+        hosts_to_trigger: &hosts_to_trigger,
+        holder_identity: &holder_identity,
+    };
 
     if !outdated_hosts.is_empty() && resource_status.phase != Phase::Applying {
         match timing {
@@ -177,195 +191,237 @@ async fn reconcile(
                 resource_status.next_run = Some(until.fixed_offset());
             }
             Timing::Now(_start) => {
-                let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
-
-                // Step 2: ensure locks held — all-or-nothing across every host this run
-                // targets; renewed every tick for as long as the run is in progress.
-                let blocked =
-                    locking::ensure_locks(&leases_api, &hosts_to_trigger, &holder_identity).await?;
-
-                if !blocked.is_empty() {
-                    debug!("Waiting on per-host locks for: {blocked:?}");
-                    requeue_after = std::time::Duration::from_secs(15);
-                } else {
-                    let (managed_ssh_hosts, tolerations) =
-                        managed_ssh_hosts_and_tolerations(&run_groups);
-
-                    // Step 3: ensure managed-ssh proxy infra ready (only relevant if this run
-                    // touches any ClusterInventory-sourced hosts).
-                    let proxy_readiness = managed_ssh::ensure_proxy_infra(
-                        &context.client,
-                        &context.operator_namespace,
-                        namespace,
-                        &execution_hash,
-                        &managed_ssh_hosts,
-                        tolerations.as_deref(),
-                        &context.ca,
-                    )
-                    .await?;
-
-                    match proxy_readiness {
-                        managed_ssh::ProxyReadiness::Pending => {
-                            debug!("Waiting for managed-ssh proxy pods to become Ready");
-                            requeue_after = std::time::Duration::from_secs(5);
-                        }
-                        managed_ssh::ProxyReadiness::AllReady(proxy_infos) => {
-                            let managed_ssh_hosts_map: BTreeMap<String, ansible::ManagedSshHostInfo> =
-                                proxy_infos
-                                    .into_iter()
-                                    .map(|p| {
-                                        (
-                                            p.host,
-                                            ansible::ManagedSshHostInfo {
-                                                pod_ip: p.pod_ip,
-                                                port: p.port,
-                                            },
-                                        )
-                                    })
-                                    .collect();
-
-                            // Step 4: ensure workspace secret reflects this run. Proxy pod IPs
-                            // are fresh every run even with an unchanged spec, so rendering is
-                            // also triggered on "a run is starting now", not generation alone.
-                            if workspace::is_missing(&secrets_api, name).await?
-                                || workspace::is_outdated(&object, true)
-                            {
-                                debug!("Rendering playbook to secret");
-                                upsert_workspace_secret(
-                                    &secrets_api,
-                                    name,
-                                    render_secret(&object, &run_groups, &managed_ssh_hosts_map)?,
-                                )
-                                .await?;
-                                resource_status.last_rendered_generation = Some(generation);
-                            }
-
-                            // Step 5: ensure the one Job exists.
-                            spawn_ansible_job(
-                                &jobs_api,
-                                execution_hash,
-                                &run_groups,
-                                &object,
-                                &mut resource_status,
-                            )
-                            .await?;
-                        }
-                    }
+                if let Some(d) = try_start_run(
+                    &context,
+                    &run,
+                    namespace,
+                    name,
+                    generation,
+                    &target_groups,
+                    &object,
+                    &secrets_api,
+                    &jobs_api,
+                    &leases_api,
+                    &mut resource_status,
+                )
+                .await?
+                {
+                    requeue_after = d;
                 }
             }
         };
     }
 
-    // Step 6: ensure the run's Job (if any) is finished, then parse + record results.
-    if resource_status.phase == Phase::Applying {
-        // Looked up by the exact recorded name, not the PLAYBOOKPLAN_HASH label — that label is
-        // stable across every retry of an unchanged spec, so a label-only `list()` could return
-        // an older, already-finished retry's Job instead of the one this run just created.
-        let job = match &resource_status.current_job_name {
-            Some(job_name) => jobs_api.get_opt(job_name).await?,
-            None => None,
-        };
-
-        if let Some(job) = &job {
-            if status::job_finished(job) {
-                let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
-                let job_name = job.metadata.name.as_ref().unwrap();
-
-                let pod_name = pods_api
-                    .list(&ListParams {
-                        label_selector: Some(format!("job-name={job_name}")),
-                        ..Default::default()
-                    })
-                    .await?
-                    .items
-                    .into_iter()
-                    .next()
-                    .and_then(|pod| pod.metadata.name);
-
-                let logs = match &pod_name {
-                    Some(pod_name) => pods_api.logs(pod_name, &LogParams::default()).await.ok(),
-                    None => None,
-                };
-
-                let parsed = logs.as_deref().and_then(callback_output::parse_callback_output);
-
-                status::evaluate_host_outcomes(
-                    &hosts_to_trigger,
-                    parsed.as_ref(),
-                    &execution_hash,
-                    &mut resource_status,
-                );
-                status::evaluate_playbookplan_conditions(
-                    &hosts_to_trigger,
-                    true,
-                    parsed.as_ref(),
-                    &mut resource_status,
-                );
-
-                // Step 7: ensure cleanup, regardless of success/failure.
-                let (managed_ssh_hosts, _) = managed_ssh_hosts_and_tolerations(
-                    &filter_groups_to_hosts(&target_groups, &hosts_to_trigger),
-                );
-                managed_ssh::cleanup_proxy_infra(
-                    &context.client,
-                    &context.operator_namespace,
-                    &execution_hash,
-                    &managed_ssh_hosts,
-                )
-                .await?;
-                locking::release_locks(&leases_api, &hosts_to_trigger, &holder_identity).await?;
-
-                let total_count: usize = resource_status
-                    .eligible_hosts
-                    .iter()
-                    .map(|g| g.hosts.len())
-                    .sum();
-                let outdated_count = find_outdated_hosts(&resource_status, &execution_hash)?.len();
-
-                resource_status.summary = match outdated_count {
-                    0 => Some(format!("{total_count}/{total_count} up-to-date")),
-                    n => Some(format!("{n}/{total_count} outdated")),
-                };
-
-                match &object.spec.mode {
-                    ExecutionMode::OneShot => {
-                        resource_status.next_run = None;
-                        resource_status.phase = match outdated_count {
-                            0 => Phase::Succeeded,
-                            _ => Phase::Failed,
-                        };
-                    }
-                    ExecutionMode::Recurring => {
-                        if let Some(schedule) = &object.spec.schedule {
-                            resource_status.phase = Phase::Scheduled;
-                            let next = forecast_next_run(
-                                schedule,
-                                now(),
-                                Some(chrono::Duration::seconds(-5)),
-                            );
-
-                            requeue_after = (next - now()).to_std().unwrap();
-                            resource_status.next_run = Some(next.fixed_offset());
-                        } else {
-                            warn!("Mode is Recurring but schedule is not set!");
-                        }
-                    }
-                }
-            } else {
-                status::evaluate_playbookplan_conditions(
-                    &hosts_to_trigger,
-                    false,
-                    None,
-                    &mut resource_status,
-                );
-                requeue_after = std::time::Duration::from_secs(15);
-            }
-        }
+    if resource_status.phase == Phase::Applying
+        && let Some(d) = advance_applying_run(
+            &context,
+            &run,
+            namespace,
+            &object,
+            &jobs_api,
+            &leases_api,
+            &mut resource_status,
+        )
+        .await?
+    {
+        requeue_after = d;
     }
 
     patch_status(&api, &object, resource_status).await?;
 
     Ok(Action::requeue(requeue_after))
+}
+
+/// Steps 2-5: acquire this run's per-host locks (all-or-nothing, renewed every tick for as long
+/// as the run is in progress), ensure managed-ssh proxy infra is Ready, ensure the workspace
+/// secret reflects this run, then ensure the one Job exists. Each guard clause returns early with
+/// a short requeue the moment a precondition isn't met yet; `None` means it ran to completion
+/// (the Job either already existed or was just created — see `spawn_ansible_job`).
+async fn try_start_run(
+    context: &ReconciliationContext,
+    run: &RunContext<'_>,
+    namespace: &str,
+    name: &str,
+    generation: i64,
+    target_groups: &[ResolvedInventoryGroup],
+    object: &PlaybookPlan,
+    secrets_api: &Api<Secret>,
+    jobs_api: &Api<Job>,
+    leases_api: &Api<Lease>,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<Option<std::time::Duration>, ReconcileError> {
+    let run_groups = filter_groups_to_hosts(target_groups, run.hosts_to_trigger);
+
+    let blocked =
+        locking::ensure_locks(leases_api, run.hosts_to_trigger, run.holder_identity).await?;
+    if !blocked.is_empty() {
+        debug!("Waiting on per-host locks for: {blocked:?}");
+        return Ok(Some(std::time::Duration::from_secs(15)));
+    }
+
+    let (managed_ssh_hosts, tolerations) = managed_ssh_hosts_and_tolerations(&run_groups);
+
+    let proxy_readiness = managed_ssh::ensure_proxy_infra(
+        &context.client,
+        &context.operator_namespace,
+        namespace,
+        &run.execution_hash,
+        &managed_ssh_hosts,
+        tolerations.as_deref(),
+        &context.ca,
+    )
+    .await?;
+
+    let proxy_infos = match proxy_readiness {
+        managed_ssh::ProxyReadiness::Pending => {
+            debug!("Waiting for managed-ssh proxy pods to become Ready");
+            return Ok(Some(std::time::Duration::from_secs(5)));
+        }
+        managed_ssh::ProxyReadiness::AllReady(infos) => infos,
+    };
+
+    let managed_ssh_hosts_map: BTreeMap<String, ansible::ManagedSshHostInfo> = proxy_infos
+        .into_iter()
+        .map(|p| {
+            (
+                p.host,
+                ansible::ManagedSshHostInfo {
+                    pod_ip: p.pod_ip,
+                    port: p.port,
+                },
+            )
+        })
+        .collect();
+
+    // Proxy pod IPs are fresh every run even with an unchanged spec, so rendering is also
+    // triggered on "a run is starting now", not generation alone.
+    if workspace::is_missing(secrets_api, name).await? || workspace::is_outdated(object, true) {
+        debug!("Rendering playbook to secret");
+        upsert_workspace_secret(
+            secrets_api,
+            name,
+            render_secret(object, &run_groups, &managed_ssh_hosts_map)?,
+        )
+        .await?;
+        resource_status.last_rendered_generation = Some(generation);
+    }
+
+    spawn_ansible_job(
+        jobs_api,
+        run.execution_hash,
+        &run_groups,
+        object,
+        resource_status,
+    )
+    .await?;
+
+    Ok(None)
+}
+
+/// Steps 6-7: once this run's Job (recorded as `current_job_name`) is `Complete`/`Failed`, parses
+/// its logs for per-host outcomes, records them, tears down this run's locks/proxy infra, and
+/// advances `phase` to whatever comes next for this `ExecutionMode`. Returns `None` if there's
+/// nothing to do yet (no Job recorded, or it hasn't reached a terminal state) or if advancing
+/// shouldn't change the requeue duration (e.g. a terminal `OneShot` outcome) — the caller only
+/// overrides its requeue duration when this returns `Some`.
+async fn advance_applying_run(
+    context: &ReconciliationContext,
+    run: &RunContext<'_>,
+    namespace: &str,
+    object: &PlaybookPlan,
+    jobs_api: &Api<Job>,
+    leases_api: &Api<Lease>,
+    resource_status: &mut PlaybookPlanStatus,
+) -> Result<Option<std::time::Duration>, ReconcileError> {
+    // Looked up by the exact recorded name, not the PLAYBOOKPLAN_HASH label — that label is
+    // stable across every retry of an unchanged spec, so a label-only `list()` could return
+    // an older, already-finished retry's Job instead of the one this run just created.
+    let Some(job_name) = &resource_status.current_job_name else {
+        return Ok(None);
+    };
+    let Some(job) = jobs_api.get_opt(job_name).await? else {
+        return Ok(None);
+    };
+
+    if !status::job_finished(&job) {
+        status::evaluate_playbookplan_conditions(run.hosts_to_trigger, false, None, resource_status);
+        return Ok(Some(std::time::Duration::from_secs(15)));
+    }
+
+    let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
+    let job_name = job.metadata.name.as_ref().unwrap();
+
+    let pod_name = pods_api
+        .list(&ListParams {
+            label_selector: Some(format!("job-name={job_name}")),
+            ..Default::default()
+        })
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .and_then(|pod| pod.metadata.name);
+
+    let logs = match &pod_name {
+        Some(pod_name) => pods_api.logs(pod_name, &LogParams::default()).await.ok(),
+        None => None,
+    };
+
+    let parsed = logs.as_deref().and_then(callback_output::parse_callback_output);
+
+    status::evaluate_host_outcomes(
+        run.hosts_to_trigger,
+        parsed.as_ref(),
+        &run.execution_hash,
+        resource_status,
+    );
+    status::evaluate_playbookplan_conditions(run.hosts_to_trigger, true, parsed.as_ref(), resource_status);
+
+    managed_ssh::cleanup_proxy_infra(
+        &context.client,
+        &context.operator_namespace,
+        &run.execution_hash,
+    )
+    .await?;
+    locking::release_locks(leases_api, run.hosts_to_trigger, run.holder_identity).await?;
+
+    let total_count: usize = resource_status
+        .eligible_hosts
+        .iter()
+        .map(|g| g.hosts.len())
+        .sum();
+    let outdated_count = find_outdated_hosts(resource_status, &run.execution_hash)?.len();
+
+    resource_status.summary = match outdated_count {
+        0 => Some(format!("{total_count}/{total_count} up-to-date")),
+        n => Some(format!("{n}/{total_count} outdated")),
+    };
+
+    Ok(match &object.spec.mode {
+        ExecutionMode::OneShot => {
+            resource_status.next_run = None;
+            resource_status.phase = match outdated_count {
+                0 => Phase::Succeeded,
+                _ => Phase::Failed,
+            };
+            None
+        }
+        ExecutionMode::Recurring => match &object.spec.schedule {
+            Some(schedule) => {
+                let tz = object.timezone().unwrap();
+                let now = || Utc::now().with_timezone(&tz);
+
+                resource_status.phase = Phase::Scheduled;
+                let next = forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+                resource_status.next_run = Some(next.fixed_offset());
+                Some((next - now()).to_std().unwrap())
+            }
+            None => {
+                warn!("Mode is Recurring but schedule is not set!");
+                None
+            }
+        },
+    })
 }
 
 /// Filters a run's resolved groups down to only the hosts actually targeted this run
@@ -639,8 +695,24 @@ fn extract_resource_info(object: &PlaybookPlan) -> Result<(&str, &str, i64), Rec
     Ok((namespace, name, generation))
 }
 
-/// Ensures this run's single Job exists (idempotency: skip creation if a Job with this run's
-/// deterministic name already exists). There's exactly one Job per run now, not one per host.
+/// Picks the most recently created Job that hasn't reached a terminal state — the "still active"
+/// attempt for a run, if there is one. Pure so it's unit-testable without a kube client.
+fn newest_active_job(jobs: &[Job]) -> Option<&Job> {
+    jobs.iter()
+        .filter(|job| !status::job_finished(job))
+        .max_by_key(|job| job.metadata.creation_timestamp.as_ref().map(|t| t.0))
+}
+
+/// Ensures exactly one active Job exists for this run, adopting an already-active one instead of
+/// creating a duplicate.
+///
+/// The `reconcile` spawn gate keys off `phase` read from the *reflector cache*, which lags this
+/// controller's own `patch_status` writes — so several reconciles fired in quick succession
+/// (proxy pods turning Ready, Job status events) can all reach this point before any observes
+/// `phase = Applying`. Guarding on the cached status therefore can't prevent duplicates; only a
+/// fresh (quorum) `list` by the run's hash label reliably sees a Job a previous tick just created.
+/// If one is still active, adopt it; otherwise this is a genuinely new attempt (first run, or a
+/// retry after the previous one reached a terminal state) and we create the next numbered Job.
 async fn spawn_ansible_job(
     api: &Api<Job>,
     hash: ExecutionHash,
@@ -650,9 +722,22 @@ async fn spawn_ansible_job(
 ) -> Result<(), ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
-    // Safe to bump unconditionally: this only runs on the tick that transitions `phase` into
-    // `Applying` for a genuinely new attempt, so it can't double-increment. Reset to 0 elsewhere
-    // whenever `current_hash` changes.
+    let existing = api
+        .list(&ListParams::default().labels(&format!("{}={hash}", labels::PLAYBOOKPLAN_HASH)))
+        .await?;
+
+    if let Some(active) = newest_active_job(&existing.items) {
+        let job_name = active.name().expect("a listed Job always has a name");
+        info!("Adopting already-active job {job_name} for this run");
+        resource_status.current_job_name = Some(job_name.to_string());
+        resource_status.phase = Phase::Applying;
+        resource_status.next_run = None;
+        return Ok(());
+    }
+
+    // No active Job for this run — a genuinely new attempt. `retry_count` climbs monotonically so
+    // the new name can't collide with an already-finished attempt's (which would 409 on create
+    // and get silently skipped); it's reset to 0 in `reconcile` whenever `current_hash` changes.
     resource_status.retry_count += 1;
 
     let job = job_builder::create_job_for_run(
@@ -663,20 +748,10 @@ async fn spawn_ansible_job(
     )?;
     let job_name = job
         .name()
-        .expect(".metadata.name must be set at this point");
+        .expect(".metadata.name must be set at this point")
+        .to_string();
 
-    // Recorded regardless of which branch below runs — step 6 looks the Job up by this exact
-    // name, since the PLAYBOOKPLAN_HASH label alone could match an older, already-finished
-    // retry's Job instead of this run's.
-    resource_status.current_job_name = Some(job_name.to_string());
-
-    // Job already exists, skip creating another one
-    // TODO: Check for jobs with another hash and decide if we need to replace them
-    if api.get_opt(&job_name).await?.is_some() {
-        info!("Job for this run already exists");
-        return Ok(());
-    }
-
+    resource_status.current_job_name = Some(job_name.clone());
     resource_status.phase = Phase::Applying;
     resource_status.next_run = None;
 
@@ -691,4 +766,232 @@ async fn spawn_ansible_job(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v1beta1::{PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig};
+
+    fn managed_ssh_group(
+        name: &str,
+        hosts: &[&str],
+        tolerations: Option<Vec<Toleration>>,
+    ) -> ResolvedInventoryGroup {
+        ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: name.into(),
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            },
+            tolerations,
+        }
+    }
+
+    fn ssh_group(name: &str, hosts: &[&str], static_inventory_name: &str) -> ResolvedInventoryGroup {
+        ResolvedInventoryGroup::Ssh {
+            hosts: ResolvedHosts {
+                name: name.into(),
+                hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            },
+            static_inventory_name: static_inventory_name.into(),
+            config: SshConfig {
+                user: "root".into(),
+                secret_ref: SecretRef {
+                    name: "ssh-key".into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn filter_groups_to_hosts_keeps_only_triggered_hosts_and_drops_empty_groups() {
+        let groups = vec![
+            managed_ssh_group("controlplanes", &["worker-1", "worker-2"], None),
+            ssh_group("external", &["ccu.fritz.box"], "ccu"),
+        ];
+
+        let filtered = filter_groups_to_hosts(&groups, &["worker-1".to_string()]);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "the ssh group has no triggered hosts and should be dropped entirely"
+        );
+        let ResolvedInventoryGroup::ManagedSsh { hosts, .. } = &filtered[0] else {
+            panic!("expected the managed-ssh group to survive");
+        };
+        assert_eq!(hosts.hosts, vec!["worker-1".to_string()]);
+    }
+
+    #[test]
+    fn filter_groups_to_hosts_preserves_group_specific_config() {
+        let tolerations = Some(vec![Toleration {
+            key: Some("dedicated".into()),
+            ..Default::default()
+        }]);
+        let groups = vec![managed_ssh_group(
+            "controlplanes",
+            &["worker-1"],
+            tolerations.clone(),
+        )];
+
+        let filtered = filter_groups_to_hosts(&groups, &["worker-1".to_string()]);
+
+        let ResolvedInventoryGroup::ManagedSsh { tolerations: t, .. } = &filtered[0] else {
+            panic!("expected a ManagedSsh group");
+        };
+        assert_eq!(t, &tolerations);
+    }
+
+    #[test]
+    fn managed_ssh_hosts_and_tolerations_flattens_only_managed_ssh_groups() {
+        let groups = vec![
+            managed_ssh_group("controlplanes", &["worker-1"], None),
+            ssh_group("external", &["ccu.fritz.box"], "ccu"),
+            managed_ssh_group("workers", &["worker-2"], None),
+        ];
+
+        let (hosts, _) = managed_ssh_hosts_and_tolerations(&groups);
+
+        assert_eq!(hosts, vec!["worker-1".to_string(), "worker-2".to_string()]);
+    }
+
+    #[test]
+    fn managed_ssh_hosts_and_tolerations_uses_first_non_none_toleration() {
+        let first = vec![Toleration {
+            key: Some("first".into()),
+            ..Default::default()
+        }];
+        let second = vec![Toleration {
+            key: Some("second".into()),
+            ..Default::default()
+        }];
+        let groups = vec![
+            managed_ssh_group("a", &["worker-1"], None),
+            managed_ssh_group("b", &["worker-2"], Some(first.clone())),
+            managed_ssh_group("c", &["worker-3"], Some(second)),
+        ];
+
+        let (_, tolerations) = managed_ssh_hosts_and_tolerations(&groups);
+
+        assert_eq!(tolerations, Some(first));
+    }
+
+    #[test]
+    fn newest_active_job_skips_finished_and_picks_the_latest() {
+        use k8s_openapi::api::batch::v1::{Job, JobCondition, JobStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+        use k8s_openapi::jiff::Timestamp;
+
+        fn job(name: &str, created_secs: i64, finished: bool) -> Job {
+            let conditions = finished.then(|| {
+                vec![JobCondition {
+                    type_: "Failed".into(),
+                    status: "True".into(),
+                    ..Default::default()
+                }]
+            });
+            Job {
+                metadata: ObjectMeta {
+                    name: Some(name.into()),
+                    creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
+                    ..Default::default()
+                },
+                status: Some(JobStatus {
+                    conditions,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        // A finished attempt plus two still-running ones — the newest active wins, not the newest
+        // overall and not a finished one.
+        let jobs = vec![
+            job("apply-x-4", 100, true),
+            job("apply-x-5", 200, false),
+            job("apply-x-6", 300, false),
+        ];
+        assert_eq!(
+            newest_active_job(&jobs).and_then(|j| j.metadata.name.as_deref()),
+            Some("apply-x-6")
+        );
+
+        // Everything terminal -> no active job, so the caller creates a fresh retry.
+        let all_finished = vec![job("apply-x-4", 100, true), job("apply-x-5", 200, true)];
+        assert!(newest_active_job(&all_finished).is_none());
+
+        assert!(newest_active_job(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_resource_info_requires_namespace_name_and_generation() {
+        let mut pp = PlaybookPlan::new("placeholder", PlaybookPlanSpec::default());
+        pp.metadata.name = None;
+
+        assert!(matches!(
+            extract_resource_info(&pp),
+            Err(ReconcileError::PreconditionFailed("namespace not set"))
+        ));
+
+        pp.metadata.namespace = Some("default".into());
+        assert!(matches!(
+            extract_resource_info(&pp),
+            Err(ReconcileError::PreconditionFailed("name not set"))
+        ));
+
+        pp.metadata.name = Some("an-example".into());
+        assert!(matches!(
+            extract_resource_info(&pp),
+            Err(ReconcileError::PreconditionFailed("generation not set"))
+        ));
+
+        pp.metadata.generation = Some(3);
+        assert_eq!(
+            extract_resource_info(&pp).unwrap(),
+            ("default", "an-example", 3)
+        );
+    }
+
+    #[test]
+    fn get_related_secrets_collects_variable_and_file_secrets_but_not_inline_or_image_sources() {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    variables:
+      - inline:
+          key: value
+      - secretRef:
+          name: secret-with-variables
+    files:
+      - name: binary-assets
+        image:
+          reference: my.registry.tld/the-image:v2
+          pullPolicy: IfNotPresent
+      - name: some-configs
+        secretRef:
+          name: secret-with-config-files
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#;
+        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+
+        let secrets: Vec<&str> = get_related_secrets(&pp)
+            .into_iter()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            secrets,
+            vec!["secret-with-variables", "secret-with-config-files"]
+        );
+    }
 }
