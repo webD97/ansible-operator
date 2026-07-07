@@ -8,6 +8,31 @@ spec:
       hosts:
         - homelab-worker-0
         - homelab-worker-1
+  ssh:
+    user: root
+    secretRef:
+      name: ssh-key
+---
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: ClusterInventory
+metadata:
+  name: cluster-nodes
+spec:
+  hosts:
+    - name: controlplanes
+      matchLabels:
+        kubernetes.io/os: linux
+        node-role.kubernetes.io/control-plane: "true"
+    - name: workers
+      matchExpressions:
+        - { key: kubernetes.io/os, operator: In, values: [linux] }
+        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+  # The managed-ssh proxy pod is already pinned to one exact node via nodeSelector (see
+  # managed_ssh.rs), so tolerating everything here doesn't risk it landing anywhere unintended —
+  # it just stops that one node's own taints (e.g. the control-plane NoSchedule taint) from
+  # blocking it from scheduling there at all.
+  tolerations:
+    - operator: Exists
 ---
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: PlaybookPlan
@@ -17,15 +42,13 @@ spec:
   image: docker.io/serversideup/ansible-core:2.18
   schedule: "* * * * *"
   timeZone: Europe/Berlin
-  connectionStrategy:
-    chroot: {}
   inventoryRefs:
-    - staticInventory: oneshot-fail
+    - clusterInventory: cluster-nodes
   template:
-    requirements: |
-      collections:
-        - name: community.general
-          version: ">=6.0.0"
+    # requirements: |
+    #   collections:
+    #     - name: community.general
+    #       version: ">=6.0.0"
     playbook: |
       - hosts: all
 

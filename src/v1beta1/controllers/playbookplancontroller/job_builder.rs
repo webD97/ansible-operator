@@ -1,34 +1,30 @@
-use std::{
-    collections::BTreeMap,
-    hash::{Hash as _, Hasher},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
 use k8s_openapi::{
     api::{
         batch::{self, v1::Job},
         core::{
             self as kcore,
-            v1::{EmptyDirVolumeSource, KeyToPath, SecretVolumeSource, Volume},
+            v1::{EmptyDirVolumeSource, EnvVar, KeyToPath, SecretVolumeSource, Volume},
         },
     },
-    apimachinery::pkg::apis::meta::v1::OwnerReference,
+    apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference},
 };
 use kube::runtime::reflector::Lookup as _;
 
 use crate::{
     utils,
     v1beta1::{
-        self, ChrootConfig, FilesSource, PlaybookPlan, PlaybookVariableSource, SshConfig,
+        self, FilesSource, PlaybookPlan, PlaybookVariableSource, ResolvedInventoryGroup, SshConfig,
         controllers::reconcile_error::ReconcileError, labels,
-        playbookplancontroller::execution_evaluator::ExecutionHash,
+        playbookplancontroller::{execution_evaluator::ExecutionHash, managed_ssh, paths},
     },
 };
 
-pub fn create_job_for_host(
-    host: &str,
+pub fn create_job_for_run(
     hash: &ExecutionHash,
-    start: Option<&DateTime<Utc>>,
+    retry_count: u32,
+    target_groups: &[ResolvedInventoryGroup],
     object: &PlaybookPlan,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = object
@@ -43,47 +39,56 @@ pub fn create_job_for_host(
         .as_ref()
         .expect(".metadata.namespace must be set here");
 
-    let mut partial_job =
-        create_job_skeleton(host, object, object.spec.template.requirements.is_some())?;
+    let mut job = create_job_skeleton(object, object.spec.template.requirements.is_some())?;
 
-    match &object.spec.connection_strategy {
-        v1beta1::ConnectionStrategy::Ssh { ssh } => configure_job_for_ssh(&mut partial_job, ssh),
-        v1beta1::ConnectionStrategy::Chroot { chroot } => {
-            configure_job_for_chroot(&mut partial_job, host, chroot)
-        }
-    };
+    if has_managed_ssh_group(target_groups) {
+        let secret_name = managed_ssh::client_cert_secret_name(hash);
+        configure_job_for_managed_ssh_client_cert(&mut job, &secret_name);
+    }
 
-    partial_job.metadata.namespace = Some(pb_namespace.into());
+    let ssh_configs = distinct_static_inventory_ssh_configs(target_groups);
+    if !ssh_configs.is_empty() {
+        configure_job_for_ssh(&mut job, &ssh_configs);
+    }
 
-    let start_time_hash = match start {
-        Some(start) => {
-            let mut hasher = twox_hash::XxHash3_64::new();
-            (*start).hash(&mut hasher);
-            hasher.finish()
-        }
-        None => 1,
-    };
+    configure_job_for_callback_plugin(&mut job);
 
-    partial_job.metadata.name = Some(format!(
-        "apply-{pb_name}-{}-on-{host}",
-        utils::generate_id(**hash ^ start_time_hash),
+    job.metadata.namespace = Some(pb_namespace.into());
+
+    // retry_count must be in the name — the hash alone is unchanged between retries of an
+    // identical spec, so without it a new run's Job name would collide with a completed prior
+    // run's and get silently skipped by the idempotency check.
+    job.metadata.name = Some(format!(
+        "apply-{pb_name}-{}-{retry_count}",
+        utils::generate_id(**hash),
     ));
-    partial_job.metadata.labels = Some(BTreeMap::from([
+
+    let job_labels: BTreeMap<String, String> = BTreeMap::from([
         (labels::PLAYBOOKPLAN_NAME.into(), pb_name.to_string()),
         (labels::PLAYBOOKPLAN_HASH.into(), hash.to_string()),
-        (labels::PLAYBOOKPLAN_HOST.into(), host.into()),
-    ]));
+    ]);
+    job.metadata.labels = Some(job_labels.clone());
 
-    Ok(partial_job)
+    // The NetworkPolicy scoping managed-ssh proxy-pod ingress selects on the execution-hash
+    // label of the actual running Pod, not just the Job object — Jobs don't carry their own
+    // labels down to their Pods unless the pod template's own metadata sets them explicitly.
+    if let Some(spec) = job.spec.as_mut() {
+        spec.template.metadata = Some(ObjectMeta {
+            labels: Some(job_labels),
+            ..Default::default()
+        });
+    }
+
+    Ok(job)
 }
 
-/// Creates a Kubernetes Job that includes everything we need for basic Ansible execution
-/// but without any connection-specifics like SSH key, chroots etc.
+/// Creates a Kubernetes Job with everything needed for basic Ansible execution, without any
+/// connection-specifics. Unlike the old chroot-based model, this Job pod needs no node-level
+/// privilege at all — hostPID/hostIPC/hostNetwork/privileged/nodeSelector all now live on the
+/// ephemeral managed-ssh proxy pods instead (see `managed_ssh.rs`).
 fn create_job_skeleton(
-    host: &str,
     plan: &v1beta1::PlaybookPlan,
     with_requirements: bool,
-    // ssh_config: &v1beta1::SshConfig,
 ) -> Result<batch::v1::Job, ReconcileError> {
     let pb_name = plan.name().ok_or(ReconcileError::PreconditionFailed(
         "expected .metadata.name in PlaybookPlan",
@@ -116,7 +121,7 @@ fn create_job_skeleton(
 
     let mut volume_mounts = vec![kcore::v1::VolumeMount {
         name: "playbook".into(),
-        mount_path: "/run/ansible-operator".into(),
+        mount_path: paths::WORKSPACE_MOUNT_PATH.into(),
         ..Default::default()
     }];
 
@@ -138,7 +143,7 @@ fn create_job_skeleton(
 
         volume_mounts.push(kcore::v1::VolumeMount {
             name: secret_name.to_string(),
-            mount_path: format!("/run/ansible-operator/vars/{secret_name}"),
+            mount_path: format!("{}/vars/{secret_name}", paths::WORKSPACE_MOUNT_PATH),
             ..Default::default()
         });
     }
@@ -149,7 +154,7 @@ fn create_job_skeleton(
 
         volume_mounts.push(kcore::v1::VolumeMount {
             name: volume.name.clone(),
-            mount_path: format!("/run/ansible-operator/files/{}", volume.name.clone()),
+            mount_path: format!("{}/files/{}", paths::WORKSPACE_MOUNT_PATH, volume.name.clone()),
             ..Default::default()
         });
     }
@@ -173,7 +178,7 @@ fn create_job_skeleton(
         let collections_installer = kcore::v1::Container {
             name: "download-collections".into(),
             image: Some(plan.spec.image.clone()),
-            working_dir: Some("/run/ansible-operator".into()),
+            working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
             volume_mounts: Some(volume_mounts.clone()),
             command: Some(vec![
                 "ansible-galaxy".into(),
@@ -190,9 +195,9 @@ fn create_job_skeleton(
     let main_container = kcore::v1::Container {
         name: "ansible-playbook".into(),
         image: Some(plan.spec.image.clone()),
-        working_dir: Some("/run/ansible-operator".into()),
+        working_dir: Some(paths::WORKSPACE_MOUNT_PATH.into()),
         volume_mounts: Some(volume_mounts),
-        command: Some(render_ansible_command(plan, host, variable_secrets)),
+        command: Some(render_ansible_command(plan, variable_secrets)),
         ..Default::default()
     };
 
@@ -218,95 +223,128 @@ fn create_job_skeleton(
     Ok(job)
 }
 
-pub const SSH_VOLUME_NAME: &str = "ssh";
-pub const SSH_VOLUME_MOUNTPATH: &str = "/ssh";
-
-/// Configures an Ansible job so that it can run via SSH
-fn configure_job_for_ssh(job: &mut Job, ssh_config: &SshConfig) {
-    let ssh_key_volume = kcore::v1::Volume {
-        name: SSH_VOLUME_NAME.into(),
-        secret: Some(kcore::v1::SecretVolumeSource {
-            secret_name: Some(ssh_config.secret_ref.name.clone()),
-            default_mode: Some(0o0400),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let ssh_key_volume_mount = kcore::v1::VolumeMount {
-        name: SSH_VOLUME_NAME.into(),
-        mount_path: SSH_VOLUME_MOUNTPATH.into(),
-        ..Default::default()
-    };
-
-    job.spec.as_mut().and_then(|spec| {
-        spec.template.spec.as_mut().map(|spec| {
-            spec.volumes.get_or_insert_default().push(ssh_key_volume);
-            spec.containers
-                .first_mut()
-                .expect("job should have a container")
-                .volume_mounts
-                .get_or_insert_default()
-                .push(ssh_key_volume_mount);
-        })
-    });
+fn has_managed_ssh_group(groups: &[ResolvedInventoryGroup]) -> bool {
+    groups
+        .iter()
+        .any(|g| matches!(g, ResolvedInventoryGroup::ManagedSsh { .. }))
 }
 
-pub const CHROOT_VOLUME_NAME: &str = "rootfs";
-pub const CHROOT_VOLUME_MOUNTPATH: &str = "/mnt/rootfs";
+/// Distinct `(StaticInventory name, SshConfig)` pairs referenced by this run's groups, deduped
+/// by resource name — a run's Job pod needs one mounted SSH secret per distinct StaticInventory
+/// it targets, not one per host-group (multiple groups can come from the same resource).
+fn distinct_static_inventory_ssh_configs(
+    groups: &[ResolvedInventoryGroup],
+) -> Vec<(String, SshConfig)> {
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
 
-fn configure_job_for_chroot(job: &mut Job, node_name: &str, chroot_config: &ChrootConfig) {
-    let chroot_volume = kcore::v1::Volume {
-        name: CHROOT_VOLUME_NAME.into(),
-        host_path: Some(kcore::v1::HostPathVolumeSource {
-            type_: Some("Directory".into()),
-            path: "/".into(),
-        }),
-        ..Default::default()
-    };
+    for group in groups {
+        if let ResolvedInventoryGroup::Ssh {
+            static_inventory_name,
+            config,
+            ..
+        } = group
+            && seen.insert(static_inventory_name.clone())
+        {
+            result.push((static_inventory_name.clone(), config.clone()));
+        }
+    }
 
-    let chroot_volume_mount = kcore::v1::VolumeMount {
-        name: CHROOT_VOLUME_NAME.into(),
-        mount_path: CHROOT_VOLUME_MOUNTPATH.into(),
-        ..Default::default()
-    };
+    result
+}
 
+/// Mounts one SSH secret per distinct `StaticInventory` referenced this run, each at its own
+/// resource-name-keyed path (`paths::static_inventory_ssh_dir`) so multiple StaticInventories
+/// with different credentials can coexist in the same Job pod without colliding.
+fn configure_job_for_ssh(job: &mut Job, ssh_configs: &[(String, SshConfig)]) {
     job.spec.as_mut().and_then(|spec| {
-        spec.template.spec.as_mut().map(|spec| {
-            let main_container = spec
+        spec.template.spec.as_mut().map(|pod_spec| {
+            let main_container = pod_spec
                 .containers
                 .first_mut()
                 .expect("job should have a container");
 
-            spec.volumes
-                .get_or_insert_default()
-                .extend_from_slice(&[chroot_volume]);
+            for (static_inventory_name, config) in ssh_configs {
+                let volume_name = format!("ssh-{static_inventory_name}");
+
+                pod_spec.volumes.get_or_insert_default().push(Volume {
+                    name: volume_name.clone(),
+                    secret: Some(SecretVolumeSource {
+                        secret_name: Some(config.secret_ref.name.clone()),
+                        default_mode: Some(0o0400),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+
+                main_container
+                    .volume_mounts
+                    .get_or_insert_default()
+                    .push(kcore::v1::VolumeMount {
+                        name: volume_name,
+                        mount_path: paths::static_inventory_ssh_dir(static_inventory_name),
+                        ..Default::default()
+                    });
+            }
+        })
+    });
+}
+
+/// Mounts this run's managed-ssh client identity. The Secret is expected to already exist by the
+/// time the Job is created (`managed_ssh::ensure_proxy_infra`'s `ensure_client_cert` step).
+fn configure_job_for_managed_ssh_client_cert(job: &mut Job, secret_name: &str) {
+    job.spec.as_mut().and_then(|spec| {
+        spec.template.spec.as_mut().map(|pod_spec| {
+            let main_container = pod_spec
+                .containers
+                .first_mut()
+                .expect("job should have a container");
+
+            pod_spec.volumes.get_or_insert_default().push(Volume {
+                name: "managed-ssh-client".into(),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(secret_name.to_string()),
+                    default_mode: Some(0o0400),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
 
             main_container
                 .volume_mounts
                 .get_or_insert_default()
-                .extend_from_slice(&[chroot_volume_mount]);
+                .push(kcore::v1::VolumeMount {
+                    name: "managed-ssh-client".into(),
+                    mount_path: paths::MANAGED_SSH_CLIENT_DIR.into(),
+                    ..Default::default()
+                });
+        })
+    });
+}
 
-            spec.host_ipc = Some(true);
-            spec.host_network = Some(true);
-            spec.host_pid = Some(true);
-            spec.host_users = Some(true);
+/// Sets the env vars that make Ansible load and use the operator's per-host-outcome recap
+/// callback (rendered into the workspace secret alongside playbook.yml/inventory.yml — see
+/// `workspace.rs`), without disabling the default human-readable stdout callback.
+fn configure_job_for_callback_plugin(job: &mut Job) {
+    job.spec.as_mut().and_then(|spec| {
+        spec.template.spec.as_mut().map(|pod_spec| {
+            let main_container = pod_spec
+                .containers
+                .first_mut()
+                .expect("job should have a container");
 
-            main_container.security_context = Some(kcore::v1::SecurityContext {
-                privileged: Some(true),
-                ..Default::default()
-            });
-
-            // Ensure scheduling on the targeted node
-            spec.node_selector = Some(BTreeMap::from_iter([(
-                "kubernetes.io/hostname".into(),
-                node_name.into(),
-            )]));
-
-            spec.tolerations = chroot_config
-                .tolerations
-                .as_ref()
-                .map(|tolerations| tolerations.iter().map(|t| t.clone().into()).collect());
+            main_container.env.get_or_insert_default().extend([
+                EnvVar {
+                    name: "ANSIBLE_CALLBACKS_ENABLED".into(),
+                    value: Some("ansible_operator_recap".into()),
+                    ..Default::default()
+                },
+                EnvVar {
+                    name: "ANSIBLE_CALLBACK_PLUGINS".into(),
+                    value: Some(paths::WORKSPACE_MOUNT_PATH.into()),
+                    ..Default::default()
+                },
+            ]);
         })
     });
 }
@@ -377,11 +415,10 @@ fn extract_file_volumes(
     })
 }
 
-fn render_ansible_command(
-    plan: &v1beta1::PlaybookPlan,
-    hostname: &str,
-    extra_vars_filepaths: Vec<&String>,
-) -> Vec<String> {
+/// Builds the `ansible-playbook` invocation. Connection details no longer appear here at all —
+/// each host's connection mechanism is expressed as inventory vars in the rendered
+/// `inventory.yml` instead, so there's no more per-strategy `-c`/`-l`/`--private-key` branching.
+fn render_ansible_command(plan: &v1beta1::PlaybookPlan, extra_vars_filepaths: Vec<&String>) -> Vec<String> {
     let static_vars_filenames: Vec<String> = plan
         .spec
         .template
@@ -411,31 +448,11 @@ fn render_ansible_command(
     ansible_command.extend(extra_vars_filepaths.iter().flat_map(|path| {
         [
             "--extra-vars".into(),
-            format!("@/run/ansible-operator/vars/{path}/variables.yaml"),
+            format!("@{}/vars/{path}/variables.yaml", paths::WORKSPACE_MOUNT_PATH),
         ]
     }));
 
-    let connection_args = match &plan.spec.connection_strategy {
-        v1beta1::ConnectionStrategy::Chroot { .. } => vec![
-            "-c".into(),
-            "community.general.chroot".into(),
-            "-i".into(),
-            format!("{CHROOT_VOLUME_MOUNTPATH},"),
-        ],
-        v1beta1::ConnectionStrategy::Ssh { ssh } => vec![
-            "--ssh-common-args='-o UserKnownHostsFile=/ssh/known_hosts'".into(),
-            "--private-key".into(),
-            "/ssh/id_rsa".into(),
-            "--user".into(),
-            ssh.user.clone(),
-            "-i".into(),
-            "inventory.yml".into(),
-            "-l".into(),
-            format!("{hostname},"),
-        ],
-    };
-
-    ansible_command.extend(connection_args);
+    ansible_command.extend(["-i".into(), "inventory.yml".into()]);
     ansible_command.push("playbook.yml".into());
 
     ansible_command
@@ -458,11 +475,6 @@ spec:
   inventoryRefs:
     - name: something
       staticInventory: blubb
-  connectionStrategy:
-    ssh:
-      user: root
-      secretRef:
-        name: ssh
   template:
     variables:
       - inline:
@@ -515,5 +527,83 @@ spec:
             volume2.image.as_ref().unwrap().pull_policy,
             Some("IfNotPresent".into())
         );
+    }
+
+    #[test]
+    fn render_ansible_command_has_no_connection_flags_and_uses_full_inventory() {
+        use crate::v1beta1::controllers::playbookplancontroller::job_builder::render_ansible_command;
+
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#;
+        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+
+        let command = render_ansible_command(&pp, Vec::new());
+
+        assert!(!command.iter().any(|arg| arg == "-c"));
+        assert!(!command.iter().any(|arg| arg == "-l"));
+        assert!(!command.iter().any(|arg| arg == "--private-key"));
+        assert!(command.iter().any(|arg| arg == "inventory.yml"));
+        assert!(command.iter().any(|arg| arg == "playbook.yml"));
+    }
+
+    #[test]
+    fn create_job_for_run_names_by_retry_count_not_a_time_nonce() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use kube::runtime::reflector::Lookup as _;
+
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+  uid: 11111111-1111-1111-1111-111111111111
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#;
+        let pp = serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap();
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let attempt_1 = super::create_job_for_run(&hash, 1, &[], &pp).unwrap();
+        let attempt_2 = super::create_job_for_run(&hash, 2, &[], &pp).unwrap();
+        let attempt_1_again = super::create_job_for_run(&hash, 1, &[], &pp).unwrap();
+
+        let name_1 = attempt_1.name().unwrap().to_string();
+        let name_2 = attempt_2.name().unwrap().to_string();
+        let name_1_again = attempt_1_again.name().unwrap().to_string();
+
+        assert_eq!(
+            name_1, name_1_again,
+            "same hash + same retry_count must be deterministic"
+        );
+        assert_ne!(
+            name_1, name_2,
+            "different retry_count for the same spec must produce a different name"
+        );
+        assert!(name_1.ends_with("-1"));
+        assert!(name_2.ends_with("-2"));
+
+        // The shortid portion stays the same across retries — it's the spec-version identifier.
+        let shortid_1 = name_1.rsplit_once('-').unwrap().0;
+        let shortid_2 = name_2.rsplit_once('-').unwrap().0;
+        assert_eq!(shortid_1, shortid_2);
     }
 }

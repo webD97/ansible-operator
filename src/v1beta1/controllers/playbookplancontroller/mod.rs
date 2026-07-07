@@ -1,6 +1,10 @@
+mod callback_output;
 mod execution_evaluator;
 mod job_builder;
+mod locking;
+mod managed_ssh;
 mod mappers;
+mod paths;
 pub mod reconciler;
 mod status;
 mod triggers;

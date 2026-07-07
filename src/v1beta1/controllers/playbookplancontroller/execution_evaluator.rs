@@ -157,18 +157,21 @@ mod tests {
                     "host-1".to_owned(),
                     HostStatus {
                         last_applied_hash: "1".to_owned(),
+                        ..Default::default()
                     },
                 ),
                 (
                     "host-2".to_owned(),
                     HostStatus {
                         last_applied_hash: "2".to_owned(),
+                        ..Default::default()
                     },
                 ),
                 (
                     "host-3".to_owned(),
                     HostStatus {
                         last_applied_hash: "1".to_owned(),
+                        ..Default::default()
                     },
                 ),
             ])),

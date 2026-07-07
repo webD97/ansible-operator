@@ -1,0 +1,30 @@
+# Namespace-scoped permissions, deliberately kept separate from the cluster-wide ClusterRole:
+# Leases, managed-ssh proxy pods, their NetworkPolicies, and their Secrets only ever exist in the
+# operator's own namespace (this release's namespace) — least privilege means they never need to
+# be reachable outside it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "chart.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+rules:
+  # Per-host mutual-exclusion locks (see agents.md's per-node locking design notes).
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # Managed-ssh proxy pods. Read verbs (get/list/watch) already come from the cluster-wide
+  # ClusterRole; only create/delete are namespace-scoped additions here.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete"]
+  # Scopes each run's proxy-pod ingress to only that run's ansible Job pod.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # The CA Secret, and per-run managed-ssh host/client cert Secrets. get/list/watch/create/patch
+  # already come from the cluster-wide ClusterRole; only delete (cleanup) is added here.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["delete"]

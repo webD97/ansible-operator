@@ -1,0 +1,42 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "chart.fullname" . }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+rules:
+  # PlaybookPlan/ClusterInventory/StaticInventory are user-created and only ever read + watched
+  # by the operator — it never creates/deletes them itself.
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["playbookplans", "clusterinventories", "staticinventories"]
+    verbs: ["get", "list", "watch"]
+  # Only PlaybookPlan and ClusterInventory have controllers writing status (StaticInventory has
+  # no controller of its own today).
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["playbookplans/status", "clusterinventories/status"]
+    verbs: ["get", "update"]
+  # One Job per PlaybookPlan run, across whichever namespace the plan lives in. Watched via
+  # Controller::owns() so the reconciler re-runs when a Job's status changes.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+  # Reading the run's Job-owned pod to fetch its logs (parsed for the recap callback's marker
+  # block) — read-only, across all namespaces. Creating pods directly only ever happens for
+  # managed-ssh proxy pods, which is namespace-scoped to the operator's own namespace (see the
+  # Role, not this ClusterRole).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # The workspace Secret (playbook/inventory/callback plugin/vars) is created via server-side
+  # apply (patch) in whichever namespace the PlaybookPlan lives in; variable/file Secrets
+  # referenced by a PlaybookPlan are only ever read.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]

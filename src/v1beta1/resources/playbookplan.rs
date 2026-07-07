@@ -60,9 +60,6 @@ pub struct PlaybookPlanSpec {
     /// These host groups will be available in our playbook
     pub inventory_refs: Vec<InventoryRef>,
 
-    /// Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
-    pub connection_strategy: ConnectionStrategy,
-
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
 }
@@ -124,35 +121,6 @@ pub enum PlaybookVariableSource {
     },
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(untagged)]
-#[serde(rename_all = "camelCase")]
-pub enum ConnectionStrategy {
-    Ssh { ssh: SshConfig },
-    Chroot { chroot: ChrootConfig },
-}
-
-impl Default for ConnectionStrategy {
-    fn default() -> Self {
-        Self::Chroot {
-            chroot: ChrootConfig { tolerations: None },
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SshConfig {
-    pub user: String,
-    pub secret_ref: SecretRef,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ChrootConfig {
-    pub tolerations: Option<Vec<Toleration>>,
-}
-
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretRef {
@@ -182,57 +150,55 @@ pub enum Phase {
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-pub struct Toleration {
-    pub effect: Option<String>,
-    pub key: Option<String>,
-    pub operator: Option<String>,
-    pub toleration_seconds: Option<i64>,
-    pub value: Option<String>,
-}
-
-impl From<k8s_openapi::api::core::v1::Toleration> for Toleration {
-    fn from(other: k8s_openapi::api::core::v1::Toleration) -> Self {
-        Self {
-            effect: other.effect,
-            key: other.key,
-            operator: other.operator,
-            toleration_seconds: other.toleration_seconds,
-            value: other.value,
-        }
-    }
-}
-
-impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
-    fn from(t: Toleration) -> Self {
-        k8s_openapi::api::core::v1::Toleration {
-            key: t.key,
-            value: t.value,
-            effect: t.effect,
-            operator: t.operator,
-            toleration_seconds: t.toleration_seconds,
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
     pub eligible_hosts: Vec<ResolvedHosts>,
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
     pub hosts_status: Option<BTreeMap<String, HostStatus>>,
-    #[serde(with = "crate::v1beta1::resources::custom_rfc3339")]
+    // `default` is required, not just nice-to-have: status patches are JSON Merge Patches, where
+    // a `null` value deletes the key rather than setting it to null, so this key is genuinely
+    // absent whenever `None`. `#[serde(with = ...)]` opts out of serde's usual missing-`Option`
+    // tolerance, so `default` must be added back explicitly or deserialization hard-fails.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
     pub phase: Phase,
     pub current_hash: String,
     pub summary: Option<String>,
+    /// Name of the Job backing the currently-`Applying` run, if any. Looked up by name rather
+    /// than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
+    /// of an unchanged spec and could match an older, already-finished retry's Job.
+    pub current_job_name: Option<String>,
+    /// How many Jobs have been created for `current_hash` so far, including the current one —
+    /// distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
+    /// `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
+    pub retry_count: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStatus {
+    /// The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
     pub last_applied_hash: String,
+    pub last_outcome: HostOutcome,
+    // See the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub last_transition_time: Option<DateTime<FixedOffset>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+pub enum HostOutcome {
+    /// The callback's output was missing or malformed for this run — distinct from `NotReached`:
+    /// this means the operator's own instrumentation broke, not that Ansible legitimately skipped the host.
+    #[default]
+    Unknown,
+    Succeeded,
+    Failed,
+    /// The host was in scope for this run but Ansible never reached it (e.g. an earlier host in its
+    /// `serial` batch stopped the play).
+    NotReached,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -243,7 +209,8 @@ pub struct PlaybookPlanCondition {
     pub status: String,
     pub reason: Option<String>,
     pub message: Option<String>,
-    #[serde(with = "crate::v1beta1::resources::custom_rfc3339")]
+    // See the identical `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub last_transition_time: Option<DateTime<FixedOffset>>,
 }
@@ -289,14 +256,6 @@ mod tests {
                     cluster_inventory: Some("controlplanes".into()),
                     static_inventory: Some("others".into()),
                 }],
-                connection_strategy: ConnectionStrategy::Ssh {
-                    ssh: SshConfig {
-                        user: "root".into(),
-                        secret_ref: SecretRef {
-                            name: "ssh-key".into(),
-                        },
-                    },
-                },
                 template: PlaybookTemplate {
                     variables: Some(vec![PlaybookVariableSource::SecretRef {
                         secret_ref: SecretRef {
@@ -339,11 +298,6 @@ spec:
   inventoryRefs:
     - name: controlplanes
   mode: OneShot
-  connectionStrategy:
-    ssh:
-      user: root
-      secretRef:
-        name: ssh
   template:
     variables:
       - inline:
@@ -388,5 +342,48 @@ spec:
         ));
 
         println!("{pp:?}");
+    }
+
+    /// Regression test: JSON Merge Patches delete a key entirely rather than setting it null, so
+    /// `nextRun`/`lastTransitionTime` are genuinely absent from the stored object when `None`.
+    /// Without `#[serde(default)]` this used to fail deserialization with "missing field".
+    #[test]
+    fn status_deserializes_when_optional_timestamps_are_entirely_absent() {
+        let json = serde_json::json!({
+            "eligibleHosts": [],
+            "lastRenderedGeneration": null,
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": null,
+                "message": null
+                // lastTransitionTime deliberately omitted
+            }],
+            "hostsStatus": {
+                "some-host": {
+                    "lastAppliedHash": "",
+                    "lastOutcome": "Unknown"
+                    // lastTransitionTime deliberately omitted
+                }
+            },
+            // nextRun deliberately omitted
+            "phase": "Applying",
+            "currentHash": "abc123",
+            "summary": null,
+            "currentJobName": null,
+            "retryCount": 1
+        });
+
+        let status: PlaybookPlanStatus = serde_json::from_value(json).unwrap();
+
+        assert_eq!(status.next_run, None);
+        assert_eq!(
+            status.conditions.first().unwrap().last_transition_time,
+            None
+        );
+        assert_eq!(
+            status.hosts_status.unwrap()["some-host"].last_transition_time,
+            None
+        );
     }
 }

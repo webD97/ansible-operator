@@ -5,3 +5,4 @@ ssh.yaml
 
 skills-lock.json
 .agents/
+.claude/

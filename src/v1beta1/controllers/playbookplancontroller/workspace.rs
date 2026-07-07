@@ -4,30 +4,36 @@ use k8s_openapi::{api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::Owne
 use kube::runtime::reflector::Lookup;
 
 use crate::v1beta1::{
-    PlaybookPlan, PlaybookVariableSource, ResolvedHosts, ansible,
+    PlaybookPlan, ResolvedInventoryGroup, ansible,
     controllers::reconcile_error::ReconcileError,
+    playbookplancontroller::paths,
 };
 
-pub fn is_outdated(object: &PlaybookPlan) -> bool {
+/// Whether the workspace secret needs to be (re)rendered — on a generation change (spec edit),
+/// or whenever `run_starting`, since managed-ssh proxy pod IPs are fresh every run.
+pub fn is_outdated(object: &PlaybookPlan, run_starting: bool) -> bool {
     let generation = object
         .metadata
         .generation
         .expect(".metdata.generation must be set at this point");
 
-    object
+    let generation_changed = object
         .status
         .as_ref()
         .and_then(|s| s.last_rendered_generation)
         .map(|g| g < generation)
-        .unwrap_or(true)
+        .unwrap_or(true);
+
+    generation_changed || run_starting
 }
 
 pub async fn is_missing(secrets_api: &kube::Api<Secret>, name: &str) -> Result<bool, kube::Error> {
     Ok(secrets_api.get_opt(name).await?.is_none())
 }
 
-/// Creates a Kubernetes secret that contains an inventory.yml, a playbook.yml and any static-variables*.yaml
-/// for a given PlaybookPlan so that the playbook can be executed afterwards. The workspace is host-agnostic.
+/// Creates a Kubernetes secret that contains an inventory.yml, a playbook.yml, the operator's
+/// recap callback plugin, and any static-variables*.yaml for a given PlaybookPlan so that the
+/// playbook can be executed afterwards. The workspace is host-agnostic.
 ///
 /// # Panics
 ///
@@ -35,7 +41,8 @@ pub async fn is_missing(secrets_api: &kube::Api<Secret>, name: &str) -> Result<b
 ///
 pub fn render_secret(
     object: &PlaybookPlan,
-    inventories: &[ResolvedHosts],
+    target_groups: &[ResolvedInventoryGroup],
+    managed_ssh_hosts: &BTreeMap<String, ansible::ManagedSshHostInfo>,
 ) -> Result<Secret, ReconcileError> {
     let pb_namespace = object
         .metadata
@@ -69,14 +76,25 @@ pub fn render_secret(
     }]);
 
     let rendered_playbook = ansible::render_playbook(&object.spec)?;
-    let rendered_inventory = ansible::render_inventory(inventories)?;
+
+    let managed_ssh_client_key_path = paths::managed_ssh_client_key_path();
+    let managed_ssh_known_hosts_path = paths::managed_ssh_known_hosts_path();
+    let ssh_paths_by_static_inventory = build_ssh_paths_map(target_groups);
+
+    let render_ctx = ansible::RenderContext {
+        managed_ssh_hosts,
+        managed_ssh_client_key_path: &managed_ssh_client_key_path,
+        managed_ssh_known_hosts_path: &managed_ssh_known_hosts_path,
+        ssh_paths_by_static_inventory: &ssh_paths_by_static_inventory,
+    };
+    let rendered_inventory = ansible::render_inventory(target_groups, &render_ctx)?;
 
     let inlined_variables = match &object.spec.template.variables {
         Some(variable_sources) => variable_sources
             .iter()
             .filter_map(|source| match source {
-                PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
-                PlaybookVariableSource::Inline { inline } => Some(inline),
+                crate::v1beta1::PlaybookVariableSource::SecretRef { secret_ref: _ } => None,
+                crate::v1beta1::PlaybookVariableSource::Inline { inline } => Some(inline),
             })
             .map(serde_yaml::to_string)
             .collect(),
@@ -86,6 +104,13 @@ pub fn render_secret(
     let mut string_data = BTreeMap::new();
     string_data.insert("playbook.yml".into(), rendered_playbook);
     string_data.insert("inventory.yml".into(), rendered_inventory);
+    // Filename must stay exactly `ansible_operator_recap.py` — Ansible's `ANSIBLE_CALLBACKS_ENABLED`
+    // matches local/adjacent plugins by filename, not CALLBACK_NAME, and must match the env var
+    // set in `job_builder::configure_job_for_callback_plugin`.
+    string_data.insert(
+        "ansible_operator_recap.py".into(),
+        include_str!("../../ansible/ansible_operator_recap.py").to_string(),
+    );
 
     if let Some(requirements) = &object.spec.template.requirements {
         string_data.insert("requirements.yml".into(), requirements.to_owned());
@@ -98,4 +123,27 @@ pub fn render_secret(
     secret.string_data = Some(string_data);
 
     Ok(secret)
+}
+
+/// `StaticInventory` resource name -> (private key mount path, known_hosts mount path), for
+/// every distinct `StaticInventory` this run's groups reference.
+fn build_ssh_paths_map(groups: &[ResolvedInventoryGroup]) -> BTreeMap<String, (String, String)> {
+    let mut map = BTreeMap::new();
+
+    for group in groups {
+        if let ResolvedInventoryGroup::Ssh {
+            static_inventory_name,
+            ..
+        } = group
+        {
+            map.entry(static_inventory_name.clone()).or_insert_with(|| {
+                (
+                    paths::static_inventory_ssh_key_path(static_inventory_name),
+                    paths::static_inventory_known_hosts_path(static_inventory_name),
+                )
+            });
+        }
+    }
+
+    map
 }

@@ -1,177 +1,225 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::batch;
-use kube::{api::ObjectList, runtime::reflector::Lookup as _};
-use tracing::debug;
 
 use crate::{
     utils::upsert_condition,
-    v1beta1::{
-        PlaybookPlanCondition, PlaybookPlanStatus, labels,
-        playbookplancontroller::execution_evaluator::ExecutionHash,
-    },
+    v1beta1::{HostOutcome, PlaybookPlanCondition, PlaybookPlanStatus},
 };
 
-pub fn count_successful(jobs: &ObjectList<batch::v1::Job>) -> usize {
-    jobs.iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
-                    })
-                })
-                .unwrap_or(false)
+use super::{callback_output::CallbackOutput, execution_evaluator::ExecutionHash};
+
+/// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
+pub fn job_finished(job: &batch::v1::Job) -> bool {
+    job.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .any(|c| (c.type_ == "Complete" || c.type_ == "Failed") && c.status == "True")
         })
-        .count()
+        .unwrap_or(false)
 }
 
-fn count_failed(jobs: &ObjectList<batch::v1::Job>) -> usize {
-    jobs.iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions
-                        .iter()
-                        .any(|condition| condition.type_ == "Failed" && condition.status == "True")
-                })
-                .unwrap_or(false)
-        })
-        .count()
-}
-
-/// Updates the conditions in the passed status so that they reflect the state of the jobs argument
-pub fn evaluate_playbookplan_conditions(
-    jobs: &ObjectList<batch::v1::Job>,
+/// Updates `hosts_status` for every host targeted this run, from the parsed callback output (or
+/// `Unknown` for all of them if it couldn't be parsed). Only `Succeeded` outcomes bump
+/// `last_applied_hash`, which is what `find_outdated_hosts` reads for retry/idempotency.
+pub fn evaluate_host_outcomes(
+    target_hosts: &[String],
+    parsed: Option<&CallbackOutput>,
+    hash: &ExecutionHash,
     status: &mut PlaybookPlanStatus,
 ) {
-    let num_total = jobs.iter().count();
-    let num_successful = count_successful(jobs);
-    let num_failed = count_failed(jobs);
-    let num_finished = num_failed + num_successful;
-    let num_running = num_total - num_finished;
+    let hosts_status = status.hosts_status.get_or_insert_with(BTreeMap::new);
+    let now = chrono::Local::now().fixed_offset();
 
-    let running_condition = {
-        if num_finished < num_total {
-            PlaybookPlanCondition {
-                type_: "Running".into(),
-                status: "True".into(),
-                reason: Some("JobsRunning".into()),
-                message: Some(format!("{num_running} jobs are currently running")),
-                last_transition_time: Some(chrono::Local::now().fixed_offset()),
-            }
-        } else {
-            PlaybookPlanCondition {
-                type_: "Running".into(),
-                status: "False".into(),
-                reason: None,
-                message: None,
-                last_transition_time: Some(chrono::Local::now().fixed_offset()),
-            }
+    for host in target_hosts {
+        let outcome = match parsed {
+            None => HostOutcome::Unknown,
+            Some(output) => match output.processed.get(host) {
+                None => HostOutcome::NotReached,
+                Some(stats) if stats.is_failure() => HostOutcome::Failed,
+                Some(_) => HostOutcome::Succeeded,
+            },
+        };
+
+        let entry = hosts_status.entry(host.clone()).or_default();
+
+        if outcome == HostOutcome::Succeeded {
+            entry.last_applied_hash = hash.to_string();
         }
-    };
 
-    let ready_condition = {
-        if num_successful == num_total {
-            PlaybookPlanCondition {
-                type_: "Ready".into(),
-                status: "True".into(),
-                reason: Some("AllJobsSucceeded".into()),
-                message: Some(format!(
-                    "{num_successful}/{num_total} jobs completed successfully"
-                )),
-                last_transition_time: Some(chrono::Local::now().fixed_offset()),
-            }
-        } else if num_failed > 0 {
-            PlaybookPlanCondition {
-                type_: "Ready".into(),
-                status: "False".into(),
-                reason: Some("SomeOrAllJobsFailed".into()),
-                message: Some(format!("{num_failed}/{num_total} jobs have failed")),
-                last_transition_time: Some(chrono::Local::now().fixed_offset()),
-            }
-        } else {
-            PlaybookPlanCondition {
-                type_: "Ready".into(),
-                status: "False".into(),
-                reason: Some("AwaitingJobResults".into()),
-                message: Some(format!("{num_running} jobs are running")),
-                last_transition_time: Some(chrono::Local::now().fixed_offset()),
-            }
+        entry.last_outcome = outcome;
+        entry.last_transition_time = Some(now);
+    }
+}
+
+/// Recomputes the plan-level `Running`/`Ready` conditions from this run's host-outcome tally,
+/// using the parsed callback output as the only host-level signal (there's exactly one Job per
+/// run now, so there's nothing to count across Jobs).
+pub fn evaluate_playbookplan_conditions(
+    target_hosts: &[String],
+    job_is_finished: bool,
+    parsed: Option<&CallbackOutput>,
+    status: &mut PlaybookPlanStatus,
+) {
+    let now = chrono::Local::now().fixed_offset();
+
+    let running_condition = if !job_is_finished {
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "True".into(),
+            reason: Some("JobRunning".into()),
+            message: Some("the run's Job is still active".into()),
+            last_transition_time: Some(now),
+        }
+    } else {
+        PlaybookPlanCondition {
+            type_: "Running".into(),
+            status: "False".into(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(now),
         }
     };
 
     upsert_condition(&mut status.conditions, running_condition);
+
+    if !job_is_finished {
+        return;
+    }
+
+    let ready_condition = match parsed {
+        None => PlaybookPlanCondition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            reason: Some("RecapUnavailable".into()),
+            message: Some(
+                "the operator could not parse per-host results for this run's Job logs".into(),
+            ),
+            last_transition_time: Some(now),
+        },
+        Some(output) => {
+            let total = target_hosts.len();
+            let succeeded = target_hosts
+                .iter()
+                .filter(|host| {
+                    output
+                        .processed
+                        .get(*host)
+                        .map(|stats| !stats.is_failure())
+                        .unwrap_or(false)
+                })
+                .count();
+
+            if total > 0 && succeeded == total {
+                PlaybookPlanCondition {
+                    type_: "Ready".into(),
+                    status: "True".into(),
+                    reason: Some("AllHostsSucceeded".into()),
+                    message: Some(format!("{succeeded}/{total} hosts completed successfully")),
+                    last_transition_time: Some(now),
+                }
+            } else {
+                PlaybookPlanCondition {
+                    type_: "Ready".into(),
+                    status: "False".into(),
+                    reason: Some("SomeHostsDidNotSucceed".into()),
+                    message: Some(format!("{succeeded}/{total} hosts completed successfully")),
+                    last_transition_time: Some(now),
+                }
+            }
+        }
+    };
+
     upsert_condition(&mut status.conditions, ready_condition);
 }
 
-/// Updates the per-host status based on the passed jobs
-pub fn evaluate_per_host_status(
-    jobs: &ObjectList<batch::v1::Job>,
-    hash: &ExecutionHash,
-    status: &mut PlaybookPlanStatus,
-) {
-    jobs.iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .and_then(|status| status.conditions.as_ref())
-                .map(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.type_ == "SuccessCriteriaMet" && condition.status == "True"
-                    })
-                })
-                .unwrap_or(false)
-        })
-        .for_each(|job| {
-            if status.hosts_status.is_none() {
-                status.hosts_status = Some(BTreeMap::new());
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v1beta1::controllers::playbookplancontroller::callback_output::HostStats;
 
-            let binding = job.metadata.labels.clone().unwrap_or_default();
-            let target_host = binding.get(labels::PLAYBOOKPLAN_HOST);
+    fn hash() -> ExecutionHash {
+        crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash(
+            "playbook",
+            std::iter::empty(),
+        )
+    }
 
-            if target_host.is_none() {
-                return;
-            }
+    #[test]
+    fn succeeded_host_bumps_hash_others_do_not() {
+        let mut status = PlaybookPlanStatus::default();
+        let mut processed = BTreeMap::new();
+        processed.insert("host-1".to_string(), HostStats { ok: 1, ..Default::default() });
+        processed.insert(
+            "host-2".to_string(),
+            HostStats {
+                failed: 1,
+                ..Default::default()
+            },
+        );
+        let output = CallbackOutput { processed };
+        let h = hash();
 
-            let target_host = target_host.unwrap();
+        evaluate_host_outcomes(
+            &["host-1".to_string(), "host-2".to_string(), "host-3".to_string()],
+            Some(&output),
+            &h,
+            &mut status,
+        );
 
-            debug!(
-                "Job {} was observed with SuccessCriteriaMet condition.",
-                job.name().unwrap()
-            );
+        let hosts_status = status.hosts_status.unwrap();
+        assert_eq!(hosts_status["host-1"].last_outcome, HostOutcome::Succeeded);
+        assert_eq!(hosts_status["host-1"].last_applied_hash, h.to_string());
 
-            status
-                .hosts_status
-                .as_mut()
-                .unwrap()
-                .entry(target_host.to_owned())
-                .or_default()
-                .last_applied_hash = hash.to_string();
-        });
-}
+        assert_eq!(hosts_status["host-2"].last_outcome, HostOutcome::Failed);
+        assert_eq!(hosts_status["host-2"].last_applied_hash, "");
 
-pub fn all_jobs_finished(jobs: &ObjectList<batch::v1::Job>) -> bool {
-    jobs.iter().all(|job| {
-        job.status
-            .as_ref()
-            .map(|status| {
-                status
-                    .conditions
-                    .as_ref()
-                    .map(|conditions| {
-                        conditions.iter().any(|condition| {
-                            (condition.type_ == "Failed" || condition.type_ == "SuccessCriteriaMet")
-                                && condition.status == "True"
-                        })
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
-    })
+        assert_eq!(hosts_status["host-3"].last_outcome, HostOutcome::NotReached);
+        assert_eq!(hosts_status["host-3"].last_applied_hash, "");
+    }
+
+    #[test]
+    fn missing_callback_output_marks_everything_unknown() {
+        let mut status = PlaybookPlanStatus::default();
+        let h = hash();
+
+        evaluate_host_outcomes(&["host-1".to_string()], None, &h, &mut status);
+
+        let hosts_status = status.hosts_status.unwrap();
+        assert_eq!(hosts_status["host-1"].last_outcome, HostOutcome::Unknown);
+    }
+
+    #[test]
+    fn ready_condition_false_when_callback_output_missing() {
+        let mut status = PlaybookPlanStatus::default();
+        evaluate_playbookplan_conditions(&["host-1".to_string()], true, None, &mut status);
+
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Ready")
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("RecapUnavailable"));
+    }
+
+    #[test]
+    fn running_condition_true_while_job_not_finished() {
+        let mut status = PlaybookPlanStatus::default();
+        evaluate_playbookplan_conditions(&["host-1".to_string()], false, None, &mut status);
+
+        let running = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Running")
+            .unwrap();
+        assert_eq!(running.status, "True");
+        assert!(
+            status.conditions.iter().all(|c| c.type_ != "Ready"),
+            "Ready shouldn't be evaluated while the job is still running"
+        );
+    }
 }

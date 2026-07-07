@@ -2,7 +2,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v1beta1::{AnsibleInventory, ResolvedHosts};
+use crate::v1beta1::{AnsibleInventory, ResolvedHosts, SecretRef};
 
 #[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 #[kube(
@@ -15,6 +15,17 @@ use crate::v1beta1::{AnsibleInventory, ResolvedHosts};
 #[serde(rename_all = "camelCase")]
 pub struct StaticInventorySpec {
     pub hosts: Vec<ResolvedHosts>,
+
+    /// How to reach these hosts over SSH. Mandatory: a StaticInventory with no reachability
+    /// info isn't usable by any PlaybookPlan.
+    pub ssh: SshConfig,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConfig {
+    pub user: String,
+    pub secret_ref: SecretRef,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

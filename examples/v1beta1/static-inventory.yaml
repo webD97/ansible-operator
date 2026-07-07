@@ -9,3 +9,7 @@ spec:
         - server1.somedomain.example
         - server1.somedomain.example
         - 192.168.73.42
+  ssh:
+    user: root
+    secretRef:
+      name: ssh-key

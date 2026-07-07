@@ -1,0 +1,59 @@
+# Default values for the ansible-operator chart.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/webd97/ansible-operator
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# Image used for managed-ssh proxy pods (created dynamically by the operator itself at runtime,
+# not by this chart) — must run a real OpenSSH sshd. The operator's own image is distroless and
+# cannot serve this role. NOTE: this default has not been verified end-to-end against a real
+# cluster — see agents.md's managed-ssh design notes.
+managedSsh:
+  proxyImage:
+    repository: testcontainers/sshd
+    tag: latest
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# IMPORTANT: install this chart into its own dedicated namespace, e.g.:
+#   helm install --create-namespace -n ansible-system ansible-operator ./chart
+# All namespaced resources in this chart (Deployment, ServiceAccount, Role/RoleBinding) use
+# .Release.Namespace. That namespace is also where per-run Leases, managed-ssh proxy
+# pods/Secrets/NetworkPolicies, and the operator's own CA Secret live at runtime — never the
+# namespace a PlaybookPlan happens to be created in. Keeping this separate means only this one
+# namespace needs privileged-pod exceptions (Pod Security Admission), not every tenant namespace.
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+  # The operator's own pod needs no special privilege — it never touches node filesystems
+  # itself, only the ephemeral managed-ssh proxy pods it creates do.
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user.
+  # limits:
+  #   cpu: 200m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 50m
+  #   memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

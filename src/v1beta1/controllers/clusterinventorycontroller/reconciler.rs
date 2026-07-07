@@ -4,7 +4,7 @@ use futures::{Stream, StreamExt as _};
 use k8s_openapi::api::core::v1::Node;
 use kube::{
     Api,
-    api::{ListParams, PostParams},
+    api::{ListParams, Patch, PatchParams},
     runtime::{
         Controller,
         controller::{self, Action},
@@ -15,8 +15,7 @@ use kube::{
 use tracing::error;
 
 use crate::v1beta1::{
-    self, ClusterInventory, ClusterInventorySpec, ClusterInventoryStatus,
-    clusterinventorycontroller::mappers,
+    self, ClusterInventory, ClusterInventoryStatus, clusterinventorycontroller::mappers,
     controllers::{nodeselector::node_matches, reconcile_error::ReconcileError},
 };
 
@@ -108,12 +107,14 @@ async fn reconcile(
     };
 
     let api: Api<ClusterInventory> = Api::namespaced(context.client.clone(), &namespace);
-    replace_status(&api, &object, next_status).await?;
+    patch_status(&api, &object, next_status).await?;
 
     Ok(Action::requeue(Duration::from_hours(1)))
 }
 
-async fn replace_status(
+/// Persists `status` via a JSON merge patch, not `Api::replace_status` — see the identical
+/// reasoning in `playbookplancontroller::reconciler::patch_status`.
+async fn patch_status(
     api: &Api<ClusterInventory>,
     target: &ClusterInventory,
     status: ClusterInventoryStatus,
@@ -122,14 +123,12 @@ async fn replace_status(
         .name()
         .ok_or(ReconcileError::PreconditionFailed("name not set"))?;
 
-    let patch_object = ClusterInventory {
-        metadata: target.metadata.clone(),
-        spec: ClusterInventorySpec::default(),
-        status: Some(status),
-    };
-
-    api.replace_status(&name, &PostParams::default(), &patch_object)
-        .await?;
+    api.patch_status(
+        &name,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "status": status })),
+    )
+    .await?;
 
     Ok(())
 }

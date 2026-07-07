@@ -18,6 +18,43 @@ use crate::v1beta1::{AnsibleInventory, NodeSelectorTerm, ResolvedHosts};
 #[serde(rename_all = "camelCase")]
 pub struct ClusterInventorySpec {
     pub hosts: Vec<InventoryHosts>,
+
+    /// Tolerations applied to the managed-ssh proxy pods created for this inventory's hosts,
+    /// e.g. to allow scheduling onto tainted controlplane nodes.
+    pub tolerations: Option<Vec<Toleration>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
+pub struct Toleration {
+    pub effect: Option<String>,
+    pub key: Option<String>,
+    pub operator: Option<String>,
+    pub toleration_seconds: Option<i64>,
+    pub value: Option<String>,
+}
+
+impl From<k8s_openapi::api::core::v1::Toleration> for Toleration {
+    fn from(other: k8s_openapi::api::core::v1::Toleration) -> Self {
+        Self {
+            effect: other.effect,
+            key: other.key,
+            operator: other.operator,
+            toleration_seconds: other.toleration_seconds,
+            value: other.value,
+        }
+    }
+}
+
+impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
+    fn from(t: Toleration) -> Self {
+        k8s_openapi::api::core::v1::Toleration {
+            key: t.key,
+            value: t.value,
+            effect: t.effect,
+            operator: t.operator,
+            toleration_seconds: t.toleration_seconds,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

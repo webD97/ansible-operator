@@ -1,0 +1,243 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: playbookplans.ansible.cloudbending.dev
+spec:
+  group: ansible.cloudbending.dev
+  names:
+    categories: []
+    kind: PlaybookPlan
+    plural: playbookplans
+    shortNames: []
+    singular: playbookplan
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .spec.schedule
+      name: Schedule
+      type: string
+    - jsonPath: .status.nextRun
+      name: Next run
+      type: string
+    - jsonPath: .status.currentHash
+      name: Current hash
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Running")].status
+      name: Running
+      type: string
+    - jsonPath: .status.summary
+      name: Summary
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for PlaybookPlanSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              image:
+                description: An OCI image with Ansible and all required collections
+                type: string
+              inventoryRefs:
+                description: These host groups will be available in our playbook
+                items:
+                  properties:
+                    clusterInventory:
+                      description: Name of the ClusterInventory resource being referenced
+                      nullable: true
+                      type: string
+                    staticInventory:
+                      description: Name of the StaticInventory resource being referenced
+                      nullable: true
+                      type: string
+                  type: object
+                type: array
+              mode:
+                default: OneShot
+                description: Controls if a playbook is executed once or repeatedly
+                enum:
+                - OneShot
+                - Recurring
+                type: string
+              schedule:
+                description: 5-part cron expression that tells at which time the playbook may execute
+                nullable: true
+                type: string
+              template:
+                description: The playbook will be built from this, some fields will be set automatically (vars, hosts)
+                properties:
+                  files:
+                    description: Files for the playbook
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                  playbook:
+                    description: The actual playbook contents
+                    type: string
+                  requirements:
+                    description: Runtime requirements (e.g. Ansible collections)
+                    nullable: true
+                    type: string
+                  variables:
+                    description: Variables for the playbook
+                    items:
+                      anyOf:
+                      - required:
+                        - secretRef
+                      - required:
+                        - inline
+                      properties:
+                        inline:
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                        secretRef:
+                          properties:
+                            name:
+                              type: string
+                          required:
+                          - name
+                          type: object
+                      type: object
+                    nullable: true
+                    type: array
+                required:
+                - playbook
+                type: object
+              timeZone:
+                description: Time zone for the _schedule_ field, if unset UTC is assumed
+                nullable: true
+                type: string
+            required:
+            - image
+            - inventoryRefs
+            - template
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              currentHash:
+                type: string
+              currentJobName:
+                description: |-
+                  Name of the Job backing the currently-`Applying` run, if any. Looked up by name (not by
+                  `PLAYBOOKPLAN_HASH` label alone) when checking whether the run has finished — the hash
+                  label is stable across every retry of an unchanged spec, so a label-only lookup can match
+                  an older, already-finished retry's Job instead of the one this run actually just created,
+                  causing premature cleanup/status evaluation before the current run's Job has even started.
+                nullable: true
+                type: string
+              eligibleHosts:
+                items:
+                  properties:
+                    hosts:
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      type: string
+                  required:
+                  - hosts
+                  - name
+                  type: object
+                type: array
+              hostsStatus:
+                additionalProperties:
+                  properties:
+                    lastAppliedHash:
+                      description: The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
+                      type: string
+                    lastOutcome:
+                      enum:
+                      - Succeeded
+                      - Failed
+                      - Unknown
+                      - NotReached
+                      type: string
+                    lastTransitionTime:
+                      nullable: true
+                      type: string
+                  required:
+                  - lastAppliedHash
+                  - lastOutcome
+                  type: object
+                nullable: true
+                type: object
+              lastRenderedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              nextRun:
+                nullable: true
+                type: string
+              phase:
+                enum:
+                - Pending
+                - Delayed
+                - Applying
+                - Scheduled
+                - Failed
+                - Succeeded
+                type: string
+              retryCount:
+                description: |-
+                  How many Jobs have been created for `current_hash` so far, including the current one —
+                  distinguishes retries of an identical spec in the Job name (`apply-{plan}-{shortid}-{n}`)
+                  human-readably, instead of an opaque time-derived hash. Reset to 0 whenever `current_hash`
+                  changes (a genuinely new spec version, not a retry); incremented once per Job actually
+                  created, in `spawn_ansible_job`.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              summary:
+                nullable: true
+                type: string
+            required:
+            - conditions
+            - currentHash
+            - eligibleHosts
+            - phase
+            - retryCount
+            type: object
+        required:
+        - spec
+        title: PlaybookPlan
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
