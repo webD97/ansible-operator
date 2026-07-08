@@ -34,6 +34,7 @@ impl JsonSchema for GenericMap {
     status = "PlaybookPlanStatus",
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
+    printcolumn = r#"{"name":"Previous run","type":"string","jsonPath":".status.lastTriggeredRun"}"#,
     printcolumn = r#"{"name":"Next run","type":"string","jsonPath":".status.nextRun"}"#,
     printcolumn = r#"{"name":"Current hash","type":"string","jsonPath":".status.currentHash"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
@@ -169,6 +170,14 @@ pub struct PlaybookPlanStatus {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
+    /// The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
+    /// for. The trigger gate compares the current slot against this so a run that completes inside
+    /// its grace window isn't immediately re-triggered by the next reconcile within that same
+    /// window. Reset whenever `current_hash` changes; `None` for unscheduled plans (no slot to
+    /// dedupe against).
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub last_triggered_run: Option<DateTime<FixedOffset>>,
     pub phase: Phase,
     pub current_hash: String,
     pub summary: Option<String>,

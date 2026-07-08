@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, FixedOffset, Utc};
 use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
     batch::v1::Job,
@@ -35,8 +35,9 @@ use crate::{
         ca::CertificateAuthority,
         controllers::reconcile_error::ReconcileError,
         playbookplancontroller::{
-            callback_output, execution_evaluator::{self, find_outdated_hosts}, job_builder, mappers,
-            status,
+            callback_output,
+            execution_evaluator::{self, find_outdated_hosts},
+            job_builder, mappers, status,
         },
     },
 };
@@ -52,9 +53,13 @@ struct ReconciliationContext {
     ca: Arc<CertificateAuthority>,
 }
 
-/// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: which hosts this
-/// run targets, its execution hash, and the Lease holder identity derived from it.
+/// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
+/// namespace/name, which hosts this run targets, its execution hash, and the Lease holder identity
+/// derived from them. Kube `Api<T>` handles are deliberately *not* here — those are plumbing built
+/// on demand from `ReconciliationContext::client` plus `namespace`, not run identity.
 struct RunContext<'a> {
+    namespace: &'a str,
+    name: &'a str,
     execution_hash: ExecutionHash,
     hosts_to_trigger: &'a [String],
     holder_identity: &'a str,
@@ -133,12 +138,10 @@ async fn reconcile(
         return Ok(Action::await_change());
     }
 
-    let (namespace, name, generation) = extract_resource_info(&object)?;
+    let (namespace, name, _) = extract_resource_info(&object)?;
 
     let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), namespace);
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
-    let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
-    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
 
     let mut requeue_after = std::time::Duration::from_secs(3600);
     let mut resource_status = object.status.clone().unwrap_or_default();
@@ -161,6 +164,9 @@ async fn reconcile(
         resource_status.current_hash = execution_hash.to_string();
         // A new spec version starts retry counting over from scratch.
         resource_status.retry_count = 0;
+        // ...and may legitimately need to run in the same slot the old version already used, so
+        // forget which slot was last triggered.
+        resource_status.last_triggered_run = None;
     }
 
     // Step 1: compute outdated hosts / evaluate schedule — unchanged from before.
@@ -178,51 +184,71 @@ async fn reconcile(
 
     let holder_identity = format!("{namespace}/{name}/{execution_hash}");
     let run = RunContext {
+        namespace,
+        name,
         execution_hash,
         hosts_to_trigger: &hosts_to_trigger,
         holder_identity: &holder_identity,
     };
 
-    if !outdated_hosts.is_empty() && resource_status.phase != Phase::Applying {
+    // What makes a run eligible to *start* this tick differs by mode:
+    //   - OneShot keeps applying until every host is on the current hash, then goes quiet — so it's
+    //     gated on there being outdated hosts left (which is exactly `hosts_to_trigger`).
+    //   - Recurring runs on every schedule tick regardless of host hashes (a successful run marks
+    //     all hosts up-to-date, so an outdated-based gate would fire once and never again). It's
+    //     gated only on having a schedule to tick on; slot dedup via `last_triggered_run` is what
+    //     stops a single tick from starting more than one run, and without a schedule there'd be no
+    //     slot to dedup against (it would busy-loop).
+    let eligible_to_start = !hosts_to_trigger.is_empty()
+        && match object.spec.mode {
+            ExecutionMode::OneShot => true,
+            ExecutionMode::Recurring => object.spec.schedule.is_some(),
+        };
+
+    if eligible_to_start && resource_status.phase != Phase::Applying {
         match timing {
             Timing::Delayed(until) => {
                 requeue_after = (until - now()).to_std().unwrap();
                 resource_status.phase = Phase::Scheduled;
                 resource_status.next_run = Some(until.fixed_offset());
             }
-            Timing::Now(_start) => {
-                if let Some(d) = try_start_run(
+            Timing::Now(start) => {
+                let this_slot = start.map(|s| s.fixed_offset());
+
+                if slot_already_triggered(this_slot, resource_status.last_triggered_run) {
+                    // A run for this scheduled slot already started within its grace window;
+                    // `evaluate_schedule` keeps returning `Now` for the rest of that window, so
+                    // don't start another — sleep until the next slot instead. Without this a run
+                    // that finishes inside its own grace window is immediately re-triggered.
+                    if let Some(schedule) = object.spec.schedule.as_deref() {
+                        let next =
+                            forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
+                        requeue_after = (next - now()).to_std().unwrap_or_default();
+                        resource_status.next_run = Some(next.fixed_offset());
+                    }
+                } else if let Some(d) = try_start_run(
                     &context,
                     &run,
-                    namespace,
-                    name,
-                    generation,
                     &target_groups,
                     &object,
-                    &secrets_api,
-                    &jobs_api,
-                    &leases_api,
                     &mut resource_status,
                 )
                 .await?
                 {
                     requeue_after = d;
+                } else {
+                    // `try_start_run` ran to completion (the Job was created or an active one
+                    // adopted, so `phase` is now `Applying`). Record this slot so it can't
+                    // re-trigger inside its grace window. `None` for unscheduled plans, which have
+                    // no slot and are never suppressed.
+                    resource_status.last_triggered_run = this_slot;
                 }
             }
         };
     }
 
     if resource_status.phase == Phase::Applying
-        && let Some(d) = advance_applying_run(
-            &context,
-            &run,
-            namespace,
-            &object,
-            &jobs_api,
-            &leases_api,
-            &mut resource_status,
-        )
-        .await?
+        && let Some(d) = advance_applying_run(&context, &run, &object, &mut resource_status).await?
     {
         requeue_after = d;
     }
@@ -230,6 +256,17 @@ async fn reconcile(
     patch_status(&api, &object, resource_status).await?;
 
     Ok(Action::requeue(requeue_after))
+}
+
+/// Whether the current schedule slot (`start`, the grace window's start) already had a run started
+/// for it, per the persisted `last_triggered_run`. Unscheduled ticks carry no slot (`None`) and are
+/// never suppressed — there is nothing to dedupe against. `DateTime` equality compares instants, so
+/// the offset the two timestamps carry is irrelevant.
+fn slot_already_triggered(
+    start: Option<DateTime<FixedOffset>>,
+    last_triggered_run: Option<DateTime<FixedOffset>>,
+) -> bool {
+    start.is_some() && start == last_triggered_run
 }
 
 /// Steps 2-5: acquire this run's per-host locks (all-or-nothing, renewed every tick for as long
@@ -240,20 +277,18 @@ async fn reconcile(
 async fn try_start_run(
     context: &ReconciliationContext,
     run: &RunContext<'_>,
-    namespace: &str,
-    name: &str,
-    generation: i64,
     target_groups: &[ResolvedInventoryGroup],
     object: &PlaybookPlan,
-    secrets_api: &Api<Secret>,
-    jobs_api: &Api<Job>,
-    leases_api: &Api<Lease>,
     resource_status: &mut PlaybookPlanStatus,
 ) -> Result<Option<std::time::Duration>, ReconcileError> {
+    let secrets_api = Api::<Secret>::namespaced(context.client.clone(), run.namespace);
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), run.namespace);
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+
     let run_groups = filter_groups_to_hosts(target_groups, run.hosts_to_trigger);
 
     let blocked =
-        locking::ensure_locks(leases_api, run.hosts_to_trigger, run.holder_identity).await?;
+        locking::ensure_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
     if !blocked.is_empty() {
         debug!("Waiting on per-host locks for: {blocked:?}");
         return Ok(Some(std::time::Duration::from_secs(15)));
@@ -264,7 +299,7 @@ async fn try_start_run(
     let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
-        namespace,
+        run.namespace,
         &run.execution_hash,
         &managed_ssh_hosts,
         tolerations.as_deref(),
@@ -295,19 +330,19 @@ async fn try_start_run(
 
     // Proxy pod IPs are fresh every run even with an unchanged spec, so rendering is also
     // triggered on "a run is starting now", not generation alone.
-    if workspace::is_missing(secrets_api, name).await? || workspace::is_outdated(object, true) {
+    if workspace::is_missing(&secrets_api, run.name).await? || workspace::is_outdated(object, true) {
         debug!("Rendering playbook to secret");
         upsert_workspace_secret(
-            secrets_api,
-            name,
+            &secrets_api,
+            run.name,
             render_secret(object, &run_groups, &managed_ssh_hosts_map)?,
         )
         .await?;
-        resource_status.last_rendered_generation = Some(generation);
+        resource_status.last_rendered_generation = object.metadata.generation;
     }
 
     spawn_ansible_job(
-        jobs_api,
+        &jobs_api,
         run.execution_hash,
         &run_groups,
         object,
@@ -327,12 +362,12 @@ async fn try_start_run(
 async fn advance_applying_run(
     context: &ReconciliationContext,
     run: &RunContext<'_>,
-    namespace: &str,
     object: &PlaybookPlan,
-    jobs_api: &Api<Job>,
-    leases_api: &Api<Lease>,
     resource_status: &mut PlaybookPlanStatus,
 ) -> Result<Option<std::time::Duration>, ReconcileError> {
+    let jobs_api = Api::<Job>::namespaced(context.client.clone(), run.namespace);
+    let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
+
     // Looked up by the exact recorded name, not the PLAYBOOKPLAN_HASH label — that label is
     // stable across every retry of an unchanged spec, so a label-only `list()` could return
     // an older, already-finished retry's Job instead of the one this run just created.
@@ -345,7 +380,12 @@ async fn advance_applying_run(
     if let Some(job) = &job
         && !status::job_finished(job)
     {
-        status::evaluate_playbookplan_conditions(run.hosts_to_trigger, false, None, resource_status);
+        status::evaluate_playbookplan_conditions(
+            run.hosts_to_trigger,
+            false,
+            None,
+            resource_status,
+        );
         return Ok(Some(std::time::Duration::from_secs(15)));
     }
 
@@ -358,7 +398,7 @@ async fn advance_applying_run(
     // channel that isn't interleaved with playbook output and needs no `pods/log` access.
     let parsed = match &job {
         Some(_) => {
-            let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
+            let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), run.namespace);
             pods_api
                 .list(&ListParams {
                     label_selector: Some(format!("job-name={job_name}")),
@@ -380,7 +420,12 @@ async fn advance_applying_run(
         &run.execution_hash,
         resource_status,
     );
-    status::evaluate_playbookplan_conditions(run.hosts_to_trigger, true, parsed.as_ref(), resource_status);
+    status::evaluate_playbookplan_conditions(
+        run.hosts_to_trigger,
+        true,
+        parsed.as_ref(),
+        resource_status,
+    );
 
     managed_ssh::cleanup_proxy_infra(
         &context.client,
@@ -388,7 +433,7 @@ async fn advance_applying_run(
         &run.execution_hash,
     )
     .await?;
-    locking::release_locks(leases_api, run.hosts_to_trigger, run.holder_identity).await?;
+    locking::release_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
 
     let total_count: usize = resource_status
         .eligible_hosts
@@ -748,7 +793,7 @@ async fn spawn_ansible_job(
 
     if let Some(active) = newest_active_job(&existing.items) {
         let job_name = active.name().expect("a listed Job always has a name");
-        info!("Adopting already-active job {job_name} for this run");
+        debug!("Adopting already-active job {job_name} for this run");
         resource_status.current_job_name = Some(job_name.to_string());
         resource_status.phase = Phase::Applying;
         resource_status.next_run = None;
@@ -829,7 +874,11 @@ mod tests {
         }
     }
 
-    fn ssh_group(name: &str, hosts: &[&str], static_inventory_name: &str) -> ResolvedInventoryGroup {
+    fn ssh_group(
+        name: &str,
+        hosts: &[&str],
+        static_inventory_name: &str,
+    ) -> ResolvedInventoryGroup {
         ResolvedInventoryGroup::Ssh {
             hosts: ResolvedHosts {
                 name: name.into(),
@@ -979,6 +1028,36 @@ mod tests {
         assert!(newest_active_job(&all_finished).is_none());
 
         assert!(newest_active_job(&[]).is_none());
+    }
+
+    #[test]
+    fn slot_already_triggered_suppresses_only_a_repeat_of_the_same_slot() {
+        let slot = |s: &str| Some(s.parse::<DateTime<FixedOffset>>().unwrap());
+
+        // Unscheduled ticks (no slot) are never suppressed.
+        assert!(!slot_already_triggered(None, None));
+        assert!(!slot_already_triggered(None, slot("2025-08-12T20:00:00Z")));
+
+        // The first time a slot is seen it hasn't been triggered yet.
+        assert!(!slot_already_triggered(slot("2025-08-12T20:00:00Z"), None));
+
+        // The same slot already recorded -> suppress the re-trigger inside its grace window.
+        assert!(slot_already_triggered(
+            slot("2025-08-12T20:00:00Z"),
+            slot("2025-08-12T20:00:00Z"),
+        ));
+
+        // Equality is by instant, so an equivalent moment in another offset still matches.
+        assert!(slot_already_triggered(
+            slot("2025-08-12T22:00:00+02:00"),
+            slot("2025-08-12T20:00:00Z"),
+        ));
+
+        // A later slot than the recorded one -> a genuinely new run.
+        assert!(!slot_already_triggered(
+            slot("2025-08-13T20:00:00Z"),
+            slot("2025-08-12T20:00:00Z"),
+        ));
     }
 
     #[test]
