@@ -121,6 +121,15 @@ spec:
                 description: Time zone for the _schedule_ field, if unset UTC is assumed
                 nullable: true
                 type: string
+              ttlSecondsAfterFinished:
+                description: |-
+                  How long a finished run's Job (and its pod) is kept before Kubernetes' TTL controller
+                  reaps it. The operator never deletes the Job itself, so this governs the ansible pod's
+                  lifetime. Values below 60 seconds are silently raised to 60; unset uses the operator's
+                  default.
+                format: int32
+                nullable: true
+                type: integer
             required:
             - image
             - inventoryRefs
@@ -154,11 +163,9 @@ spec:
                 type: string
               currentJobName:
                 description: |-
-                  Name of the Job backing the currently-`Applying` run, if any. Looked up by name (not by
-                  `PLAYBOOKPLAN_HASH` label alone) when checking whether the run has finished — the hash
-                  label is stable across every retry of an unchanged spec, so a label-only lookup can match
-                  an older, already-finished retry's Job instead of the one this run actually just created,
-                  causing premature cleanup/status evaluation before the current run's Job has even started.
+                  Name of the Job backing the currently-`Applying` run, if any. Looked up by name rather
+                  than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
+                  of an unchanged spec and could match an older, already-finished retry's Job.
                 nullable: true
                 type: string
               eligibleHosts:
@@ -216,10 +223,8 @@ spec:
               retryCount:
                 description: |-
                   How many Jobs have been created for `current_hash` so far, including the current one —
-                  distinguishes retries of an identical spec in the Job name (`apply-{plan}-{shortid}-{n}`)
-                  human-readably, instead of an opaque time-derived hash. Reset to 0 whenever `current_hash`
-                  changes (a genuinely new spec version, not a retry); incremented once per Job actually
-                  created, in `spawn_ansible_job`.
+                  distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
+                  `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
                 format: uint32
                 minimum: 0.0
                 type: integer

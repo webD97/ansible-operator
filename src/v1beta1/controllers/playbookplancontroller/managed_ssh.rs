@@ -484,13 +484,19 @@ pub async fn ensure_proxy_infra(
 }
 
 /// Deletes every operator-namespace resource belonging to this run — proxy pods, their per-host
-/// Secrets, the run's NetworkPolicy, and the shared client-cert Secret — with one label-scoped
-/// `delete_collection` per kind on the `PLAYBOOKPLAN_HASH` label they all carry. This is why the
-/// host list isn't needed: GC-by-label catches everything tagged with the run's hash regardless of
-/// how the inventory drifted since the run started. The CA Secret carries no such label, so it's
-/// never swept up. Not reliant on ownerReferences, since Kubernetes GC doesn't act on references
-/// that cross namespaces (these live in the operator's namespace, the Job/PlaybookPlan live in the
-/// target namespace). Best-effort: delete errors are ignored, the next run's cleanup retries.
+/// Secrets, the run's NetworkPolicy, and the shared client-cert Secret — via label-scoped
+/// `delete_collection`. This is why the host list isn't needed: GC-by-label catches everything
+/// tagged with the run's hash regardless of how the inventory drifted since the run started. The
+/// CA Secret carries no such label, so it's never swept up. Not reliant on ownerReferences, since
+/// Kubernetes GC doesn't act on references that cross namespaces (these live in the operator's
+/// namespace, the Job/PlaybookPlan live in the target namespace). Best-effort: delete errors are
+/// ignored, the next run's cleanup retries.
+///
+/// Pods use a tighter selector than the Secrets/NetworkPolicy: the ansible Job pod carries the same
+/// `PLAYBOOKPLAN_HASH` label (the run's NetworkPolicy targets it by that label) but is NOT proxy
+/// infra — it must be reaped by its own Job's `ttlSecondsAfterFinished`, never here. That only
+/// collides when the operator and the plan share a namespace, but requiring the per-host
+/// `PLAYBOOKPLAN_HOST` label (which only proxy pods carry) excludes the ansible pod cleanly.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
@@ -501,12 +507,17 @@ pub async fn cleanup_proxy_infra(
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
 
     let dp = DeleteParams::default();
-    let lp = ListParams::default().labels(&format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH));
+    let hash_selector = format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH);
 
-    // Secrets covers both the per-host host-cert Secrets and the shared client-cert Secret.
-    let _ = pods_api.delete_collection(&dp, &lp).await;
-    let _ = secrets_api.delete_collection(&dp, &lp).await;
-    let _ = netpol_api.delete_collection(&dp, &lp).await;
+    // Existence of PLAYBOOKPLAN_HOST spares the ansible Job pod (which lacks it) — see the doc.
+    let pods_lp = ListParams::default()
+        .labels(&format!("{hash_selector},{}", labels::PLAYBOOKPLAN_HOST));
+    // Bare hash selector: no other operator-managed Secret/NetworkPolicy carries the hash label.
+    let rest_lp = ListParams::default().labels(&hash_selector);
+
+    let _ = pods_api.delete_collection(&dp, &pods_lp).await;
+    let _ = secrets_api.delete_collection(&dp, &rest_lp).await;
+    let _ = netpol_api.delete_collection(&dp, &rest_lp).await;
 
     Ok(())
 }

@@ -60,6 +60,12 @@ pub struct PlaybookPlanSpec {
     /// These host groups will be available in our playbook
     pub inventory_refs: Vec<InventoryRef>,
 
+    /// How long a finished run's Job (and its pod) is kept before Kubernetes' TTL controller
+    /// reaps it. The operator never deletes the Job itself, so this governs the ansible pod's
+    /// lifetime. Values below 60 seconds are silently raised to 60; unset uses the operator's
+    /// default.
+    pub ttl_seconds_after_finished: Option<i32>,
+
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
 }
@@ -256,6 +262,7 @@ mod tests {
                     cluster_inventory: Some("controlplanes".into()),
                     static_inventory: Some("others".into()),
                 }],
+                ttl_seconds_after_finished: None,
                 template: PlaybookTemplate {
                     variables: Some(vec![PlaybookVariableSource::SecretRef {
                         secret_ref: SecretRef {

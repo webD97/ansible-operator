@@ -336,35 +336,43 @@ async fn advance_applying_run(
     // Looked up by the exact recorded name, not the PLAYBOOKPLAN_HASH label — that label is
     // stable across every retry of an unchanged spec, so a label-only `list()` could return
     // an older, already-finished retry's Job instead of the one this run just created.
-    let Some(job_name) = &resource_status.current_job_name else {
+    let Some(job_name) = resource_status.current_job_name.clone() else {
         return Ok(None);
     };
-    let Some(job) = jobs_api.get_opt(job_name).await? else {
-        return Ok(None);
-    };
+    let job = jobs_api.get_opt(&job_name).await?;
 
-    if !status::job_finished(&job) {
+    // Still running -> keep waiting.
+    if let Some(job) = &job
+        && !status::job_finished(job)
+    {
         status::evaluate_playbookplan_conditions(run.hosts_to_trigger, false, None, resource_status);
         return Ok(Some(std::time::Duration::from_secs(15)));
     }
 
-    let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
-    let job_name = job.metadata.name.as_ref().unwrap();
-
-    // The recap is read from the finished container's termination message (what the callback wrote
-    // to /dev/termination-log), not its logs — a dedicated channel that isn't interleaved with
-    // playbook output and needs no `pods/log` access.
-    let recap = pods_api
-        .list(&ListParams {
-            label_selector: Some(format!("job-name={job_name}")),
-            ..Default::default()
-        })
-        .await?
-        .items
-        .iter()
-        .find_map(termination_message);
-
-    let parsed = recap.as_deref().and_then(callback_output::parse_callback_output);
+    // The Job either finished, or is already gone — reaped by Kubernetes' TTL controller (its result
+    // outlived a long operator outage) or deleted out from under us. Both mean the run is over: read
+    // the recap from the pod's termination message if the Job is still there, otherwise the outcome
+    // is lost and every host falls to `Unknown`. Not returning early on a missing Job is what keeps
+    // a reaped run from wedging in `Applying` forever. The recap comes from the container's
+    // termination message (what the callback wrote to /dev/termination-log), not logs — a dedicated
+    // channel that isn't interleaved with playbook output and needs no `pods/log` access.
+    let parsed = match &job {
+        Some(_) => {
+            let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
+            pods_api
+                .list(&ListParams {
+                    label_selector: Some(format!("job-name={job_name}")),
+                    ..Default::default()
+                })
+                .await?
+                .items
+                .iter()
+                .find_map(termination_message)
+                .as_deref()
+                .and_then(callback_output::parse_callback_output)
+        }
+        None => None,
+    };
 
     status::evaluate_host_outcomes(
         run.hosts_to_trigger,
@@ -748,8 +756,8 @@ async fn spawn_ansible_job(
     }
 
     // No active Job for this run — a genuinely new attempt. `retry_count` climbs monotonically so
-    // the new name can't collide with an already-finished attempt's (which would 409 on create
-    // and get silently skipped); it's reset to 0 in `reconcile` whenever `current_hash` changes.
+    // the new name is expected not to collide with an already-finished attempt's; it's reset to 0
+    // in `reconcile` whenever `current_hash` changes.
     resource_status.retry_count += 1;
 
     let job = job_builder::create_job_for_run(
@@ -768,16 +776,38 @@ async fn spawn_ansible_job(
     resource_status.next_run = None;
 
     info!("Creating job {job_name}");
-    api.create(
-        &PostParams {
-            field_manager: Some("ansible-operator".into()),
-            ..Default::default()
-        },
-        &job,
-    )
-    .await?;
+    match api
+        .create(
+            &PostParams {
+                field_manager: Some("ansible-operator".into()),
+                ..Default::default()
+            },
+            &job,
+        )
+        .await
+    {
+        Ok(_) => {}
+        // A Job by this exact name already exists. In principle `retry_count` should always be
+        // ahead of every name already in the cluster, but if a previous tick created a Job and
+        // then errored *before* `patch_status` ran, the bump above never got persisted — so this
+        // tick recomputes the same name a real Job already holds. Treating that as fatal (instead
+        // of adopting it here) would be the actual bug: erroring via `?` skips `patch_status` too,
+        // so nothing this tick would get persisted either, and the next tick would recompute the
+        // exact same name and hit the exact same 409 — a permanent stall on one name, observed
+        // live. Adopting instead means current_job_name/phase are persisted this tick regardless,
+        // so the run can proceed against whatever Job actually holds that name, and the next
+        // genuinely-new attempt computes its retry_count from state that now matches reality.
+        Err(err) if is_conflict(&err) => {
+            info!("Job {job_name} already exists, adopting it");
+        }
+        Err(err) => return Err(err.into()),
+    }
 
     Ok(())
+}
+
+fn is_conflict(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(status) if status.code == 409)
 }
 
 #[cfg(test)]
@@ -887,6 +917,21 @@ mod tests {
         let (_, tolerations) = managed_ssh_hosts_and_tolerations(&groups);
 
         assert_eq!(tolerations, Some(first));
+    }
+
+    #[test]
+    fn is_conflict_matches_only_409() {
+        let conflict = kube::Error::Api(Box::new(kube::core::Status {
+            code: 409,
+            ..Default::default()
+        }));
+        let not_found = kube::Error::Api(Box::new(kube::core::Status {
+            code: 404,
+            ..Default::default()
+        }));
+
+        assert!(is_conflict(&conflict));
+        assert!(!is_conflict(&not_found));
     }
 
     #[test]

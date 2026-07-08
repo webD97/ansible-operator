@@ -16,6 +16,34 @@ use kube::runtime::reflector::Lookup as _;
 /// `/dev/termination-log` carries the recap the reconciler reads back (see `advance_applying_run`).
 pub const ANSIBLE_CONTAINER_NAME: &str = "ansible-playbook";
 
+/// `ttlSecondsAfterFinished` for the ansible Job: the operator never deletes the Job or its pod
+/// itself, it leaves cleanup to Kubernetes' TTL controller so finished runs stay around briefly for
+/// inspection, then get reaped instead of accumulating forever.
+///
+/// Default `ttlSecondsAfterFinished` when a `PlaybookPlan` doesn't set `spec.ttlSecondsAfterFinished`.
+///
+/// Should comfortably exceed the time the operator needs to consume a finished Job's result — the
+/// reconciler reads the run's outcome from the Job's own termination message, so a Job reaped
+/// before that (e.g. across a long operator outage) loses its recap. That no longer wedges the run
+/// — `advance_applying_run` treats a missing finished Job as `Unknown` and lets it retry — but it
+/// costs an unnecessary retry, so keep this generous. One hour is well clear of the seconds-scale
+/// consume latency.
+const DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 3600;
+
+/// Silent floor for a plan-supplied `spec.ttlSecondsAfterFinished`. Below this, the same
+/// reaped-before-consumed risk above becomes likely rather than theoretical, so anything smaller is
+/// quietly raised to it rather than rejected.
+const MIN_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 60;
+
+/// Resolves the effective Job TTL for a plan: its `spec.ttlSecondsAfterFinished` clamped up to
+/// `MIN_JOB_TTL_SECONDS_AFTER_FINISHED`, or the default when unset.
+fn effective_job_ttl(plan: &v1beta1::PlaybookPlan) -> i32 {
+    match plan.spec.ttl_seconds_after_finished {
+        Some(v) => v.max(MIN_JOB_TTL_SECONDS_AFTER_FINISHED),
+        None => DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED,
+    }
+}
+
 use crate::{
     utils,
     v1beta1::{
@@ -56,6 +84,7 @@ pub fn create_job_for_run(
     }
 
     configure_job_for_callback_plugin(&mut job);
+    configure_job_for_node_affinity(&mut job, &managed_ssh_node_names(target_groups));
 
     job.metadata.namespace = Some(pb_namespace.into());
 
@@ -223,6 +252,8 @@ fn create_job_skeleton(
 
     let job_spec = batch::v1::JobSpec {
         backoff_limit: Some(0), // todo: maybe configurable
+        // Cleanup is Kubernetes' job (the TTL controller), not the operator's — see `effective_job_ttl`.
+        ttl_seconds_after_finished: Some(effective_job_ttl(plan)),
         template: pod_template,
         ..Default::default()
     };
@@ -236,6 +267,55 @@ fn has_managed_ssh_group(groups: &[ResolvedInventoryGroup]) -> bool {
     groups
         .iter()
         .any(|g| matches!(g, ResolvedInventoryGroup::ManagedSsh { .. }))
+}
+
+/// The real cluster Node names this run targets over managed-ssh. Only `ManagedSsh` groups map to
+/// actual nodes; `StaticInventory` hosts are arbitrary hostnames/IPs that don't constrain pod
+/// scheduling, so they're excluded.
+fn managed_ssh_node_names(groups: &[ResolvedInventoryGroup]) -> Vec<String> {
+    groups
+        .iter()
+        .filter_map(|g| match g {
+            ResolvedInventoryGroup::ManagedSsh { hosts, .. } => Some(hosts.hosts.iter().cloned()),
+            ResolvedInventoryGroup::Ssh { .. } => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// Softly prefers scheduling the ansible Job pod *off* the nodes this run targets, so a playbook
+/// that disrupts a node (reboot/drain) is less likely to kill its own controller pod mid-run.
+/// Uses `preferredDuringScheduling…` (never `required`): a run targeting every node still schedules
+/// normally — the `NotIn` term then matches no node and the preference is simply a no-op. Skipped
+/// entirely when the run targets no managed-ssh nodes (e.g. StaticInventory-only).
+fn configure_job_for_node_affinity(job: &mut Job, avoid_nodes: &[String]) {
+    if avoid_nodes.is_empty() {
+        return;
+    }
+
+    let affinity = kcore::v1::Affinity {
+        node_affinity: Some(kcore::v1::NodeAffinity {
+            preferred_during_scheduling_ignored_during_execution: Some(vec![
+                kcore::v1::PreferredSchedulingTerm {
+                    weight: 100,
+                    preference: kcore::v1::NodeSelectorTerm {
+                        match_expressions: Some(vec![kcore::v1::NodeSelectorRequirement {
+                            key: "kubernetes.io/hostname".into(),
+                            operator: "NotIn".into(),
+                            values: Some(avoid_nodes.to_vec()),
+                        }]),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    if let Some(pod_spec) = job.spec.as_mut().and_then(|s| s.template.spec.as_mut()) {
+        pod_spec.affinity = Some(affinity);
+    }
 }
 
 /// Distinct `(StaticInventory name, SshConfig)` pairs referenced by this run's groups, deduped
@@ -614,5 +694,130 @@ spec:
         let shortid_1 = name_1.rsplit_once('-').unwrap().0;
         let shortid_2 = name_2.rsplit_once('-').unwrap().0;
         assert_eq!(shortid_1, shortid_2);
+    }
+
+    fn minimal_plan() -> PlaybookPlan {
+        let yaml = r#"
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: an-example
+  namespace: default
+  uid: 11111111-1111-1111-1111-111111111111
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  mode: OneShot
+  inventoryRefs: []
+  template:
+    playbook: |
+      - hosts: all
+        tasks: []
+        "#;
+        serde_yaml::from_str::<PlaybookPlan>(yaml).unwrap()
+    }
+
+    #[test]
+    fn managed_ssh_run_softly_prefers_scheduling_off_targeted_nodes() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{ResolvedHosts, ResolvedInventoryGroup};
+
+        let pp = minimal_plan();
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let groups = vec![ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["node-a".into(), "node-b".into()],
+            },
+            tolerations: None,
+        }];
+
+        let job = super::create_job_for_run(&hash, 1, &groups, &pp).unwrap();
+        let node_affinity = job
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .affinity
+            .expect("affinity should be set for a managed-ssh run")
+            .node_affinity
+            .unwrap();
+
+        // Soft only — a run targeting every node must still schedule, so this is never `required`.
+        assert!(node_affinity
+            .required_during_scheduling_ignored_during_execution
+            .is_none());
+
+        let term = &node_affinity
+            .preferred_during_scheduling_ignored_during_execution
+            .unwrap()[0];
+        assert_eq!(term.weight, 100);
+
+        let req = &term.preference.match_expressions.as_ref().unwrap()[0];
+        assert_eq!(req.key, "kubernetes.io/hostname");
+        assert_eq!(req.operator, "NotIn");
+        assert_eq!(
+            req.values.as_ref().unwrap(),
+            &vec!["node-a".to_string(), "node-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn job_ttl_defaults_and_clamps_to_a_silent_minimum() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let ttl = |plan: &PlaybookPlan| {
+            super::create_job_for_run(&hash, 1, &[], plan)
+                .unwrap()
+                .spec
+                .unwrap()
+                .ttl_seconds_after_finished
+                .unwrap()
+        };
+
+        // Unset -> the operator's default (cleanup is the TTL controller's job, never the operator's).
+        assert_eq!(
+            ttl(&minimal_plan()),
+            super::DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED
+        );
+
+        // Below the floor -> silently raised to the minimum, not rejected.
+        let mut too_small = minimal_plan();
+        too_small.spec.ttl_seconds_after_finished = Some(10);
+        assert_eq!(ttl(&too_small), super::MIN_JOB_TTL_SECONDS_AFTER_FINISHED);
+
+        // At/above the floor -> passed through unchanged.
+        let mut explicit = minimal_plan();
+        explicit.spec.ttl_seconds_after_finished = Some(7200);
+        assert_eq!(ttl(&explicit), 7200);
+    }
+
+    #[test]
+    fn static_inventory_only_run_gets_no_node_affinity() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+        use crate::v1beta1::{ResolvedHosts, ResolvedInventoryGroup, SecretRef, SshConfig};
+
+        let pp = minimal_plan();
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+        let groups = vec![ResolvedInventoryGroup::Ssh {
+            hosts: ResolvedHosts {
+                name: "external".into(),
+                hosts: vec!["ccu.fritz.box".into()],
+            },
+            static_inventory_name: "ccu".into(),
+            config: SshConfig {
+                user: "root".into(),
+                secret_ref: SecretRef {
+                    name: "ssh-key".into(),
+                },
+            },
+        }];
+
+        let job = super::create_job_for_run(&hash, 1, &groups, &pp).unwrap();
+        assert!(
+            job.spec.unwrap().template.spec.unwrap().affinity.is_none(),
+            "StaticInventory hosts aren't cluster nodes, so nothing constrains placement"
+        );
     }
 }
