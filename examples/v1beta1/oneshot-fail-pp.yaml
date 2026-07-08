@@ -1,17 +1,14 @@
 apiVersion: ansible.cloudbending.dev/v1beta1
-kind: StaticInventory
+kind: NodeAccessPolicy
 metadata:
-  name: oneshot-fail
+  name: full-cluster
 spec:
-  hosts:
-    - name: all
-      hosts:
-        - homelab-worker-0
-        - homelab-worker-1
-  ssh:
-    user: root
-    secretRef:
-      name: ssh-key
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: default
+  nodeSelector:
+    matchExpressions:
+      - { key: kubernetes.io/hostname, operator: Exists }
 ---
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: ClusterInventory

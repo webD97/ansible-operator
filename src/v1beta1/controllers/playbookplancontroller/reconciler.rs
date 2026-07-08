@@ -11,7 +11,7 @@ use kube::{
     runtime::{
         Controller,
         controller::Action,
-        reflector::{ObjectRef, store::Writer},
+        reflector::{ObjectRef, Store, store::Writer},
         watcher,
     },
 };
@@ -19,7 +19,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
-    AnsibleInventory, ClusterInventory, ExecutionMode, Phase, PlaybookPlanStatus,
+    AnsibleInventory, ClusterInventory, ExecutionMode, NodeAccessPolicy, Phase, PlaybookPlanStatus,
     ResolvedInventoryGroup, StaticInventory, Toleration, ansible, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
@@ -37,7 +37,7 @@ use crate::{
         playbookplancontroller::{
             callback_output,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, status,
+            job_builder, mappers, node_access, status,
         },
     },
 };
@@ -51,6 +51,11 @@ struct ReconciliationContext {
     /// The operator's self-managed SSH certificate authority — generated once at startup if
     /// missing, no auto-rotation in v1.
     ca: Arc<CertificateAuthority>,
+    /// Reflector-backed cache of the admin-authored `NodeAccessPolicy` resources in the operator
+    /// namespace, read by `node_access::enforce` to clamp managed-ssh nodes without a per-reconcile
+    /// list. Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
+    /// affected plans via `mappers::node_access_policy_to_playbookplans`.
+    node_access_policies: Arc<Store<NodeAccessPolicy>>,
 }
 
 /// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
@@ -75,15 +80,12 @@ pub fn new(
         kube::runtime::controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
-    let context = Arc::new(ReconciliationContext {
-        client: client.clone(),
-        operator_namespace,
-        ca,
-    });
-
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
     let jobs_api: Api<Job> = Api::all(client.clone());
-    let secrets_api: Api<Secret> = Api::all(client);
+    let secrets_api: Api<Secret> = Api::all(client.clone());
+    // Policies only ever govern managed-ssh in the operator namespace, so cache/watch just those.
+    let node_access_policies_api: Api<NodeAccessPolicy> =
+        Api::namespaced(client.clone(), &operator_namespace);
 
     let playbookplan_reflector_reader = {
         let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
@@ -108,12 +110,46 @@ pub fn new(
         playbookplan_reflector_reader
     };
 
+    let node_access_policy_reflector_reader = {
+        let writer = Writer::<NodeAccessPolicy>::default();
+        let reader = Arc::new(writer.as_reader());
+
+        let reflector = kube::runtime::reflector(
+            writer,
+            watcher(node_access_policies_api.clone(), watcher::Config::default()),
+        );
+
+        tokio::spawn(async move {
+            reflector
+                .for_each(|event| async {
+                    if let Err(e) = event {
+                        error!("NodeAccessPolicy reflector error: {e:?}");
+                    }
+                })
+                .await;
+        });
+
+        reader
+    };
+
+    let context = Arc::new(ReconciliationContext {
+        client,
+        operator_namespace,
+        ca,
+        node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
+    });
+
     Controller::new(playbookplans_api, watcher::Config::default())
         .owns(jobs_api, watcher::Config::default())
         .watches(
             secrets_api,
             watcher::Config::default(),
             mappers::secret_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
+        .watches(
+            node_access_policies_api,
+            watcher::Config::default(),
+            mappers::node_access_policy_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
         )
         .run(
             reconcile,
@@ -148,7 +184,25 @@ async fn reconcile(
 
     // Step 0: resolve inventory (kept separate per-resource, not flattened — connection
     // mechanism is implicit by which resource produced a group).
-    let target_groups = resolve_inventory(&context, &object).await?;
+    let mut target_groups = resolve_inventory(&context, &object).await?;
+
+    // Step 0b: NodeAccessPolicy enforcement — clamp managed-ssh (ClusterInventory) nodes to what
+    // this namespace is permitted to target, before eligible_hosts and any proxy infra derive from
+    // them. Fail-closed: an ungoverned namespace resolves to zero managed-ssh nodes.
+    let excluded_nodes = node_access::enforce(
+        &context.client,
+        &context.node_access_policies,
+        namespace,
+        &mut target_groups,
+    )
+    .await?;
+    if !excluded_nodes.is_empty() {
+        warn!(
+            "NodeAccessPolicy excluded nodes {excluded_nodes:?} from {namespace}/{name} \
+             (not granted to this namespace)"
+        );
+    }
+
     resource_status.eligible_hosts = flatten_hosts(&target_groups);
 
     let related_secrets = get_related_secrets(&object);

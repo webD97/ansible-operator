@@ -4,6 +4,7 @@ mod job_builder;
 mod locking;
 mod managed_ssh;
 mod mappers;
+mod node_access;
 mod paths;
 pub mod reconciler;
 mod status;

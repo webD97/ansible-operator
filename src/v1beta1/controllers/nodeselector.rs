@@ -51,7 +51,12 @@ fn node_matches_match_expressions(
     use kube::ResourceExt as _;
     let labels = node.labels();
 
-    exprs.iter().all(|expr| match expr.operator {
+    exprs.iter().all(|expr| eval_expression(labels, expr))
+}
+
+/// Evaluates a single `matchExpressions` term against a raw label map.
+fn eval_expression(labels: &BTreeMap<String, String>, expr: &SelectorExpression) -> bool {
+    match expr.operator {
         SelectorOperator::In => {
             matches_expression_in(labels, &expr.key, expr.values.as_deref().unwrap_or(&[]))
         }
@@ -60,7 +65,55 @@ fn node_matches_match_expressions(
         }
         SelectorOperator::Exists => matches_expression_exists(labels, &expr.key),
         SelectorOperator::DoesNotExist => matches_expression_doesnotexist(labels, &expr.key),
-    })
+    }
+}
+
+/// Evaluates a label selector against a raw label map with Kubernetes' **default** semantics: an
+/// absent `matchLabels`/`matchExpressions` imposes no constraint, so an entirely empty selector
+/// matches *everything*. Works on any object's labels (Node, Namespace, …).
+pub fn selector_matches(
+    labels: &BTreeMap<String, String>,
+    selector: &v1beta1::NodeSelectorTerm,
+) -> bool {
+    let matches_labels = selector
+        .match_labels
+        .as_ref()
+        .map(|ml| {
+            ml.iter()
+                .all(|(k, v)| labels.get(k).is_some_and(|actual| actual == v))
+        })
+        .unwrap_or(true);
+
+    let matches_expressions = selector
+        .match_expressions
+        .as_ref()
+        .map(|exprs| exprs.iter().all(|expr| eval_expression(labels, expr)))
+        .unwrap_or(true);
+
+    matches_labels && matches_expressions
+}
+
+/// **Fail-closed** variant for authorization ceilings such as `NodeAccessPolicy`: an *empty*
+/// selector (no `matchLabels` entries and no `matchExpressions`) matches *nothing* rather than
+/// everything. Any non-empty selector is evaluated exactly as [`selector_matches`]. This is the
+/// opposite default from [`node_matches`]/[`selector_matches`] and must be used wherever an empty
+/// selector should grant no access.
+pub fn selector_matches_fail_closed(
+    labels: &BTreeMap<String, String>,
+    selector: &v1beta1::NodeSelectorTerm,
+) -> bool {
+    let is_empty = selector
+        .match_labels
+        .as_ref()
+        .map(|m| m.is_empty())
+        .unwrap_or(true)
+        && selector
+            .match_expressions
+            .as_ref()
+            .map(|e| e.is_empty())
+            .unwrap_or(true);
+
+    !is_empty && selector_matches(labels, selector)
 }
 
 fn matches_expression_in(
@@ -404,5 +457,61 @@ mod tests {
             values: None,
         }];
         assert!(node_matches_match_expressions(&node, &exprs));
+    }
+
+    // --- fail-closed selector matching (NodeAccessPolicy) ---
+
+    use super::{selector_matches, selector_matches_fail_closed};
+
+    fn labels(pairs: impl IntoIterator<Item = (&'static str, &'static str)>) -> BTreeMap<String, String> {
+        pairs
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn selector_matches_empty_selector_matches_everything() {
+        // Default (non-fail-closed) semantics: empty selector matches any labels.
+        let empty = NodeSelectorTerm::default();
+        assert!(selector_matches(&labels([("a", "1")]), &empty));
+        assert!(selector_matches(&labels([]), &empty));
+    }
+
+    #[test]
+    fn fail_closed_empty_selector_matches_nothing() {
+        // The security-critical inversion: an empty ceiling grants no access.
+        let empty = NodeSelectorTerm::default();
+        assert!(!selector_matches_fail_closed(&labels([("a", "1")]), &empty));
+        assert!(!selector_matches_fail_closed(&labels([]), &empty));
+
+        // An empty matchLabels map (not just `None`) is still "empty" → nothing.
+        let empty_map = NodeSelectorTerm {
+            match_labels: Some(label_selector([])),
+            match_expressions: Some(vec![]),
+        };
+        assert!(!selector_matches_fail_closed(&labels([("a", "1")]), &empty_map));
+    }
+
+    #[test]
+    fn fail_closed_nonempty_selector_matches_like_normal() {
+        let sel = NodeSelectorTerm {
+            match_labels: Some(label_selector([("node-pool", "business")])),
+            match_expressions: None,
+        };
+        assert!(selector_matches_fail_closed(&labels([("node-pool", "business")]), &sel));
+        assert!(!selector_matches_fail_closed(&labels([("node-pool", "platform")]), &sel));
+
+        // "Allow all" must be expressed explicitly, e.g. Exists on a ubiquitous label.
+        let all = NodeSelectorTerm {
+            match_labels: None,
+            match_expressions: Some(vec![SelectorExpression {
+                operator: SelectorOperator::Exists,
+                key: "kubernetes.io/hostname".to_string(),
+                values: None,
+            }]),
+        };
+        assert!(selector_matches_fail_closed(&labels([("kubernetes.io/hostname", "n1")]), &all));
+        assert!(!selector_matches_fail_closed(&labels([("other", "x")]), &all));
     }
 }

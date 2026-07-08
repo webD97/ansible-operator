@@ -12,6 +12,11 @@ pub struct NodeSelectorTerm {
     pub match_expressions: Option<Vec<SelectorExpression>>,
 }
 
+/// A `matchLabels` + `matchExpressions` label selector — structurally identical to
+/// `NodeSelectorTerm`, aliased for readability where the target is something other than a Node
+/// (e.g. a namespace selector). Kubernetes' own `metav1.LabelSelector` has the same two fields.
+pub type LabelSelector = NodeSelectorTerm;
+
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectorExpression {

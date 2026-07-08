@@ -30,12 +30,14 @@ async fn main() {
         let playbookplan = v1beta1::PlaybookPlan::crd();
         let cluster_inventory = v1beta1::ClusterInventory::crd();
         let static_inventory = v1beta1::StaticInventory::crd();
+        let node_access_policy = v1beta1::NodeAccessPolicy::crd();
         println!(
             "{}",
             [
                 serde_yaml::to_string(&playbookplan).unwrap(),
                 serde_yaml::to_string(&cluster_inventory).unwrap(),
-                serde_yaml::to_string(&static_inventory).unwrap()
+                serde_yaml::to_string(&static_inventory).unwrap(),
+                serde_yaml::to_string(&node_access_policy).unwrap()
             ]
             .join("---\n")
         );
@@ -64,14 +66,26 @@ async fn main() {
             });
 
     let inventory_controller =
-        v1beta1::clusterinventorycontroller::new(client).for_each(|res| async move {
+        v1beta1::clusterinventorycontroller::new(client.clone()).for_each(|res| async move {
             match res {
                 Ok(o) => debug!("reconciled {:?}", o),
                 Err(e) => warn!("reconcile failed: {:?}", e),
             }
         });
 
-    join!(playbookplan_controller, inventory_controller);
+    let node_access_policy_controller =
+        v1beta1::nodeaccesspolicycontroller::new(client).for_each(|res| async move {
+            match res {
+                Ok(o) => debug!("reconciled {:?}", o),
+                Err(e) => warn!("reconcile failed: {:?}", e),
+            }
+        });
+
+    join!(
+        playbookplan_controller,
+        inventory_controller,
+        node_access_policy_controller
+    );
 }
 
 /// Loads the operator's CA from its Secret in `operator_namespace` if one already exists,

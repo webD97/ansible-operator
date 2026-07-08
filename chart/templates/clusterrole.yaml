@@ -13,7 +13,7 @@ rules:
   # Only PlaybookPlan and ClusterInventory have controllers writing status (StaticInventory has
   # no controller of its own today).
   - apiGroups: ["ansible.cloudbending.dev"]
-    resources: ["playbookplans/status", "clusterinventories/status"]
+    resources: ["playbookplans/status", "clusterinventories/status", "nodeaccesspolicies/status"]
     verbs: ["get", "update"]
   # One Job per PlaybookPlan run, across whichever namespace the plan lives in. Watched via
   # Controller::owns() so the reconciler re-runs when a Job's status changes.
@@ -37,4 +37,14 @@ rules:
   # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped).
   - apiGroups: [""]
     resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # NodeAccessPolicy enforcement reads the plan namespace's labels to match a policy's
+  # namespaceSelector (Namespaces are cluster-scoped).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # NodeAccessPolicy resources are admin-authored and only ever read by the operator (they live in
+  # the operator's own namespace; see also the Role). Read cluster-wide for simplicity/watch reuse.
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["nodeaccesspolicies"]
     verbs: ["get", "list", "watch"]
