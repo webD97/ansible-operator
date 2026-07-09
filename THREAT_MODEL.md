@@ -34,7 +34,7 @@ valid certificate.* Everything below exists to constrain that.
 The operator is therefore a **cluster-privileged component**: compromise of the
 operator, its service account, or its CA is equivalent to root on every node it can
 schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
-(the operator ns ∪ `watchNamespaces`; no longer the whole cluster — see §8, RBAC / R1).
+(the operator ns ∪ `watchNamespaces` — not the whole cluster; see §8, RBAC).
 ---
 
 ## 2. Assets
@@ -42,10 +42,10 @@ schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
 | # | Asset | Why it matters |
 |---|-------|----------------|
 | A1 | **Root on cluster nodes** (via proxy pods) | The ultimate target. Node-root ⇒ container escape, kubelet credential theft, cluster takeover. |
-| A2 | **The operator's SSH CA private key** (in-memory only, held in the operator process) | Signs *both* host and client certs. Whoever holds it can mint a client cert with principal `root` and SSH into any proxy pod → A1. Never persisted to the cluster; an operator restart rotates it. Still no in-process rotation or revocation. |
+| A2 | **The operator's SSH CA private key** (in-memory only, held in the operator process) | Signs *both* host and client certs. Whoever holds it can mint a client cert with principal `root` and SSH into any proxy pod → A1. Never persisted to the cluster; an operator restart rotates it. No in-process rotation or revocation. |
 | A3 | **Per-run client-cert Secret** (`managed-ssh-client-<hash>`, plan ns) | A live credential trusted by every proxy pod of that run. Mounted into the Job pod. |
 | A4 | **NodeAccessPolicy resources** (operator ns) | The admin-authored ceiling that decides which namespace may target which nodes. Tampering = privilege escalation to more nodes. |
-| A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read Secrets in enrolled namespaces (operator ns ∪ `watchNamespaces`), not cluster-wide (R1). |
+| A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read Secrets in its enrolled namespaces (operator ns ∪ `watchNamespaces`), not cluster-wide. |
 | A6 | **Playbook content & execution integrity** | The playbook runs as root on nodes. Tampering with it = arbitrary node code execution. |
 | A7 | **Cluster control plane / node kubelet identities** | Reachable *from* a rooted node (A1); the blast radius of A1. |
 
@@ -102,7 +102,7 @@ flowchart TB
   is *intentionally collapsed* — that is the feature. The controls are all upstream of
   the SSH session (who gets a cert, which node the pod lands on).
 - **TB-4 — Admin → Operator (policy authorship).** `NodeAccessPolicy` lives in the operator
-  namespace, writable only by the admin (the CA is no longer a Secret — the operator mints it
+  namespace, writable only by the admin (the CA is not a Secret — the operator mints it
   in memory). The value of the whole scheme is that policy and request come from
   **independent principals** (see §5, T-ESC-1).
 
@@ -205,10 +205,10 @@ for the next scheduled reconcile.
 
 **T-INFO-1 — Operator's Secret access (scoped to enrolled namespaces).**
 Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
-(`role.yaml`/`rolebinding.yaml`), **not** cluster-wide — the `ClusterRole` no longer mentions
+(`role.yaml`/`rolebinding.yaml`), **not** cluster-wide — the `ClusterRole` does not mention
 `secrets` (nor `jobs`/`pods`). The enrolled set = the operator's own namespace ∪ the chart's
 `watchNamespaces`. `jobs: create` and `pods: get,list,watch` are likewise scoped to the enrolled set.
-- *Mitigation (R1, implemented):* the operator can read/write Secrets and create Jobs only in
+- *Mitigation:* the operator can read/write Secrets and create Jobs only in
   namespaces an admin has explicitly enrolled — enrolment is an intentional "this namespace may drive
   node-root runs" decision, authored in `watchNamespaces` (static Helm/GitOps config, no runtime
   `rolebindings` write by the operator). A plan in a non-enrolled namespace is refused with
@@ -217,21 +217,20 @@ Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
 - *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
   disclosure of Secrets in *those* namespaces and a Job-create write primitive *there*. Widening
   `watchNamespaces` widens the blast radius accordingly; enrol conservatively.
-- *Severity:* **Medium** — reduced from High: compromise no longer discloses *every* Secret in the
-  cluster nor grants a cluster-wide Job-create primitive; the blast radius is bounded to the enrolled
-  namespaces. See R1.
+- *Severity:* **Medium** — compromise discloses Secrets and yields a Job-create primitive only within
+  the enrolled namespaces, not cluster-wide; the blast radius is bounded to the enrolled namespaces.
 
 **T-INFO-2 — CA private key disclosure.**
 - *Mitigation:* the CA is generated in-memory at operator startup and **never persisted** —
   no Secret, nothing in etcd, never logged; only the private→public and signing operations
   are exposed in code (`ca.rs`). An operator restart rotates the CA.
-- *Residual:* the attack surface is now the running operator process itself — operator RCE or
-  a process-memory read obtains A2 ⇒ mint `root` client certs ⇒ node-root on all reachable
-  nodes. `get secret` in the operator namespace and etcd-at-rest no longer disclose it. No
-  in-process rotation/revocation: within one operator lifetime a leaked cert is valid for its
-  full 2h `CERT_VALIDITY`.
-- *Severity:* **High** — reduced from Critical: disclosure now requires code execution or
-  memory access in the operator process, not merely read access to a Secret or etcd.
+- *Residual:* the attack surface is the running operator process itself — operator RCE or
+  a process-memory read obtains A2 ⇒ mint a client cert bearing a live run's hash principal ⇒
+  node-root on that run's reachable nodes. `get secret` in the operator namespace and
+  etcd-at-rest do not disclose it. No in-process rotation/revocation: a leaked CA can keep
+  minting certs for as long as the operator process runs (a restart rotates it).
+- *Severity:* **High** — disclosure requires code execution or memory access in the operator
+  process; read access to a Secret or to etcd-at-rest does not expose the key.
 
 **T-INFO-3 — Cross-run credential reuse via a shared CA.**
 Every proxy pod trusts the *same* CA, so a CA-signed client cert is not, on its own, bound
@@ -240,14 +239,18 @@ to a single run.
   `AuthorizedPrincipalsFile` listing **only its own run's execution hash** (`build_secret`),
   and each run's client cert carries that hash as a principal (`ensure_client_cert`). sshd
   therefore rejects a cert whose hash principal doesn't match the proxy's run — a stray/leaked
-  client cert from another run is refused at the cert layer, independent of network reach.
+  client cert from another run is refused at the cert layer, independent of network reach
+  (verified end-to-end against the prod proxy sshd image by `managed_ssh::container_tests`).
 - *Mitigation (defense in depth):* `build_network_policy` additionally restricts proxy-pod
   ingress to the Job pod in the plan namespace bearing the matching hash label.
 - *Residual:* an attacker who can both reach another run's proxy pod IP **and** obtain that
   run's *own* client cert (A3) is still inside its own run's authorization — no cross-run
-  escalation. Certs remain valid for their full 2h `CERT_VALIDITY` with no revocation.
-- *Severity:* **Low** — cross-run reuse now requires forging a hash principal (needs the CA
-  key, i.e. T-INFO-2), not merely defeating NetworkPolicy. See R3 and §7 INV-4.
+  escalation. A leaked client cert authenticates **only** to its own run's proxy pods, and those
+  pods (plus the cert Secret) are deleted when the run completes (`cleanup_proxy_infra`); its 2h
+  `CERT_VALIDITY` is thus only exploitable while those pods are alive, and deleting them is
+  effectively immediate revocation. No other or future proxy accepts that principal.
+- *Severity:* **Low** — cross-run reuse requires forging a hash principal (needs the CA
+  key, i.e. T-INFO-2), not merely defeating NetworkPolicy. See §7 INV-4.
 
 ### Denial of service
 
@@ -348,17 +351,17 @@ This design is **only** as strong as the environment it runs in. The following a
 **requirements**, not recommendations:
 
 1. **A NetworkPolicy-enforcing CNI is strongly recommended (defense in depth).** Cross-run
-   isolation is now enforced primarily at the sshd cert layer — each proxy accepts only its own
-   run's hash principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI no
-   longer collapses it. NetworkPolicy still limits reachability to node-root proxy pods and blocks
+   isolation is enforced primarily at the sshd cert layer — each proxy accepts only its own
+   run's hash principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI does
+   not collapse it. NetworkPolicy still limits reachability to node-root proxy pods and blocks
    non-cert traffic; keep it on for multi-tenant.
 2. **Deploy a `NodeAccessPolicy` for the operator namespace before/at rollout.**
    Enforcement is always-on and fail-closed; absent a policy, managed-ssh plans resolve to
    zero nodes (T-DOS-2). See the `cluster-admins` doc in
    [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
 3. **Lock down the operator namespace.** It runs the node-root proxy pods and the Tier-0
-   operator ServiceAccount, and holds per-run client-cert Secrets (A3). The CA itself no longer
-   lives here (in-memory only, A2), but operator compromise still yields it. Restrict RBAC,
+   operator ServiceAccount, and holds per-run client-cert Secrets (A3). The CA itself does not
+   live here (in-memory only, A2), but operator compromise still yields it. Restrict RBAC,
    enable etcd encryption at rest, and treat this namespace as Tier-0.
 4. **Author policies against immutable/admin-controlled labels** (`kubernetes.io/metadata.name`
    for namespaces; admin-managed node pool labels), never tenant-settable ones (T-ESC-3).
@@ -400,39 +403,43 @@ Any change touching these paths should re-verify the corresponding unit tests an
 ## 8. Operator privilege summary (blast radius)
 
 From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
-[`role.yaml`](chart/templates/role.yaml) (operator ns):
+[`role.yaml`](chart/templates/role.yaml) (rendered once per enrolled namespace):
 
 | Resource | Verbs | Scope | Risk note |
 |----------|-------|-------|-----------|
-| secrets | get,list,watch,create,patch | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces (R1). Not cluster-wide. |
+| secrets | get,list,watch,create,patch | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces, not cluster-wide. |
 | secrets | delete,deletecollection | operator ns | Run cleanup. |
-| jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns (R1). Not cluster-wide. |
-| pods | get,list,watch | **enrolled ns only** | Read termination message (R1). Not cluster-wide. |
+| jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. |
+| pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
 | networkpolicies | get,list,watch,create,delete,deletecollection | operator ns | Run isolation. |
 | leases | full | operator ns | Per-node mutual exclusion. |
 | nodes | get,list,watch | cluster-wide | Selector resolution / NAP allow-set (cluster-scoped resource). |
 | namespaces | get,list,watch | cluster-wide | namespaceSelector matching (cluster-scoped resource). |
-| playbookplans/clusterinventories/staticinventories/nodeaccesspolicies | get,list,watch (+/status update) | cluster-wide | CRDs — read cluster-wide so plans in non-enrolled namespaces are seen and reported. |
+| playbookplans/clusterinventories/staticinventories/nodeaccesspolicies | get,list,watch | cluster-wide | CRDs — read cluster-wide so plans in non-enrolled namespaces are seen and reported. |
+| playbookplans/clusterinventories/nodeaccesspolicies (/status) | get,update | cluster-wide | Status writes (incl. `UnauthorizedNamespace`); StaticInventory has no status-writing controller. |
 
 The *enrolled set* = the operator's own namespace (always) ∪ the chart's `watchNamespaces`. The
 `secrets`/`jobs`/`pods` grants live in a per-enrolled-namespace `Role`/`RoleBinding`, not the
 `ClusterRole` (see [`role.yaml`](chart/templates/role.yaml)).
 
-**Net:** the operator remains **Tier-0** for node-root capability *on enrolled namespaces*, but
-operator compromise no longer implies whole-cluster Secret disclosure or a cluster-wide Job-create
-primitive — the blast radius is bounded to the enrolled namespaces. A cluster with node-root reach
-into only a few enrolled tenant namespaces is materially smaller than "≈ cluster compromise."
+**Net:** the operator is **Tier-0** for node-root capability *on enrolled namespaces*. Operator
+compromise does not imply whole-cluster Secret disclosure or a cluster-wide Job-create primitive —
+the blast radius is bounded to the enrolled namespaces. Node-root reach into only a few enrolled
+tenant namespaces is materially smaller than "≈ cluster compromise."
 
 ---
 
-## 9. Residual risks & prioritized recommendations
+## 9. Residual risks & open recommendations
+
+The mitigations described in §5 and §8 are implemented and in place; the items below are the
+residual risks that remain open. (R1 — scoping Secret/Job/Pod access to enrolled namespaces — is
+fully implemented and carries no open tail; see T-INFO-1 and §8.)
 
 | ID | Recommendation | Addresses | Priority |
 |----|----------------|-----------|----------|
-| R1 | **Done:** Secret/Job/Pod access is no longer cluster-wide — it is granted per enrolled namespace (`Role`/`RoleBinding` driven by the chart's `watchNamespaces`; the operator's own namespace is always enrolled). The `ClusterRole` keeps only genuinely cluster-scoped access (nodes, namespaces, CRD reads). Enrolment is static admin/GitOps config read from a mounted ConfigMap at startup (a change rolls the pod via `checksum/config`); fail-closed — a plan in a non-enrolled namespace gets `phase: UnauthorizedNamespace`, and there is no cluster-wide escape hatch. Bounds operator compromise to the enrolled namespaces. Still open: nothing further required for R1; tenants should enrol conservatively. | T-INFO-1 | Low |
-| R2 | **Partly done:** the CA is now ephemeral and in-memory — regenerated every operator restart, never persisted — so restart *is* the rotation mechanism and the persisted-Secret/etcd disclosure path for T-INFO-2 is gone. (Cross-run cert reuse is separately handled by R3's per-run principal enforcement, so a per-run CA is no longer needed for that.) Still open: shorter cert validity and a CRL/short TTL to bound a leaked cert's lifetime (currently 2h, no revocation). | T-INFO-2 | Low |
-| R3 | **Mostly done:** run isolation no longer depends solely on NetworkPolicy — each proxy pod's sshd enforces a per-run `AuthorizedPrincipalsFile` containing only that run's execution hash, and the client cert carries it as a principal, so a stray cert can't open another run's proxy (`build_secret`/`ensure_client_cert`). Verified end-to-end against a real sshd (the prod proxy image) by `managed_ssh::container_tests` — foreign-run cert refused, own-run cert accepted, StrictModes tolerant of the rendered files. Still open: bind the principal to specific *host(s)* (not just the run) for intra-run host scoping, and document the CNI/defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3, T-SPOOF-1 | Low |
+| R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter `CERT_VALIDITY` or a CRL adds little. | T-INFO-2 | Low |
+| R3 | Bind the client-cert principal to specific *host(s)*, not just the run, for intra-run host scoping; document the CNI / defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3 | Low |
 | R4 | Ship a linter/validating admission example that rejects NodeAccessPolicies keyed on tenant-settable labels; recommend `kubernetes.io/metadata.name` in docs (already in type docs). | T-ESC-3 | Medium |
 | R5 | Pin `DEFAULT_PROXY_IMAGE` to a digest of a trusted, minimal sshd image; document image-signature/admission verification. | T-ESC-5 | Medium |
 | R6 | Persist/ship proxy sshd session logs and emit a structured audit event per node-root session for attribution. | T-REP-1 | Medium |
@@ -466,3 +473,6 @@ into only a few enrolled tenant namespaces is materially smaller than "≈ clust
 - Scoping of a client to "its own" proxies is **cert-level**: each proxy pod's sshd sets
   `AuthorizedPrincipalsFile` to a file containing only that run's `<hash>`, so it accepts only
   this run's client cert. The per-run NetworkPolicy is defense in depth on top — see T-INFO-3 / R3.
+- Because the principal is run-scoped and the proxy pods (and the client-cert Secret) are deleted
+  on run completion (`cleanup_proxy_infra`), a client cert is inert once its run ends — nothing on
+  the cluster will accept it, regardless of the 2h validity remaining.
