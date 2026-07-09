@@ -46,6 +46,12 @@ const HOST_CERT_FILENAME: &str = "ssh_host_ed25519_key-cert.pub";
 const CA_PUB_FILENAME: &str = "ca.pub";
 const ENTER_HOST_SCRIPT_FILENAME: &str = "enter-host.sh";
 
+/// Per-run principals file for sshd's `AuthorizedPrincipalsFile`. It contains **only this run's
+/// execution hash** (see `build_secret`) — never `root`. That scopes the proxy to certs carrying
+/// that run's hash principal, so a leaked/strayed client cert from another run is rejected at the
+/// sshd cert-principal layer, not just by the per-run NetworkPolicy (THREAT_MODEL R3 / T-INFO-3).
+const AUTHORIZED_PRINCIPALS_FILENAME: &str = "authorized_principals";
+
 /// Placeholder value for the `Subsystem sftp` directive, never executed as a binary. Without a
 /// `Subsystem sftp` line, sshd rejects sftp requests before `ForceCommand` ever runs; declaring
 /// one (even a nonsense one) is what makes sshd hand the request to `ForceCommand` instead, which
@@ -80,7 +86,10 @@ pub enum ProxyReadiness {
 /// which are already valid Kubernetes object name components. The run uses `utils::generate_id`'s
 /// short-id, matching `job_builder::create_job_for_run`'s Job naming.
 fn resource_name(host: &str, execution_hash: &ExecutionHash) -> String {
-    format!("ansible-sshd-{host}-{}", utils::generate_id(**execution_hash))
+    format!(
+        "ansible-sshd-{host}-{}",
+        utils::generate_id(**execution_hash)
+    )
 }
 
 /// Name of this run's client-cert Secret, shared by `job_builder`'s mount and `ensure_client_cert`.
@@ -90,7 +99,10 @@ pub fn client_cert_secret_name(execution_hash: &ExecutionHash) -> String {
 
 fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
-        (labels::PLAYBOOKPLAN_HASH.to_string(), execution_hash.to_string()),
+        (
+            labels::PLAYBOOKPLAN_HASH.to_string(),
+            execution_hash.to_string(),
+        ),
         (labels::PLAYBOOKPLAN_HOST.to_string(), host.to_string()),
     ])
 }
@@ -105,6 +117,7 @@ fn render_sshd_config() -> String {
          HostKey {SSHD_CONFIG_MOUNT_PATH}/{HOST_KEY_FILENAME}\n\
          HostCertificate {SSHD_CONFIG_MOUNT_PATH}/{HOST_CERT_FILENAME}\n\
          TrustedUserCAKeys {SSHD_CONFIG_MOUNT_PATH}/{CA_PUB_FILENAME}\n\
+         AuthorizedPrincipalsFile {SSHD_CONFIG_MOUNT_PATH}/{AUTHORIZED_PRINCIPALS_FILENAME}\n\
          ForceCommand {SSHD_CONFIG_MOUNT_PATH}/{ENTER_HOST_SCRIPT_FILENAME}\n\
          PermitRootLogin yes\n\
          PasswordAuthentication no\n\
@@ -171,6 +184,14 @@ fn build_secret(
     string_data.insert(HOST_KEY_FILENAME.to_string(), host_key_openssh);
     string_data.insert(HOST_CERT_FILENAME.to_string(), host_cert);
     string_data.insert(CA_PUB_FILENAME.to_string(), ca_pub);
+    // ONLY this run's hash — never "root". This is the sole principal sshd's
+    // `AuthorizedPrincipalsFile` will accept, so a client cert from any other run (whose hash
+    // differs) is rejected even if it can reach this pod. Must match the client cert's hash
+    // principal minted in `ensure_client_cert`.
+    string_data.insert(
+        AUTHORIZED_PRINCIPALS_FILENAME.to_string(),
+        format!("{execution_hash}\n"),
+    );
     string_data.insert("sshd_config".to_string(), render_sshd_config());
     string_data.insert(
         ENTER_HOST_SCRIPT_FILENAME.to_string(),
@@ -284,8 +305,7 @@ fn build_pod(
                 "kubernetes.io/hostname".into(),
                 host.into(),
             )])),
-            tolerations: tolerations
-                .map(|ts| ts.iter().map(|t| t.clone().into()).collect()),
+            tolerations: tolerations.map(|ts| ts.iter().map(|t| t.clone().into()).collect()),
             ..Default::default()
         }),
         ..Default::default()
@@ -348,23 +368,21 @@ fn build_network_policy(
     }
 }
 
-/// Ensures this run's client-cert Secret exists — one client identity trusted by every proxy pod
-/// via the CA, not per-host `authorized_keys`. Idempotent.
-async fn ensure_client_cert(
-    secrets_api: &Api<Secret>,
-    execution_hash: &ExecutionHash,
+/// Renders this run's client-cert files — private key, a cert signed for `["root", <hash>]`, and
+/// the `@cert-authority` known_hosts line — as a `filename -> contents` map. Split out from
+/// `ensure_client_cert` (which just wraps this in a Secret) so tests can exercise the exact client
+/// material the Job pod mounts against a real sshd, rather than re-deriving it.
+///
+/// The run hash is the *enforced* principal: each proxy pod's `AuthorizedPrincipalsFile` lists only
+/// its own run's hash, so this cert authenticates only to this run's proxies. "root" is kept as a
+/// harmless second principal (belt-and-suspenders for sshd's default username check on builds/configs
+/// where `AuthorizedPrincipalsFile` isn't in force); `PermitRootLogin yes` authorizes the root login.
+fn render_client_cert_files(
     ca: &CertificateAuthority,
-) -> Result<(), ReconcileError> {
-    let name = client_cert_secret_name(execution_hash);
-
-    if secrets_api.get_opt(&name).await?.is_some() {
-        return Ok(());
-    }
-
+    execution_hash: &ExecutionHash,
+) -> Result<BTreeMap<String, String>, ReconcileError> {
     let client_key = crate::v1beta1::ca::generate_ephemeral_keypair()?;
     let principal = execution_hash.to_string();
-    // "root" must be a principal to match `PermitRootLogin yes` (sshd requires the connecting
-    // username to be in the cert's principal list); the execution-hash is just an identity marker.
     let client_cert = ca.sign_client_cert(client_key.public_key(), &["root", &principal])?;
     let ca_pub = ca.public_key_openssh()?;
 
@@ -386,6 +404,24 @@ async fn ensure_client_cert(
         paths::MANAGED_SSH_KNOWN_HOSTS_FILENAME.to_string(),
         format!("@cert-authority * {ca_pub}"),
     );
+
+    Ok(string_data)
+}
+
+/// Ensures this run's client-cert Secret exists — one client identity trusted by every proxy pod
+/// via the CA, not per-host `authorized_keys`. Idempotent.
+async fn ensure_client_cert(
+    secrets_api: &Api<Secret>,
+    execution_hash: &ExecutionHash,
+    ca: &CertificateAuthority,
+) -> Result<(), ReconcileError> {
+    let name = client_cert_secret_name(execution_hash);
+
+    if secrets_api.get_opt(&name).await?.is_some() {
+        return Ok(());
+    }
+
+    let string_data = render_client_cert_files(ca, execution_hash)?;
 
     let secret = Secret {
         metadata: ObjectMeta {
@@ -511,8 +547,8 @@ pub async fn cleanup_proxy_infra(
     let hash_selector = format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH);
 
     // Existence of PLAYBOOKPLAN_HOST spares the ansible Job pod (which lacks it) — see the doc.
-    let pods_lp = ListParams::default()
-        .labels(&format!("{hash_selector},{}", labels::PLAYBOOKPLAN_HOST));
+    let pods_lp =
+        ListParams::default().labels(&format!("{hash_selector},{}", labels::PLAYBOOKPLAN_HOST));
     // Bare hash selector: no other operator-managed Secret/NetworkPolicy carries the hash label.
     let rest_lp = ListParams::default().labels(&hash_selector);
 
@@ -549,13 +585,46 @@ mod tests {
     }
 
     #[test]
+    fn build_secret_writes_the_run_hash_as_the_sole_authorized_principal() {
+        use crate::v1beta1::ca::CertificateAuthority;
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let ca = CertificateAuthority::generate().unwrap();
+        let hash = calculate_execution_hash("playbook-a", std::iter::empty());
+
+        let secret = build_secret("ansible-sshd-worker-1-abc", &hash, "worker-1", &ca).unwrap();
+        let principals = secret
+            .string_data
+            .as_ref()
+            .and_then(|d| d.get(AUTHORIZED_PRINCIPALS_FILENAME))
+            .expect("proxy secret must carry an authorized_principals file");
+
+        // The file must name exactly this run's hash and nothing else — in particular not "root",
+        // which would make every run's client cert authenticate to every proxy (R3 / T-INFO-3).
+        assert_eq!(principals.trim(), hash.to_string());
+        assert!(
+            !principals.contains("root"),
+            "authorized_principals must not contain 'root', or cross-run isolation is void"
+        );
+    }
+
+    #[test]
     fn sshd_config_forces_the_enter_host_script_and_has_no_pam_directive() {
         let config = render_sshd_config();
-        assert!(config.contains(&format!("ForceCommand {SSHD_CONFIG_MOUNT_PATH}/{ENTER_HOST_SCRIPT_FILENAME}")));
+        assert!(config.contains(&format!(
+            "ForceCommand {SSHD_CONFIG_MOUNT_PATH}/{ENTER_HOST_SCRIPT_FILENAME}"
+        )));
         assert!(config.contains("TrustedUserCAKeys"));
+        // Per-run principal enforcement: without this line sshd falls back to accepting any cert
+        // whose principals include the login user, defeating cross-run isolation (R3 / T-INFO-3).
+        assert!(config.contains(&format!(
+            "AuthorizedPrincipalsFile {SSHD_CONFIG_MOUNT_PATH}/{AUTHORIZED_PRINCIPALS_FILENAME}"
+        )));
         // HostCertificate isn't auto-discovered from the HostKey filename — omitting it makes
         // sshd present a bare key, failing host-key verification for `@cert-authority` clients.
-        assert!(config.contains(&format!("HostCertificate {SSHD_CONFIG_MOUNT_PATH}/{HOST_CERT_FILENAME}")));
+        assert!(config.contains(&format!(
+            "HostCertificate {SSHD_CONFIG_MOUNT_PATH}/{HOST_CERT_FILENAME}"
+        )));
         assert!(!config.contains("ChrootDirectory"));
         assert!(!config.contains("UsePAM"));
         // Without this line sshd rejects the sftp subsystem before ForceCommand ever runs.
@@ -579,7 +648,9 @@ mod tests {
     #[test]
     fn enter_host_script_recognizes_sftp_marker_and_searches_common_server_paths() {
         let script = render_enter_host_script();
-        assert!(script.contains(&format!("\"$SSH_ORIGINAL_COMMAND\" = \"{SFTP_SUBSYSTEM_MARKER}\"")));
+        assert!(script.contains(&format!(
+            "\"$SSH_ORIGINAL_COMMAND\" = \"{SFTP_SUBSYSTEM_MARKER}\""
+        )));
         for candidate in [
             "/usr/lib/openssh/sftp-server",
             "/usr/libexec/openssh/sftp-server",
@@ -588,7 +659,184 @@ mod tests {
             "/usr/lib64/misc/sftp-server",
             "/usr/lib64/openssh/sftp-server",
         ] {
-            assert!(script.contains(candidate), "missing candidate path {candidate}");
+            assert!(
+                script.contains(candidate),
+                "missing candidate path {candidate}"
+            );
         }
+    }
+}
+
+/// Container-backed integration test for the R3 cross-run isolation property: a *real* sshd (the
+/// production proxy image) configured entirely by `build_secret`/`render_sshd_config` must accept
+/// this run's client cert and reject another run's — purely on sshd's `AuthorizedPrincipalsFile`
+/// principal check, with the per-run NetworkPolicy out of the picture. It also exercises the host
+/// cert / `@cert-authority` known_hosts path and, crucially, sshd's StrictModes tolerance of the
+/// rendered config files (the runtime risk flagged when R3 was added).
+///
+/// `#[ignore]`d by default — it needs a Docker/Podman API socket and an OpenSSH `ssh` client on the
+/// runner. With rootless podman (`systemctl --user start podman.socket`), run:
+///   ```text
+///   export DOCKER_HOST="unix:///run/user/$(id -u)/podman/podman.sock" \
+///   export TESTCONTAINERS_RYUK_DISABLED=true \
+///   cargo test managed_ssh::container_tests -- --ignored --nocapture
+///   ```
+/// (Ryuk — testcontainers' reaper sidecar — is flaky under rootless podman; disabling it is safe
+/// here because `ContainerAsync`'s `Drop` removes the proxy container at test end.)
+///
+/// SELinux / rootless-podman note: the sshd config files are injected with testcontainers'
+/// copy-to-container, so they land in the container's own image layer — owned by container-root and
+/// labeled `container_file_t` automatically. A host bind mount would instead need `:Z` relabeling on
+/// an SELinux-enforcing host *and* would carry the host uid, which sshd's StrictModes rejects as bad
+/// ownership on `AuthorizedPrincipalsFile`/the host key. Copy-to sidesteps both, matching prod's
+/// root-owned read-only Secret mount.
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+    use crate::v1beta1::ca::CertificateAuthority;
+    use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
+    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{GenericImage, ImageExt};
+
+    const PROXY_IMAGE: &str = "docker.io/testcontainers/sshd";
+    const PROXY_TAG: &str = "latest";
+    /// Node name the proxy's host cert is signed for; the client must dial it via `HostKeyAlias`
+    /// (mirroring `inventory_renderer`) so the `@cert-authority *` known_hosts entry validates.
+    const HOST_NAME: &str = "worker-1";
+
+    /// Writes a rendered client-cert file map to `dir`, tightening the private key to 0600 so the
+    /// `ssh` client doesn't refuse it as too open.
+    fn write_client_files(dir: &Path, files: &BTreeMap<String, String>) {
+        for (name, contents) in files {
+            let path = dir.join(name);
+            std::fs::File::create(&path)
+                .unwrap()
+                .write_all(contents.as_bytes())
+                .unwrap();
+            let mode = if name == paths::MANAGED_SSH_CLIENT_KEY_FILENAME {
+                0o600
+            } else {
+                0o644
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    /// Runs the real `ssh` client against the proxy on `port`, presenting `client_dir`'s cert and
+    /// mirroring production's connection options (`UserKnownHostsFile` + `HostKeyAlias`,
+    /// publickey-only, batch mode).
+    fn ssh_attempt(port: u16, client_dir: &Path) -> std::process::Output {
+        let opt = |k: &str, v: String| format!("{k}={v}");
+        std::process::Command::new("ssh")
+            .args(["-F", "/dev/null"])
+            .arg("-i")
+            .arg(client_dir.join(paths::MANAGED_SSH_CLIENT_KEY_FILENAME))
+            .arg("-o")
+            .arg(opt(
+                "CertificateFile",
+                client_dir
+                    .join(paths::MANAGED_SSH_CLIENT_CERT_FILENAME)
+                    .display()
+                    .to_string(),
+            ))
+            .arg("-o")
+            .arg(opt(
+                "UserKnownHostsFile",
+                client_dir
+                    .join(paths::MANAGED_SSH_KNOWN_HOSTS_FILENAME)
+                    .display()
+                    .to_string(),
+            ))
+            .args(["-o", "GlobalKnownHostsFile=/dev/null"])
+            .arg("-o")
+            .arg(opt("HostKeyAlias", HOST_NAME.to_string()))
+            .args(["-o", "BatchMode=yes"])
+            .args(["-o", "StrictHostKeyChecking=yes"])
+            .args(["-o", "PreferredAuthentications=publickey"])
+            .args(["-o", "ConnectTimeout=10"])
+            .args(["-p", &port.to_string()])
+            .arg("root@127.0.0.1")
+            .arg("true")
+            .output()
+            .expect("failed to spawn `ssh`; is an OpenSSH client installed on the runner?")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a Docker/Podman API socket and an ssh client"]
+    async fn proxy_rejects_other_runs_cert_and_accepts_its_own() {
+        let ca = CertificateAuthority::generate().unwrap();
+        let run_b = calculate_execution_hash("plan-b", std::iter::empty());
+        let run_a = calculate_execution_hash("plan-a", std::iter::empty());
+
+        // Server: proxy config for run B — host cert principal = HOST_NAME, and the
+        // AuthorizedPrincipalsFile carries only run B's hash.
+        let server_files = build_secret("proxy-b", &run_b, HOST_NAME, &ca)
+            .unwrap()
+            .string_data
+            .expect("proxy secret must carry string_data");
+
+        // Clients: run B's cert (must be accepted) and run A's cert (must be rejected), both off
+        // the same CA — so only the principal, not the signature, distinguishes them.
+        let client_b = tempfile::tempdir().unwrap();
+        let client_a = tempfile::tempdir().unwrap();
+        write_client_files(
+            client_b.path(),
+            &render_client_cert_files(&ca, &run_b).unwrap(),
+        );
+        write_client_files(
+            client_a.path(),
+            &render_client_cert_files(&ca, &run_a).unwrap(),
+        );
+
+        // Boot the real proxy image with our rendered config injected into its own fs layer. The
+        // chmod reproduces the Secret's 0500 default_mode; then exec sshd with the exact prod flags.
+        let start_cmd = format!(
+            "chmod 0500 {SSHD_CONFIG_MOUNT_PATH}/* && exec /usr/sbin/sshd -D -e -f {SSHD_CONFIG_MOUNT_PATH}/sshd_config"
+        );
+        let mut request = GenericImage::new(PROXY_IMAGE, PROXY_TAG)
+            .with_exposed_port((PROXY_SSH_PORT as u16).tcp())
+            .with_wait_for(WaitFor::message_on_stderr("Server listening"))
+            .with_cmd(vec!["sh".to_string(), "-c".to_string(), start_cmd]);
+        for (name, contents) in &server_files {
+            request = request.with_copy_to(
+                format!("{SSHD_CONFIG_MOUNT_PATH}/{name}"),
+                contents.clone().into_bytes(),
+            );
+        }
+        let container = request
+            .start()
+            .await
+            .expect("proxy sshd container failed to start (check sshd_config / StrictModes)");
+        let port = container
+            .get_host_port_ipv4((PROXY_SSH_PORT as u16).tcp())
+            .await
+            .unwrap();
+
+        // Same-run cert: must pass host-cert verification AND user auth, reaching the ForceCommand.
+        // The forced `enter-host.sh` then nsenters into /host/proc/1/ns/* which doesn't exist here
+        // (and rootless lacks CAP_SYS_ADMIN), so it errors via `nsenter` — that's the success signal
+        // that we got *past* authentication.
+        let accepted = ssh_attempt(port, client_b.path());
+        let accepted_err = String::from_utf8_lossy(&accepted.stderr);
+        assert!(
+            !accepted_err.contains("Permission denied"),
+            "run B's own cert was rejected by its proxy:\n{accepted_err}"
+        );
+        assert!(
+            accepted_err.contains("nsenter"),
+            "run B's cert did not reach the ForceCommand — host-cert or auth failed:\n{accepted_err}"
+        );
+
+        // Foreign cert (run A's hash): sshd must refuse it at the AuthorizedPrincipalsFile check.
+        let rejected = ssh_attempt(port, client_a.path());
+        let rejected_err = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            rejected_err.contains("Permission denied"),
+            "run A's cert was NOT rejected by run B's proxy — cross-run isolation is broken:\n{rejected_err}"
+        );
     }
 }

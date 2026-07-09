@@ -27,6 +27,12 @@ regex = "1.12.3"
 lazy_static = "1.5.0"
 ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "alloc", "std", "getrandom"] }
 
+[dev-dependencies]
+# Container-backed integration tests (see managed_ssh::container_tests). #[ignore]d by default;
+# require a running Docker/Podman API socket and an `ssh` client binary on the runner.
+testcontainers = "0.27.3"
+tempfile = "3"
+
 [profile.release]
 lto = true
 codegen-units = 1
