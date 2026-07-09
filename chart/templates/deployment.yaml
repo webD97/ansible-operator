@@ -12,10 +12,13 @@ spec:
       {{- include "chart.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
+        # Rolls the operator whenever the rendered config changes, so a `helm upgrade` that edits
+        # watchNamespaces restarts the pod and it re-reads the enrollment config (see configmap.yaml).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         {{- include "chart.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -39,6 +42,9 @@ spec:
           {{- end }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The binary uses subcommands: `run` starts the control loop (the config path defaults to
+          # the mounted ConfigMap below), `crds` dumps CRD YAML.
+          args: ["run"]
           env:
             # The operator learns its own namespace at runtime via the Downward API — this is
             # how it knows where to create per-run Leases, managed-ssh proxy pods/Secrets/
@@ -48,10 +54,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+          volumeMounts:
+            # Enrollment config (watchNamespaces), read once at startup. Mounted as a directory (not
+            # subPath) so the projected file tracks the ConfigMap; the pod is rolled on change via the
+            # checksum/config annotation rather than hot-reloading.
+            - name: config
+              mountPath: /etc/ansible-operator
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "chart.fullname" . }}-config
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

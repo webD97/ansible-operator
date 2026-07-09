@@ -4,42 +4,30 @@ metadata:
   name: {{ include "chart.fullname" . }}
   labels:
     {{- include "chart.labels" . | nindent 4 }}
+# Only genuinely cluster-scoped access lives here. Secret/Job/Pod access is deliberately NOT
+# cluster-wide anymore — it is granted per enrolled namespace via the Role (see role.yaml,
+# rolebinding.yaml and .Values.watchNamespaces). This bounds operator compromise to the enrolled
+# namespaces instead of the whole cluster (THREAT_MODEL R1 / T-INFO-1).
 rules:
-  # PlaybookPlan/ClusterInventory/StaticInventory are user-created and only ever read + watched
-  # by the operator — it never creates/deletes them itself.
+  # PlaybookPlan/ClusterInventory/StaticInventory are user-created and only ever read + watched by
+  # the operator — it never creates/deletes them itself. Read cluster-wide so plans in ANY namespace
+  # are discovered; a plan in a non-enrolled namespace is reported as UnauthorizedNamespace rather
+  # than silently ignored.
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["playbookplans", "clusterinventories", "staticinventories"]
     verbs: ["get", "list", "watch"]
-  # Only PlaybookPlan and ClusterInventory have controllers writing status (StaticInventory has
-  # no controller of its own today).
+  # Only PlaybookPlan and ClusterInventory have controllers writing status (StaticInventory has no
+  # controller of its own today). Cluster-wide so status (incl. UnauthorizedNamespace) can be written
+  # on plans in non-enrolled namespaces too.
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["playbookplans/status", "clusterinventories/status", "nodeaccesspolicies/status"]
     verbs: ["get", "update"]
-  # One Job per PlaybookPlan run, across whichever namespace the plan lives in. Watched via
-  # Controller::owns() so the reconciler re-runs when a Job's status changes.
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["get", "list", "watch", "create"]
-  # Reading the run's Job-owned pod for its container termination message (the recap the callback
-  # wrote to /dev/termination-log) — read-only, across all namespaces. No pods/log access is
-  # needed since the recap comes from the pod's status, not its logs. Creating pods directly only
-  # ever happens for managed-ssh proxy pods, which is namespace-scoped to the operator's own
-  # namespace (see the Role, not this ClusterRole).
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  # The workspace Secret (playbook/inventory/callback plugin/vars) is created via server-side
-  # apply (patch) in whichever namespace the PlaybookPlan lives in; variable/file Secrets
-  # referenced by a PlaybookPlan are only ever read.
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "patch"]
-  # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped).
+  # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped resource).
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
   # NodeAccessPolicy enforcement reads the plan namespace's labels to match a policy's
-  # namespaceSelector (Namespaces are cluster-scoped).
+  # namespaceSelector (Namespaces are cluster-scoped resources).
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]

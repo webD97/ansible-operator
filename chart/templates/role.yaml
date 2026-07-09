@@ -1,33 +1,51 @@
-# Namespace-scoped permissions, deliberately kept separate from the cluster-wide ClusterRole:
-# Leases, managed-ssh proxy pods, their NetworkPolicies, and their Secrets only ever exist in the
-# operator's own namespace (this release's namespace) — least privilege means they never need to
-# be reachable outside it.
+{{- /*
+Namespaced permissions, rendered once per ENROLLED namespace = the operator's own namespace
+(.Release.Namespace, always enrolled) plus every entry in .Values.watchNamespaces. This is the R1
+enforcement boundary: the operator can read/write Secrets and create Jobs ONLY in these namespaces.
+
+Every enrolled namespace gets the "plan-serving" rules (Secret/Job/Pod access for a run). The
+operator's OWN namespace additionally gets the managed-ssh infra rules (Leases, proxy pods,
+NetworkPolicies, and cleanup of per-run cert Secrets) — those resources only ever exist there.
+*/ -}}
+{{- $namespaces := concat (.Values.watchNamespaces | default list) (list .Release.Namespace) | uniq }}
+{{- range $ns := $namespaces }}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "chart.fullname" . }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ include "chart.fullname" $ }}
+  namespace: {{ $ns }}
   labels:
-    {{- include "chart.labels" . | nindent 4 }}
+    {{- include "chart.labels" $ | nindent 4 }}
 rules:
-  # Per-host mutual-exclusion locks (see agents.md's per-node locking design notes).
+  # Plan-serving grants (R1) — scoped to enrolled namespaces only:
+  #  - the workspace Secret is created/patched here and variable/file Secrets are read here;
+  #  - one Job per run is created + watched here;
+  #  - the run's Job-owned pod is read here for its termination message.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  {{- if eq $ns $.Release.Namespace }}
+  # Operator-namespace-only infra. Leases, managed-ssh proxy pods, their NetworkPolicies, and
+  # cleanup (delete/deletecollection) of per-run cert Secrets only ever exist in the operator's own
+  # namespace, so these are NOT granted in tenant namespaces.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "delete"]
-  # Managed-ssh proxy pods. Read verbs (get/list/watch) already come from the cluster-wide
-  # ClusterRole; only create/delete are namespace-scoped additions here. deletecollection backs
-  # the label-scoped run cleanup in managed_ssh::cleanup_proxy_infra.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "deletecollection"]
-  # Scopes each run's proxy-pod ingress to only that run's ansible Job pod.
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
-  # Per-run managed-ssh host/client cert Secrets. get/list/watch/create/patch already come from
-  # the cluster-wide ClusterRole; only delete/deletecollection (cleanup) is added here. Cleanup's
-  # deletecollection is scoped to a run's PLAYBOOKPLAN_HASH label. (The operator's SSH CA is
-  # in-memory only and is never stored as a Secret.)
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["delete", "deletecollection"]
+  {{- end }}
+{{- end }}

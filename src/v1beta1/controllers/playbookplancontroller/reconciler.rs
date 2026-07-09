@@ -48,6 +48,11 @@ struct ReconciliationContext {
     /// live (never the PlaybookPlan's namespace). Read from `POD_NAMESPACE` at operator startup
     /// (see `main.rs`).
     operator_namespace: String,
+    /// The admin-authored enrollment allowlist: the only namespaces the operator is RBAC-permitted
+    /// to read/write Secrets and create Jobs in (R1 / T-INFO-1). A PlaybookPlan whose namespace is
+    /// not in here is refused with `Phase::UnauthorizedNamespace` before any Secret/Job call. Always
+    /// includes the operator namespace. Derived from the Helm-rendered config at startup (`config`).
+    enrolled_namespaces: Arc<std::collections::BTreeSet<String>>,
     /// The operator's ephemeral SSH certificate authority — generated in memory at startup and
     /// never persisted, so an operator restart rotates it (see `main.rs`/`ca.rs`).
     ca: Arc<CertificateAuthority>,
@@ -73,6 +78,7 @@ struct RunContext<'a> {
 pub fn new(
     client: kube::Client,
     operator_namespace: String,
+    enrolled_namespaces: std::collections::BTreeSet<String>,
     ca: Arc<CertificateAuthority>,
 ) -> impl Stream<
     Item = Result<
@@ -80,12 +86,15 @@ pub fn new(
         kube::runtime::controller::Error<ReconcileError, kube::runtime::watcher::Error>,
     >,
 > {
+    // PlaybookPlans are still watched cluster-wide so a plan created in a *non*-enrolled namespace is
+    // seen and reported (`Phase::UnauthorizedNamespace`) rather than silently ignored (CRD reads stay
+    // cluster-wide — see R1). Secret/Job watches below, by contrast, are scoped to the enrolled set.
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
-    let jobs_api: Api<Job> = Api::all(client.clone());
-    let secrets_api: Api<Secret> = Api::all(client.clone());
     // Policies only ever govern managed-ssh in the operator namespace, so cache/watch just those.
     let node_access_policies_api: Api<NodeAccessPolicy> =
         Api::namespaced(client.clone(), &operator_namespace);
+
+    let enrolled_namespaces = Arc::new(enrolled_namespaces);
 
     let playbookplan_reflector_reader = {
         let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
@@ -133,29 +142,41 @@ pub fn new(
     };
 
     let context = Arc::new(ReconciliationContext {
-        client,
+        client: client.clone(),
         operator_namespace,
+        enrolled_namespaces: Arc::clone(&enrolled_namespaces),
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
     });
 
-    Controller::new(playbookplans_api, watcher::Config::default())
-        .owns(jobs_api, watcher::Config::default())
-        .watches(
-            secrets_api,
-            watcher::Config::default(),
-            mappers::secret_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
-        )
-        .watches(
-            node_access_policies_api,
-            watcher::Config::default(),
-            mappers::node_access_policy_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
-        )
-        .run(
-            reconcile,
-            |_, _, _| Action::requeue(std::time::Duration::from_secs(15)),
-            Arc::clone(&context),
-        )
+    let mut controller = Controller::new(playbookplans_api, watcher::Config::default()).watches(
+        node_access_policies_api,
+        watcher::Config::default(),
+        mappers::node_access_policy_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+    );
+
+    // Owned-Job and referenced-Secret watches are set up per enrolled namespace instead of once
+    // cluster-wide: the operator holds `jobs`/`secrets` RBAC only in these namespaces (R1), so a
+    // cluster-wide `Api::all` watch would 403. A Secret edit in an enrolled namespace still promptly
+    // re-triggers its plan (preserving "input changed -> reapply"); the merged effect is identical to
+    // the old single cluster-wide watch, just bounded to the allowlist.
+    for namespace in enrolled_namespaces.iter() {
+        let jobs_api: Api<Job> = Api::namespaced(client.clone(), namespace);
+        let secrets_api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+        controller = controller
+            .owns(jobs_api, watcher::Config::default())
+            .watches(
+                secrets_api,
+                watcher::Config::default(),
+                mappers::secret_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+            );
+    }
+
+    controller.run(
+        reconcile,
+        |_, _, _| Action::requeue(std::time::Duration::from_secs(15)),
+        Arc::clone(&context),
+    )
 }
 
 /// Reconciles one PlaybookPlan. Level-triggered/idempotent "ensure" style — every step re-derives
@@ -177,6 +198,27 @@ async fn reconcile(
     let (namespace, name, _) = extract_resource_info(&object)?;
 
     let api = Api::<v1beta1::PlaybookPlan>::namespaced(context.client.clone(), namespace);
+
+    // Enrollment guard (R1 / T-INFO-1): the operator holds no Secret/Job RBAC outside the enrolled
+    // set, so a plan in a non-enrolled namespace can never run. Refuse it up front — before any
+    // (would-be-403) Secret/Job call — and report why. `await_change()`, not a timed requeue: the
+    // enrolled set only changes on operator restart (a ConfigMap edit rolls the pod), so there is
+    // nothing to poll for and a requeue would just busy-loop blocked plans.
+    if !context.enrolled_namespaces.contains(namespace) {
+        warn!(
+            "PlaybookPlan {namespace}/{name} is in a namespace not enrolled for ansible-operator; refusing to run (add it to the chart's watchNamespaces)"
+        );
+        if object.status.as_ref().map(|s| &s.phase) != Some(&Phase::UnauthorizedNamespace) {
+            let mut status = object.status.clone().unwrap_or_default();
+            status.phase = Phase::UnauthorizedNamespace;
+            status.summary = Some(format!(
+                "namespace '{namespace}' is not enrolled for ansible-operator (not in watchNamespaces); an administrator must enroll it"
+            ));
+            patch_status(&api, &object, status).await?;
+        }
+        return Ok(Action::await_change());
+    }
+
     let secrets_api = Api::<Secret>::namespaced(context.client.clone(), namespace);
 
     let mut requeue_after = std::time::Duration::from_secs(3600);
@@ -384,7 +426,8 @@ async fn try_start_run(
 
     // Proxy pod IPs are fresh every run even with an unchanged spec, so rendering is also
     // triggered on "a run is starting now", not generation alone.
-    if workspace::is_missing(&secrets_api, run.name).await? || workspace::is_outdated(object, true) {
+    if workspace::is_missing(&secrets_api, run.name).await? || workspace::is_outdated(object, true)
+    {
         debug!("Rendering playbook to secret");
         upsert_workspace_secret(
             &secrets_api,

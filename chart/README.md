@@ -47,7 +47,7 @@ After changing any `#[derive(CustomResource)]` type in the Rust source, regenera
 
 ```sh
 cargo build --release
-./target/release/ansible-operator --crd > /tmp/all-crds.yaml
+./target/release/ansible-operator crds > /tmp/all-crds.yaml
 csplit -z -f /tmp/crd- /tmp/all-crds.yaml '/^---$/' '{*}'
 for f in /tmp/crd-*; do
   name=$(grep -m1 "^  name:" "$f" | awk '{print $2}')

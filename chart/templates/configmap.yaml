@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chart.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+data:
+  # The operator reads this at startup (mounted at /etc/ansible-operator/config.toml). It is NOT
+  # hot-reloaded: a change here rolls the Deployment via the checksum/config pod annotation
+  # (see deployment.yaml), and the restarted process picks up the new config.
+  config.toml: |
+    # Enrolled tenant namespaces the operator may read/write Secrets and create Jobs in (R1). The
+    # operator's own namespace ({{ .Release.Namespace }}) is ALWAYS enrolled implicitly by the
+    # operator, so it does not need to be listed here.
+    watch_namespaces = [
+    {{- range (.Values.watchNamespaces | default list) }}
+      {{ . | quote }},
+    {{- end }}
+    ]

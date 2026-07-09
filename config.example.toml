@@ -1,0 +1,24 @@
+# Example ansible-operator configuration for LOCAL DEVELOPMENT.
+#
+# In-cluster this file is rendered by the Helm chart into a ConfigMap and mounted at the default
+# path /etc/ansible-operator/config.toml. For local runs, copy this file and point the operator at
+# it via the --config flag:
+#
+#   cp config.example.toml config.toml
+#   POD_NAMESPACE=ansible-system cargo run -- run --config ./config.toml
+#
+# POD_NAMESPACE is required separately (the operator's own namespace, normally injected via the
+# Downward API in-cluster) and is ALWAYS enrolled implicitly — you do not list it below.
+#
+# A missing config file is not an error: the operator then serves only POD_NAMESPACE (fail-closed).
+
+# Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1): the only namespaces the operator may
+# read/write Secrets and create Jobs in, on top of POD_NAMESPACE. A PlaybookPlan created anywhere
+# else is refused with status.phase = UnauthorizedNamespace.
+#
+# Empty ([]) => serve only the operator's own namespace.
+watch_namespaces = [
+  "default",
+  # "team-a",
+  # "team-b",
+]

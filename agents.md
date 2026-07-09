@@ -8,7 +8,7 @@ concurrently in `main.rs` via `tokio::join!`.
 ## Layout
 
 ```
-src/main.rs                          entrypoint, tracing setup, --crd flag for CRD YAML dump
+src/main.rs                          entrypoint (clap `run`/`crds` subcommands), tracing setup
 src/utils.rs                         create_or_update (server-side apply helper), Condition trait, generate_id (k8s-like short ID)
 src/v1beta1/
   resources/                         CRD types (kube::CustomResource derives)
@@ -85,5 +85,5 @@ The controller `.watches(secrets_api, ..., mappers::secret_to_playbookplans(...)
 - `cargo clippy` is clean; no `clippy.toml`/lint overrides exist — keep it that way rather than special-casing lints.
 - No integration/e2e tests against a real cluster; correctness for reconcile logic is tested via pure functions extracted for exactly that purpose (`execution_evaluator`, `triggers`, `status`, `nodeselector`, `job_builder::extract_file_volumes`) — when adding reconciler logic, prefer pulling it into a small pure function like these rather than testing through the full `reconcile()`.
 - CI (`.github/workflows/container.yml`): `cargo test` and `cargo build --release` on `rust:1-bookworm`, then builds/pushes a Containerfile-based distroless image (build output binary is just copied in, no cargo build inside the container image itself).
-- `./ansible-operator --crd` dumps all three CRDs' YAML (for `kubectl apply` or Helm chart generation) and exits — check this path still works after changing any `#[derive(CustomResource)]` type.
+- `./ansible-operator crds` dumps all four CRDs' YAML (for `kubectl apply` or Helm chart generation) and exits — check this path still works after changing any `#[derive(CustomResource)]` type.
 - `.agents/skills/` is a vendored skill pack (rust-skills) unrelated to this project's own domain logic — not something to modify as part of feature work here.

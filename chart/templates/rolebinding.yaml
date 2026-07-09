@@ -1,15 +1,23 @@
+{{- /*
+One RoleBinding per enrolled namespace (see role.yaml), each binding the operator's ServiceAccount
+(which lives in .Release.Namespace) to that namespace's Role.
+*/ -}}
+{{- $namespaces := concat (.Values.watchNamespaces | default list) (list .Release.Namespace) | uniq }}
+{{- range $ns := $namespaces }}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "chart.fullname" . }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ include "chart.fullname" $ }}
+  namespace: {{ $ns }}
   labels:
-    {{- include "chart.labels" . | nindent 4 }}
+    {{- include "chart.labels" $ | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "chart.fullname" . }}
+  name: {{ include "chart.fullname" $ }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "chart.serviceAccountName" . }}
-    namespace: {{ .Release.Namespace }}
+    name: {{ include "chart.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}

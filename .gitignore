@@ -2,6 +2,7 @@
 .ansible
 .vscode
 ssh.yaml
+/config.toml
 
 skills-lock.json
 .agents/

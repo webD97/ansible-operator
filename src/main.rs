@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use clap::{Parser, Subcommand};
 use futures_util::StreamExt as _;
 use kube::CustomResourceExt as _;
 use kube::config::KubeConfigOptions;
@@ -12,36 +13,80 @@ use tracing_subscriber::{fmt, layer::SubscriberExt as _};
 
 use v1beta1::ca::CertificateAuthority;
 
+mod config;
 mod utils;
 mod v1beta1;
 
+use config::OperatorConfig;
+
+#[derive(Parser)]
+#[command(
+    name = "ansible-operator",
+    about = "Kubernetes operator for running Ansible playbooks against cluster nodes"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the operator control loop (the normal in-cluster entrypoint).
+    Run(RunArgs),
+    /// Print the CRD manifests (YAML) to stdout and exit.
+    Crds,
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Path to the operator config file (enrolled namespaces, see R1). In-cluster this is the
+    /// chart-rendered ConfigMap mounted at the default path; override it for local runs.
+    #[arg(long, short, default_value = config::DEFAULT_CONFIG_PATH)]
+    config: String,
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.contains(&"--crd".into()) {
-        let playbookplan = v1beta1::PlaybookPlan::crd();
-        let cluster_inventory = v1beta1::ClusterInventory::crd();
-        let static_inventory = v1beta1::StaticInventory::crd();
-        let node_access_policy = v1beta1::NodeAccessPolicy::crd();
-        println!(
-            "{}",
-            [
-                serde_yaml::to_string(&playbookplan).unwrap(),
-                serde_yaml::to_string(&cluster_inventory).unwrap(),
-                serde_yaml::to_string(&static_inventory).unwrap(),
-                serde_yaml::to_string(&node_access_policy).unwrap()
-            ]
-            .join("---\n")
-        );
-        std::process::exit(0);
+    match Cli::parse().command {
+        Command::Crds => print!("{}", render_crds()),
+        Command::Run(args) => run(args).await,
     }
+}
 
+/// Renders all CRDs as a single multi-document YAML string (for `kubectl apply` / Helm chart
+/// generation). See `chart/README.md` for how the bundled `crds/` snapshot is regenerated.
+fn render_crds() -> String {
+    let playbookplan = v1beta1::PlaybookPlan::crd();
+    let cluster_inventory = v1beta1::ClusterInventory::crd();
+    let static_inventory = v1beta1::StaticInventory::crd();
+    let node_access_policy = v1beta1::NodeAccessPolicy::crd();
+    [
+        serde_yaml::to_string(&playbookplan).unwrap(),
+        serde_yaml::to_string(&cluster_inventory).unwrap(),
+        serde_yaml::to_string(&static_inventory).unwrap(),
+        serde_yaml::to_string(&node_access_policy).unwrap(),
+    ]
+    .join("---\n")
+}
+
+async fn run(args: RunArgs) {
     setup_tracing();
 
     let client = kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
 
     let operator_namespace = std::env::var("POD_NAMESPACE").expect("POD_NAMESPACE must be set");
+
+    // Enrollment allowlist (R1 / T-INFO-1): the operator only reads/writes Secrets and creates Jobs
+    // in namespaces it is enrolled for. Read once at startup from the config file (the Helm-rendered
+    // ConfigMap in-cluster, default path); a change to it rolls this pod (checksum/config annotation)
+    // rather than being hot-reloaded. Override the path with `run --config <path>` for local runs.
+    let operator_config = OperatorConfig::load(&args.config)
+        .unwrap_or_else(|e| panic!("failed to load operator config: {e}"));
+    let enrolled_namespaces = operator_config.enrolled_namespaces(&operator_namespace);
+    tracing::info!(
+        "enrolled namespaces (Secret/Job access is scoped to these): {:?}",
+        enrolled_namespaces
+    );
 
     // Ephemeral, in-memory CA: a fresh keypair per operator process, never persisted to the
     // cluster. Restarting the operator rotates the CA and invalidates all outstanding certs.
@@ -50,14 +95,18 @@ async fn main() {
             .expect("failed to generate the operator's ephemeral SSH certificate authority"),
     );
 
-    let playbookplan_controller =
-        v1beta1::playbookplancontroller::reconciler::new(client.clone(), operator_namespace, ca)
-            .for_each(|res| async move {
-                match res {
-                    Ok(o) => debug!("reconciled {:?}", o),
-                    Err(e) => warn!("reconcile failed: {:?}", e),
-                }
-            });
+    let playbookplan_controller = v1beta1::playbookplancontroller::reconciler::new(
+        client.clone(),
+        operator_namespace,
+        enrolled_namespaces,
+        ca,
+    )
+    .for_each(|res| async move {
+        match res {
+            Ok(o) => debug!("reconciled {:?}", o),
+            Err(e) => warn!("reconcile failed: {:?}", e),
+        }
+    });
 
     let inventory_controller =
         v1beta1::clusterinventorycontroller::new(client.clone()).for_each(|res| async move {
@@ -107,4 +156,45 @@ async fn discover_kubernetes_config() -> kube::Config {
     }
 
     panic!("Failed to find a suitable Kubernetes client config.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory as _;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn run_parses_config_flag() {
+        let cli =
+            Cli::try_parse_from(["ansible-operator", "run", "--config", "/etc/foo.toml"]).unwrap();
+        match cli.command {
+            Command::Run(args) => assert_eq!(args.config, "/etc/foo.toml"),
+            Command::Crds => panic!("expected the run subcommand"),
+        }
+    }
+
+    #[test]
+    fn run_config_defaults_to_the_mounted_path() {
+        let cli = Cli::try_parse_from(["ansible-operator", "run"]).unwrap();
+        match cli.command {
+            Command::Run(args) => assert_eq!(args.config, config::DEFAULT_CONFIG_PATH),
+            Command::Crds => panic!("expected the run subcommand"),
+        }
+    }
+
+    #[test]
+    fn crds_subcommand_parses() {
+        let cli = Cli::try_parse_from(["ansible-operator", "crds"]).unwrap();
+        assert!(matches!(cli.command, Command::Crds));
+    }
+
+    #[test]
+    fn a_missing_subcommand_is_an_error() {
+        assert!(Cli::try_parse_from(["ansible-operator"]).is_err());
+    }
 }

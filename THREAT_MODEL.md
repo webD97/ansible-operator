@@ -33,7 +33,8 @@ valid certificate.* Everything below exists to constrain that.
 
 The operator is therefore a **cluster-privileged component**: compromise of the
 operator, its service account, or its CA is equivalent to root on every node it can
-schedule onto, plus read access to every Secret in the cluster (see §8, RBAC).
+schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
+(the operator ns ∪ `watchNamespaces`; no longer the whole cluster — see §8, RBAC / R1).
 ---
 
 ## 2. Assets
@@ -44,7 +45,7 @@ schedule onto, plus read access to every Secret in the cluster (see §8, RBAC).
 | A2 | **The operator's SSH CA private key** (in-memory only, held in the operator process) | Signs *both* host and client certs. Whoever holds it can mint a client cert with principal `root` and SSH into any proxy pod → A1. Never persisted to the cluster; an operator restart rotates it. Still no in-process rotation or revocation. |
 | A3 | **Per-run client-cert Secret** (`managed-ssh-client-<hash>`, plan ns) | A live credential trusted by every proxy pod of that run. Mounted into the Job pod. |
 | A4 | **NodeAccessPolicy resources** (operator ns) | The admin-authored ceiling that decides which namespace may target which nodes. Tampering = privilege escalation to more nodes. |
-| A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read *any* Secret cluster-wide. |
+| A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read Secrets in enrolled namespaces (operator ns ∪ `watchNamespaces`), not cluster-wide (R1). |
 | A6 | **Playbook content & execution integrity** | The playbook runs as root on nodes. Tampering with it = arbitrary node code execution. |
 | A7 | **Cluster control plane / node kubelet identities** | Reachable *from* a rooted node (A1); the blast radius of A1. |
 
@@ -202,13 +203,23 @@ for the next scheduled reconcile.
 
 ### Information disclosure
 
-**T-INFO-1 — Operator can read every Secret in the cluster.**
-The ClusterRole grants `secrets: get,list,watch,create,patch` cluster-wide (`clusterrole.yaml`).
-- *Mitigation:* needed to read tenant-referenced Secrets across namespaces and to create
-  workspace/cert Secrets. Distroless image, no shell.
-- *Residual:* this is a very broad grant. Operator compromise ⇒ all-Secrets disclosure.
-  Cluster-wide `create/patch` on Secrets is also a potential write primitive.
-- *Severity:* **High** (blast radius). See recommendations R1/R2.
+**T-INFO-1 — Operator's Secret access (scoped to enrolled namespaces).**
+Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
+(`role.yaml`/`rolebinding.yaml`), **not** cluster-wide — the `ClusterRole` no longer mentions
+`secrets` (nor `jobs`/`pods`). The enrolled set = the operator's own namespace ∪ the chart's
+`watchNamespaces`. `jobs: create` and `pods: get,list,watch` are likewise scoped to the enrolled set.
+- *Mitigation (R1, implemented):* the operator can read/write Secrets and create Jobs only in
+  namespaces an admin has explicitly enrolled — enrolment is an intentional "this namespace may drive
+  node-root runs" decision, authored in `watchNamespaces` (static Helm/GitOps config, no runtime
+  `rolebindings` write by the operator). A plan in a non-enrolled namespace is refused with
+  `status.phase = UnauthorizedNamespace` before any Secret/Job call (fail-closed; no "all namespaces"
+  escape hatch). Distroless image, no shell.
+- *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
+  disclosure of Secrets in *those* namespaces and a Job-create write primitive *there*. Widening
+  `watchNamespaces` widens the blast radius accordingly; enrol conservatively.
+- *Severity:* **Medium** — reduced from High: compromise no longer discloses *every* Secret in the
+  cluster nor grants a cluster-wide Job-create primitive; the blast radius is bounded to the enrolled
+  namespaces. See R1.
 
 **T-INFO-2 — CA private key disclosure.**
 - *Mitigation:* the CA is generated in-memory at operator startup and **never persisted** —
@@ -393,19 +404,25 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 
 | Resource | Verbs | Scope | Risk note |
 |----------|-------|-------|-----------|
-| secrets | get,list,watch,create,patch | **cluster-wide** | Reads *all* Secrets (T-INFO-1); create/patch is a write primitive. |
+| secrets | get,list,watch,create,patch | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces (R1). Not cluster-wide. |
 | secrets | delete,deletecollection | operator ns | Run cleanup. |
-| nodes | get,list,watch | cluster-wide | Selector resolution / NAP allow-set. |
-| namespaces | get,list,watch | cluster-wide | namespaceSelector matching. |
-| pods | get,list,watch | cluster-wide | Read termination message. |
+| jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns (R1). Not cluster-wide. |
+| pods | get,list,watch | **enrolled ns only** | Read termination message (R1). Not cluster-wide. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
-| jobs | get,list,watch,create | cluster-wide | One Job per run in the plan ns. |
 | networkpolicies | get,list,watch,create,delete,deletecollection | operator ns | Run isolation. |
 | leases | full | operator ns | Per-node mutual exclusion. |
-| playbookplans/clusterinventories/staticinventories/nodeaccesspolicies | get,list,watch (+/status update) | cluster-wide | CRDs. |
+| nodes | get,list,watch | cluster-wide | Selector resolution / NAP allow-set (cluster-scoped resource). |
+| namespaces | get,list,watch | cluster-wide | namespaceSelector matching (cluster-scoped resource). |
+| playbookplans/clusterinventories/staticinventories/nodeaccesspolicies | get,list,watch (+/status update) | cluster-wide | CRDs — read cluster-wide so plans in non-enrolled namespaces are seen and reported. |
 
-**Net:** the operator is effectively **Tier-0**. Node-root capability + cluster-wide Secret
-read means operator compromise ≈ cluster compromise. Harden accordingly.
+The *enrolled set* = the operator's own namespace (always) ∪ the chart's `watchNamespaces`. The
+`secrets`/`jobs`/`pods` grants live in a per-enrolled-namespace `Role`/`RoleBinding`, not the
+`ClusterRole` (see [`role.yaml`](chart/templates/role.yaml)).
+
+**Net:** the operator remains **Tier-0** for node-root capability *on enrolled namespaces*, but
+operator compromise no longer implies whole-cluster Secret disclosure or a cluster-wide Job-create
+primitive — the blast radius is bounded to the enrolled namespaces. A cluster with node-root reach
+into only a few enrolled tenant namespaces is materially smaller than "≈ cluster compromise."
 
 ---
 
@@ -413,7 +430,7 @@ read means operator compromise ≈ cluster compromise. Harden accordingly.
 
 | ID | Recommendation | Addresses | Priority |
 |----|----------------|-----------|----------|
-| R1 | Scope Secret read narrower than cluster-wide if feasible (e.g. an admission/labeling convention + per-namespace Roles, or read only Secrets referenced by a plan). | T-INFO-1 | High |
+| R1 | **Done:** Secret/Job/Pod access is no longer cluster-wide — it is granted per enrolled namespace (`Role`/`RoleBinding` driven by the chart's `watchNamespaces`; the operator's own namespace is always enrolled). The `ClusterRole` keeps only genuinely cluster-scoped access (nodes, namespaces, CRD reads). Enrolment is static admin/GitOps config read from a mounted ConfigMap at startup (a change rolls the pod via `checksum/config`); fail-closed — a plan in a non-enrolled namespace gets `phase: UnauthorizedNamespace`, and there is no cluster-wide escape hatch. Bounds operator compromise to the enrolled namespaces. Still open: nothing further required for R1; tenants should enrol conservatively. | T-INFO-1 | Low |
 | R2 | **Partly done:** the CA is now ephemeral and in-memory — regenerated every operator restart, never persisted — so restart *is* the rotation mechanism and the persisted-Secret/etcd disclosure path for T-INFO-2 is gone. (Cross-run cert reuse is separately handled by R3's per-run principal enforcement, so a per-run CA is no longer needed for that.) Still open: shorter cert validity and a CRL/short TTL to bound a leaked cert's lifetime (currently 2h, no revocation). | T-INFO-2 | Low |
 | R3 | **Mostly done:** run isolation no longer depends solely on NetworkPolicy — each proxy pod's sshd enforces a per-run `AuthorizedPrincipalsFile` containing only that run's execution hash, and the client cert carries it as a principal, so a stray cert can't open another run's proxy (`build_secret`/`ensure_client_cert`). Verified end-to-end against a real sshd (the prod proxy image) by `managed_ssh::container_tests` — foreign-run cert refused, own-run cert accepted, StrictModes tolerant of the rendered files. Still open: bind the principal to specific *host(s)* (not just the run) for intra-run host scoping, and document the CNI/defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3, T-SPOOF-1 | Low |
 | R4 | Ship a linter/validating admission example that rejects NodeAccessPolicies keyed on tenant-settable labels; recommend `kubernetes.io/metadata.name` in docs (already in type docs). | T-ESC-3 | Medium |

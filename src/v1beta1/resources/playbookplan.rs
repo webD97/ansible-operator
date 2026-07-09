@@ -154,6 +154,12 @@ pub enum Phase {
 
     /// Jobs for all hosts ran successfully (for OneShot mode only)
     Succeeded,
+
+    /// The PlaybookPlan's namespace is not enrolled for the operator (not in the chart's
+    /// `watchNamespaces`), so the operator has no RBAC to read its Secrets or create its Job and
+    /// refuses to run it. Terminal until an administrator enrols the namespace and the operator
+    /// restarts (see R1 / T-INFO-1).
+    UnauthorizedNamespace,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]

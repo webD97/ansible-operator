@@ -21,6 +21,22 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1). The operator may read/write Secrets and
+# create Jobs ONLY in these namespaces plus its own (.Release.Namespace, always enrolled). This is
+# the security boundary that replaces the old cluster-wide Secret/Job/Pod grants — an operator
+# compromise is bounded to the enrolled namespaces, not the whole cluster.
+#
+# Fail-closed: a PlaybookPlan created in a namespace NOT listed here (and not the operator namespace)
+# is refused with status.phase = UnauthorizedNamespace. There is deliberately no "all namespaces"
+# escape hatch. Enrolling a namespace is an admin action: edit this list and `helm upgrade` (which
+# rolls the operator so it re-reads the enrollment config).
+#
+# Example:
+#   watchNamespaces:
+#     - team-a
+#     - team-b
+watchNamespaces: []
+
 # IMPORTANT: install this chart into its own dedicated namespace, e.g.:
 #   helm install --create-namespace -n ansible-system ansible-operator ./chart
 # All namespaced resources in this chart (Deployment, ServiceAccount, Role/RoleBinding) use
