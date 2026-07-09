@@ -215,6 +215,7 @@ fn build_pod(
     execution_hash: &ExecutionHash,
     host: &str,
     tolerations: Option<&[Toleration]>,
+    proxy_image: &str,
 ) -> Pod {
     let secret_volume = Volume {
         name: "sshd-config".into(),
@@ -239,7 +240,7 @@ fn build_pod(
 
     let container = Container {
         name: "sshd".into(),
-        image: Some(DEFAULT_PROXY_IMAGE.into()),
+        image: Some(proxy_image.into()),
         command: Some(vec![
             "/usr/sbin/sshd".into(),
             "-D".into(),
@@ -451,6 +452,7 @@ pub async fn ensure_proxy_infra(
     hosts: &[String],
     tolerations: Option<&[Toleration]>,
     ca: &CertificateAuthority,
+    proxy_image: &str,
 ) -> Result<ProxyReadiness, ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
@@ -484,7 +486,7 @@ pub async fn ensure_proxy_infra(
         let pod = match pods_api.get_opt(&name).await? {
             Some(pod) => pod,
             None => {
-                let pod = build_pod(&name, &name, execution_hash, host, tolerations);
+                let pod = build_pod(&name, &name, execution_hash, host, tolerations, proxy_image);
                 pods_api.create(&PostParams::default(), &pod).await?
             }
         };

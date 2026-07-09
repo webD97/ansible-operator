@@ -61,6 +61,10 @@ struct ReconciliationContext {
     /// list. Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
     /// affected plans via `mappers::node_access_policy_to_playbookplans`.
     node_access_policies: Arc<Store<NodeAccessPolicy>>,
+    /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5).
+    /// Admin-overridable via the chart's `managedSsh.proxyImage`; resolved in `new` to the configured
+    /// value or `managed_ssh::DEFAULT_PROXY_IMAGE` when unset.
+    proxy_image: String,
 }
 
 /// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
@@ -80,6 +84,7 @@ pub fn new(
     operator_namespace: String,
     enrolled_namespaces: std::collections::BTreeSet<String>,
     ca: Arc<CertificateAuthority>,
+    proxy_image: Option<String>,
 ) -> impl Stream<
     Item = Result<
         (ObjectRef<v1beta1::PlaybookPlan>, Action),
@@ -95,6 +100,9 @@ pub fn new(
         Api::namespaced(client.clone(), &operator_namespace);
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
+
+    // Fall back to the built-in default when the chart didn't pin an image (T-ESC-5).
+    let proxy_image = proxy_image.unwrap_or_else(|| managed_ssh::DEFAULT_PROXY_IMAGE.to_string());
 
     let playbookplan_reflector_reader = {
         let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
@@ -147,6 +155,7 @@ pub fn new(
         enrolled_namespaces: Arc::clone(&enrolled_namespaces),
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
+        proxy_image,
     });
 
     let mut controller = Controller::new(playbookplans_api, watcher::Config::default()).watches(
@@ -400,6 +409,7 @@ async fn try_start_run(
         &managed_ssh_hosts,
         tolerations.as_deref(),
         &context.ca,
+        &context.proxy_image,
     )
     .await?;
 

@@ -325,13 +325,16 @@ filesystems, secrets mounted on that node, and reach the API server as the node.
   (especially control-plane nodes).
 
 **T-ESC-5 — Supply-chain: proxy image compromise.**
-Default proxy image is `testcontainers/sshd:latest` — a third-party `:latest` tag pulled
-into a **node-root** pod (`DEFAULT_PROXY_IMAGE`).
-- *Mitigation:* overridable via Helm `values.yaml`.
-- *Residual:* `:latest` from an external registry in a node-root context is a live
-  supply-chain risk (mutable tag, no digest pin, no signature verification). A malicious
-  image = node-root on every targeted node.
-- *Severity:* **High**. See R5.
+The proxy image is pulled into a **node-root** pod.
+- *Mitigation:* the image is admin-set via the chart's `managedSsh.proxyImage`, rendered into the
+  operator config (`proxy_image`) and consumed when building the proxy pod (`build_pod`); it accepts
+  a **digest-pinned** reference, so an operator can point it at a trusted, pinned image.
+- *Residual:* the shipped **default** is still `testcontainers/sshd:latest` (`DEFAULT_PROXY_IMAGE`) —
+  a mutable third-party tag with no digest pin and no signature verification. An operator who does not
+  override it runs that tag in a node-root context; a malicious/hijacked image = node-root on every
+  targeted node. Pinning is opt-in, not enforced.
+- *Severity:* **High** for the default deployment (unpinned `:latest`); reducible to Low by pinning
+  `managedSsh.proxyImage` to a trusted digest. See R5.
 
 **T-ESC-6 — Execution-hash collision affecting security-relevant naming/labels.**
 `ExecutionHash` (XxHash3_64, non-cryptographic) keys resource names, the NetworkPolicy
@@ -367,7 +370,8 @@ This design is **only** as strong as the environment it runs in. The following a
    for namespaces; admin-managed node pool labels), never tenant-settable ones (T-ESC-3).
 5. **Restrict who can create ClusterInventory/PlaybookPlan** (e.g. admission policy). NAP
    bounds *which nodes*, but managed-ssh on any authorized node is root on that node (T-ESC-4).
-6. **Pin the proxy image** to a digest from a registry you trust (T-ESC-5).
+6. **Pin the proxy image** to a digest from a registry you trust, via `managedSsh.proxyImage`
+   (the default is an unpinned third-party `:latest` tag) (T-ESC-5).
 
 ---
 
@@ -441,7 +445,7 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 | R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter `CERT_VALIDITY` or a CRL adds little. | T-INFO-2 | Low |
 | R3 | Bind the client-cert principal to specific *host(s)*, not just the run, for intra-run host scoping; document the CNI / defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3 | Low |
 | R4 | Ship a linter/validating admission example that rejects NodeAccessPolicies keyed on tenant-settable labels; recommend `kubernetes.io/metadata.name` in docs (already in type docs). | T-ESC-3 | Medium |
-| R5 | Pin `DEFAULT_PROXY_IMAGE` to a digest of a trusted, minimal sshd image; document image-signature/admission verification. | T-ESC-5 | Medium |
+| R5 | The proxy image is now admin-overridable and digest-pinnable via `managedSsh.proxyImage`. Still open: ship a **pinned default** (the shipped default is an unpinned `testcontainers/sshd:latest`) and document image-signature/admission verification. | T-ESC-5 | Medium |
 | R6 | Persist/ship proxy sshd session logs and emit a structured audit event per node-root session for attribution. | T-REP-1 | Medium |
 | R7 | Add per-tenant ResourceQuota/LimitRange guidance and optionally a max-fan-out guard. | T-DOS-1 | Low |
 | R8 | Pin host identity: replace the `@cert-authority *` wildcard with per-host known_hosts entries so host certs are bound to the intended node. | T-SPOOF-2 | Low |

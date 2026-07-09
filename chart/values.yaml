@@ -10,8 +10,13 @@ image:
 
 # Image used for managed-ssh proxy pods (created dynamically by the operator itself at runtime,
 # not by this chart) — must run a real OpenSSH sshd. The operator's own image is distroless and
-# cannot serve this role. NOTE: this default has not been verified end-to-end against a real
-# cluster — see agents.md's managed-ssh design notes.
+# cannot serve this role. This value is rendered into the operator's config (configmap.yaml) and
+# consumed at pod-build time; a change rolls the operator via checksum/config.
+#
+# This is a node-root pod (THREAT_MODEL T-ESC-5): the default is a third-party `:latest` tag and
+# is NOT digest-pinned. In production, override with an image from a registry you trust and pin it
+# to a digest — set `tag: ""` and put the digest in `repository`, e.g.
+#   repository: my-registry.example.com/sshd@sha256:<digest>
 managedSsh:
   proxyImage:
     repository: testcontainers/sshd

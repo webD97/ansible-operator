@@ -34,6 +34,14 @@ pub struct OperatorConfig {
     /// so this lists only the *additional* tenant namespaces.
     #[serde(default)]
     pub watch_namespaces: Vec<String>,
+
+    /// Image for the managed-ssh proxy pods the operator schedules onto target nodes (the node-root
+    /// primitive — see THREAT_MODEL T-ESC-5). `None` (field absent) falls back to the built-in
+    /// `DEFAULT_PROXY_IMAGE`. Rendered by the Helm chart from `managedSsh.proxyImage` into the mounted
+    /// ConfigMap; a change rolls the operator pod (via `checksum/config`) rather than hot-reloading,
+    /// exactly like `watch_namespaces`. Accepts a digest-pinned reference (`repo@sha256:…`).
+    #[serde(default)]
+    pub proxy_image: Option<String>,
 }
 
 impl OperatorConfig {
@@ -82,6 +90,7 @@ mod tests {
     fn enrolled_set_is_the_operator_namespace_unioned_with_watch_namespaces() {
         let config = OperatorConfig {
             watch_namespaces: vec!["team-a".to_string(), "team-b".to_string()],
+            ..Default::default()
         };
         let enrolled = config.enrolled_namespaces("ansible-system");
         assert_eq!(
@@ -91,6 +100,21 @@ mod tests {
                 "team-a".to_string(),
                 "team-b".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn proxy_image_is_optional_and_overridable() {
+        // Absent -> None, so the caller falls back to DEFAULT_PROXY_IMAGE.
+        let default: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
+        assert!(default.proxy_image.is_none());
+
+        // A digest-pinned override round-trips verbatim (see THREAT_MODEL T-ESC-5 / R5).
+        let overridden: OperatorConfig =
+            toml::from_str("proxy_image = \"registry.example.com/sshd@sha256:abc\"").unwrap();
+        assert_eq!(
+            overridden.proxy_image.as_deref(),
+            Some("registry.example.com/sshd@sha256:abc")
         );
     }
 

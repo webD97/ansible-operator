@@ -18,3 +18,8 @@ data:
       {{ . | quote }},
     {{- end }}
     ]
+    {{- with .Values.managedSsh }}{{ with .proxyImage }}{{ if .repository }}
+    # Image for the node-root managed-ssh proxy pods (THREAT_MODEL T-ESC-5). Pin to a trusted digest
+    # in production; omit `tag` and put a `@sha256:...` digest in `repository` to do so.
+    proxy_image = {{ printf "%s%s" .repository (ternary (printf ":%s" (.tag | toString)) "" (ne (.tag | toString) "")) | quote }}
+    {{- end }}{{ end }}{{ end }}

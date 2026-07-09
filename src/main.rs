@@ -88,6 +88,11 @@ async fn run(args: RunArgs) {
         enrolled_namespaces
     );
 
+    // Managed-ssh proxy image (T-ESC-5): admin-overridable via the chart's `managedSsh.proxyImage`,
+    // surfaced here through the config file. `None` lets the reconciler fall back to the built-in
+    // default. Pin to a trusted digest in production.
+    let proxy_image = operator_config.proxy_image.clone();
+
     // Ephemeral, in-memory CA: a fresh keypair per operator process, never persisted to the
     // cluster. Restarting the operator rotates the CA and invalidates all outstanding certs.
     let ca = Arc::new(
@@ -100,6 +105,7 @@ async fn run(args: RunArgs) {
         operator_namespace,
         enrolled_namespaces,
         ca,
+        proxy_image,
     )
     .for_each(|res| async move {
         match res {
