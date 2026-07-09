@@ -44,12 +44,12 @@ use crate::{
 
 struct ReconciliationContext {
     client: kube::Client,
-    /// Namespace the operator itself runs in — where per-run Leases, managed-ssh proxy pods,
-    /// and the operator's own CA Secret live (never the PlaybookPlan's namespace). Read from
-    /// `POD_NAMESPACE` at operator startup (see `main.rs`).
+    /// Namespace the operator itself runs in — where per-run Leases and managed-ssh proxy pods
+    /// live (never the PlaybookPlan's namespace). Read from `POD_NAMESPACE` at operator startup
+    /// (see `main.rs`).
     operator_namespace: String,
-    /// The operator's self-managed SSH certificate authority — generated once at startup if
-    /// missing, no auto-rotation in v1.
+    /// The operator's ephemeral SSH certificate authority — generated in memory at startup and
+    /// never persisted, so an operator restart rotates it (see `main.rs`/`ca.rs`).
     ca: Arc<CertificateAuthority>,
     /// Reflector-backed cache of the admin-authored `NodeAccessPolicy` resources in the operator
     /// namespace, read by `node_access::enforce` to clamp managed-ssh nodes without a per-reconcile

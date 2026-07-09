@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ssh_key::{Algorithm, LineEnding, PrivateKey, PublicKey, certificate, rand_core::OsRng};
+use ssh_key::{Algorithm, PrivateKey, PublicKey, certificate, rand_core::OsRng};
 
 /// Validity window for host/client certs signed per run — comfortably beyond a typical
 /// playbook run, with no mid-run renewal in v1 (see agents.md/managed-ssh design notes).
@@ -15,28 +15,20 @@ pub enum CaError {
     ClockError,
 }
 
-/// The operator's own SSH certificate authority. Self-managed (own Secret, own key material) —
-/// generated once at operator startup if it doesn't exist yet; v1 scope has no auto-rotation.
+/// The operator's own SSH certificate authority. Ephemeral and in-memory only — a fresh keypair
+/// is generated at every operator startup and is never serialized or persisted. The CA private
+/// key therefore never touches the cluster, and an operator restart rotates the CA (invalidating
+/// every previously signed host/client cert). No auto-rotation within a single process lifetime.
 pub struct CertificateAuthority {
     key: PrivateKey,
 }
 
 impl CertificateAuthority {
-    /// Generates a brand-new CA keypair. Callers are responsible for persisting the result
-    /// (`private_key_openssh`) so `from_private_key_openssh` can reload the same CA on restart.
+    /// Generates a brand-new in-memory CA keypair. The private key lives only for the lifetime of
+    /// the operator process — it is never written out, so nothing can reload the same CA later.
     pub fn generate() -> Result<Self, CaError> {
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
         Ok(Self { key })
-    }
-
-    pub fn from_private_key_openssh(pem: &str) -> Result<Self, CaError> {
-        Ok(Self {
-            key: PrivateKey::from_openssh(pem)?,
-        })
-    }
-
-    pub fn private_key_openssh(&self) -> Result<String, CaError> {
-        Ok(self.key.to_openssh(LineEnding::LF)?.to_string())
     }
 
     /// The CA's public key in OpenSSH wire format — goes into a proxy pod's
@@ -154,17 +146,5 @@ mod tests {
 
         let other_fingerprint = other_ca.key.fingerprint(ssh_key::HashAlg::Sha256);
         assert!(cert.validate([&other_fingerprint]).is_err());
-    }
-
-    #[test]
-    fn ca_key_roundtrips_through_openssh_serialization() {
-        let ca = CertificateAuthority::generate().unwrap();
-        let serialized = ca.private_key_openssh().unwrap();
-        let reloaded = CertificateAuthority::from_private_key_openssh(&serialized).unwrap();
-
-        assert_eq!(
-            ca.public_key_openssh().unwrap(),
-            reloaded.public_key_openssh().unwrap()
-        );
     }
 }

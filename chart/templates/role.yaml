@@ -24,10 +24,10 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
-  # The CA Secret, and per-run managed-ssh host/client cert Secrets. get/list/watch/create/patch
-  # already come from the cluster-wide ClusterRole; only delete/deletecollection (cleanup) is added
-  # here. Cleanup's deletecollection is scoped to a run's PLAYBOOKPLAN_HASH label, which the CA
-  # Secret doesn't carry, so it's never swept up.
+  # Per-run managed-ssh host/client cert Secrets. get/list/watch/create/patch already come from
+  # the cluster-wide ClusterRole; only delete/deletecollection (cleanup) is added here. Cleanup's
+  # deletecollection is scoped to a run's PLAYBOOKPLAN_HASH label. (The operator's SSH CA is
+  # in-memory only and is never stored as a Secret.)
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["delete", "deletecollection"]

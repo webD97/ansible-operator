@@ -42,8 +42,8 @@ spec:
           env:
             # The operator learns its own namespace at runtime via the Downward API — this is
             # how it knows where to create per-run Leases, managed-ssh proxy pods/Secrets/
-            # NetworkPolicies, and its own CA Secret. It is NOT read from any chart value, so it
-            # is always correct regardless of what namespace this release is installed into.
+            # NetworkPolicies. It is NOT read from any chart value, so it is always correct
+            # regardless of what namespace this release is installed into.
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:

@@ -25,9 +25,9 @@ fullnameOverride: ""
 #   helm install --create-namespace -n ansible-system ansible-operator ./chart
 # All namespaced resources in this chart (Deployment, ServiceAccount, Role/RoleBinding) use
 # .Release.Namespace. That namespace is also where per-run Leases, managed-ssh proxy
-# pods/Secrets/NetworkPolicies, and the operator's own CA Secret live at runtime — never the
-# namespace a PlaybookPlan happens to be created in. Keeping this separate means only this one
-# namespace needs privileged-pod exceptions (Pod Security Admission), not every tenant namespace.
+# pods/Secrets/NetworkPolicies live at runtime — never the namespace a PlaybookPlan happens to
+# be created in. (The operator's SSH CA is in-memory only) Keeping this separate means only this
+# one namespace needs privileged-pod exceptions (Pod Security Admission), not every tenant namespace.
 
 serviceAccount:
   create: true

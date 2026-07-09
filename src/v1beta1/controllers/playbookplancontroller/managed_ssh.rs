@@ -486,8 +486,9 @@ pub async fn ensure_proxy_infra(
 /// Deletes every operator-namespace resource belonging to this run — proxy pods, their per-host
 /// Secrets, the run's NetworkPolicy, and the shared client-cert Secret — via label-scoped
 /// `delete_collection`. This is why the host list isn't needed: GC-by-label catches everything
-/// tagged with the run's hash regardless of how the inventory drifted since the run started. The
-/// CA Secret carries no such label, so it's never swept up. Not reliant on ownerReferences, since
+/// tagged with the run's hash regardless of how the inventory drifted since the run started.
+/// (The CA is in-memory only, not a Secret, so nothing CA-related is in scope here.) Not reliant
+/// on ownerReferences, since
 /// Kubernetes GC doesn't act on references that cross namespaces (these live in the operator's
 /// namespace, the Job/PlaybookPlan live in the target namespace). Best-effort: delete errors are
 /// ignored, the next run's cleanup retries.
