@@ -1,0 +1,103 @@
+# Reading results and troubleshooting
+
+The operator reports everything about a run on the plan's `.status`. There is no separate dashboard
+and you do not need pod logs — the per-host recap travels back via the Job container's termination
+message, so `kubectl` is enough.
+
+## At a glance
+
+The `PlaybookPlan` has printer columns, so a quick look is:
+
+```sh
+kubectl get playbookplan -n my-team
+# NAME            MODE        SCHEDULE     PREVIOUS RUN  NEXT RUN  CURRENT HASH  READY  RUNNING  SUMMARY          PHASE       AGE
+```
+
+For detail, `kubectl describe playbookplan <name>` (or `-o yaml`) shows the phase, conditions,
+per-host status, and the summary line.
+
+## Phases
+
+`.status.phase` is one of:
+
+| Phase | Meaning |
+|---|---|
+| `Pending` | Triggers not yet evaluated — the resting state right after creation or after the inputs changed. |
+| `Delayed` | Execution was deferred (e.g. waiting on a lock or on proxy readiness). Transient. |
+| `Applying` | A Job is running the playbook right now. The `Running` condition is `True`. |
+| `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
+| `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |
+| `Failed` | (`OneShot`) The run finished but some host could not be brought current. |
+| `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
+
+## Conditions
+
+`.status.conditions` carries two `True`/`False` conditions surfaced as columns:
+
+- **`Ready`** — the plan is in a healthy, settled state.
+- **`Running`** — a Job is currently applying the playbook.
+
+`.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
+current [execution hash](./scheduling-and-modes.md#drift-detection-the-execution-hash).
+
+## Per-host outcomes
+
+`.status.hostsStatus` maps each targeted host to its result. `lastOutcome` is one of:
+
+| Outcome | Meaning |
+|---|---|
+| `Succeeded` | Ansible applied the playbook to this host successfully. `lastAppliedHash` is bumped to the current hash. |
+| `Failed` | Ansible reached the host but a task failed. |
+| `NotReached` | The host was in scope but Ansible never got to it — e.g. an earlier host in its `serial` batch stopped the play. Not an error *on this host*. |
+| `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
+
+Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
+detection compares against) and `lastTransitionTime`.
+
+## Troubleshooting
+
+### The plan is stuck in `UnauthorizedNamespace`
+
+The plan's namespace has not been **enrolled** with the operator, so the operator has no RBAC to
+read its Secrets or create its Job and refuses to run it — fail-closed. This is a cluster-admin
+action, not something you can fix from the tenant side: an admin must add your namespace to the
+chart's `watchNamespaces` and roll the operator. See
+[Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
+
+### A `ClusterInventory` resolves to zero hosts (for me)
+
+If Nodes clearly match your selector but the plan still targets nothing, the likely cause is that no
+`NodeAccessPolicy` grants your namespace those Nodes. Node access is **fail-closed**: with no
+matching policy a namespace may reach no Nodes at all. Check `.status.eligibleHosts` on the plan and
+ask your admin which policy applies to your namespace (see
+[Node access policies](../cluster-operators/node-access-policies.md)). The `ClusterInventory`'s own
+`.status.hostCount` shows how many Nodes match *before* policy clamping, which helps localise the
+problem.
+
+### Hosts show `NotReached`
+
+Expected when a play stops early — for example a `serial` batch that failed before reaching later
+hosts, or a `run_once` task that aborted. Fix the host that actually failed (its outcome is
+`Failed`); the `NotReached` hosts should proceed on the next run.
+
+### Hosts show `Unknown`
+
+This means the operator could not parse a recap for the host — the operator's instrumentation, not
+the playbook, is the suspect. Common causes: the run image is missing something the recap callback
+needs, or the Job pod was killed before it could write its termination message (a disruptive
+playbook that took down its own runner is one way). Inspect the (not-yet-reaped) Job pod; raising
+`spec.ttlSecondsAfterFinished` buys time to look before it is cleaned up.
+
+### A change is not being picked up
+
+Only inputs that feed the
+[execution hash](./scheduling-and-modes.md#drift-detection-the-execution-hash) — the playbook text
+and the **contents** of referenced Secrets — trigger a re-run of already current hosts. Editing an
+unrelated `spec` field (or a schedule that has not fired yet) will not. Confirm `.status.currentHash`
+actually changed after your edit.
+
+### It never seems to run
+
+Check the `schedule`/`timeZone` and `.status.nextRun`. Remember that `OneShot` goes quiet once every
+host is current — that is success, not a hang. A `Recurring` plan with no `schedule` has nothing
+telling it when to fire.

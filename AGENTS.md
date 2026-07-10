@@ -195,6 +195,37 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
   namespace — a policy created in a tenant namespace still gets a populated status yet is
   ignored (fail-closed). Author policies in the operator namespace.
 
+## User & operator documentation (`docs/` mdBook) — keep in sync with the code
+
+End-user and cluster-operator docs are an **mdBook** under `docs/` (`docs/book.toml`, chapters in
+`docs/src/*.md`, TOC in `docs/src/SUMMARY.md`; `just docs` builds it to the git-ignored `docs/book/`).
+This is the narrative guide; rustdoc (`just apidoc`) is the separate API reference for the code. Two
+chapters: `docs/src/running-playbooks/` (users authoring PlaybookPlans/inventories) and
+`docs/src/cluster-operators/` (admins installing/securing the operator). The guide is **part of the
+change surface** — a behaviour/API/security change is not done until the matching page is updated. Map:
+
+- CRD field / default / enum change → the page for that resource under `running-playbooks/`:
+  `playbook-plans.md` (PlaybookPlan), `cluster-nodes.md` (ClusterInventory), `external-hosts.md`
+  (StaticInventory), `variables-and-files.md` (`template.variables`/`files`), `scheduling-and-modes.md`
+  (`schedule`/`mode`/hash), `results-and-troubleshooting.md` (status/phases/outcomes); or
+  `cluster-operators/node-access-policies.md` (NodeAccessPolicy).
+- Chart / deploy / RBAC / PSA / SELinux / proxy-image / `watchNamespaces` change → `cluster-operators/deployment.md`.
+- Threat-model / invariant change → `cluster-operators/security.md` (a **summary**; `THREAT_MODEL.md`
+  stays the source of truth — the page says so, so update both and keep them consistent).
+- Secret-key conventions the user must match (`variables.yaml`; StaticInventory `id_rsa`/`known_hosts`;
+  file mount paths under `/run/ansible-operator/files/<name>`) live in `variables-and-files.md` /
+  `external-hosts.md` — re-verify against `workspace.rs`/`job_builder.rs`/`inventory_renderer.rs`/`paths.rs`
+  if you touch those.
+
+Conventions: the guide is **prose** — refer to CRD types as inline code (`` `PlaybookPlan` ``) and
+defer exhaustive field lists to the API reference (`ansible-operator crds` / `just apidoc`), don't
+restate whole field tables. Cross-references between pages are **relative markdown links**
+(`./playbook-plans.md`, `../cluster-operators/deployment.md#enrolled-namespaces`); heading anchors are
+mdBook slugs (lowercase, punctuation stripped, spaces→`-`), so a link into `## The proxy image`
+becomes `#the-proxy-image`. Verify with `just docs`; adding/removing a page also needs a `SUMMARY.md`
+entry (a page missing from `SUMMARY.md` is not rendered). mdBook has no built-in broken-link check, so
+eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed).
+
 ## Testing & workflow
 
 - `cargo test` — unit tests colocated in `#[cfg(test)] mod tests` at the bottom of each file
@@ -207,7 +238,9 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
   (that's what the `StrictModes no` unit assertion guards — see the test's doc comment).
 - `cargo clippy` is clean and there's no `clippy.toml`; keep it clean (a scoped
   `#[allow(clippy::too_many_arguments)]` on `ensure_proxy_infra` is the only deliberate
-  exception). Run `cargo build` + `cargo test` + `cargo clippy` before proposing changes.
+  exception). Run `cargo build` + `cargo test` + `cargo clippy` before proposing changes — and
+  the guide build (`just docs`) if you touched `docs/` or user-facing behaviour/CRDs/chart.
+  `just check` runs everything (build + test + clippy + guide + apidoc); see the `Justfile` for recipes.
 - `./ansible-operator crds` dumps all **four** CRDs (PlaybookPlan, ClusterInventory,
   StaticInventory, NodeAccessPolicy) — check this path after changing any `CustomResource` type.
 - The chart renders `managedSsh.proxyImage` and `watchNamespaces` into the operator ConfigMap;

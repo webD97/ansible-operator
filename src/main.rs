@@ -1,3 +1,15 @@
+//! # Ansible Operator
+//!
+//! A Kubernetes operator that runs Ansible playbooks against your cluster's own Nodes and against
+//! arbitrary external hosts, on a schedule, idempotently, without a standing privileged agent on
+//! your nodes.
+//!
+//! This is the generated **API reference** for the operator binary's internals. The narrative
+//! **user & operator guide** — what the operator does, how to author `PlaybookPlan`s and
+//! inventories, and how to deploy and secure it — is a separate mdBook under `docs/` (build it with
+//! `just docs`, or read the published site). Start there unless you are working on the operator
+//! itself.
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
