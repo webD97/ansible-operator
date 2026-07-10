@@ -10,13 +10,13 @@ one could otherwise target *any* Node — the policy is what stops that.
 > managed-SSH plans target nothing. This is the single most common "why does my `ClusterInventory`
 > resolve to no hosts?" cause.
 
-## Where to author them
+## Who can author them
 
-Author policies **in the operator's own namespace** (e.g. `ansible-system`). The CRD is namespaced
-and the API server will accept a policy created anywhere — but **enforcement reads only the operator
-namespace**. A policy created in a tenant namespace still gets a populated `.status` (so it looks
-like it is "working"), yet is completely ignored by enforcement. Restricting who can write to the
-operator namespace via RBAC is therefore what makes this an *admin* control rather than a tenant one.
+`NodeAccessPolicy` is a **cluster-scoped** resource — it has no namespace. Creating one requires
+cluster-level RBAC (the `nodeaccesspolicies` resource in the `ansible.cloudbending.dev` API group),
+which is what makes this an *admin* control rather than a tenant one: an ordinary tenant with rights
+in their own namespace cannot mint a policy that widens their own Node access. Enforcement considers
+**every** `NodeAccessPolicy` in the cluster.
 
 ## What a policy says
 
@@ -33,8 +33,7 @@ a `matchLabels`/`matchExpressions` selector, like Kubernetes' own):
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: NodeAccessPolicy
 metadata:
-  name: business-team
-  namespace: ansible-system      # the operator namespace — admin-only via RBAC
+  name: business-team            # cluster-scoped — no namespace
 spec:
   namespaceSelector:
     matchLabels:
@@ -58,7 +57,6 @@ apiVersion: ansible.cloudbending.dev/v1beta1
 kind: NodeAccessPolicy
 metadata:
   name: cluster-admins
-  namespace: ansible-system
 spec:
   namespaceSelector:
     matchLabels:

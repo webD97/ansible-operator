@@ -231,6 +231,7 @@ spec:
                 - Scheduled
                 - Failed
                 - Succeeded
+                - UnauthorizedNamespace
                 type: string
               retryCount:
                 description: |-

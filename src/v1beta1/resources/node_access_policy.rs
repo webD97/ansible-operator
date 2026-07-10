@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::v1beta1::LabelSelector;
 
-/// Cluster-admin-authored policy — living in the operator namespace — that caps which cluster Nodes
-/// a namespace's `ClusterInventory` resources may resolve.
+/// Cluster-admin-authored, **cluster-scoped** policy that caps which cluster Nodes a namespace's
+/// `ClusterInventory` resources may resolve.
 ///
 /// `ClusterInventory` confers node-root (its managed-ssh proxy pods run with hostPID + nsenter), so
 /// any namespace allowed to create one could otherwise target *any* node. A `NodeAccessPolicy` maps
@@ -14,10 +14,10 @@ use crate::v1beta1::LabelSelector;
 ///
 /// # Trust model
 ///
-/// The policy is authored by whoever can write to the operator namespace (the cluster admin) — a
-/// different principal than the tenant who authors the `ClusterInventory`. Enforcement is an
-/// intersection, so it can only ever *shrink* a tenant's node set: a forged or buggy request can
-/// never reach a node the policy didn't grant.
+/// The policy is cluster-scoped, so authoring one requires cluster-level RBAC (the cluster admin) —
+/// a different principal than the tenant who authors the namespaced `ClusterInventory`. Enforcement
+/// is an intersection, so it can only ever *shrink* a tenant's node set: a forged or buggy request
+/// can never reach a node the policy didn't grant.
 ///
 /// # Fail-closed
 ///
@@ -30,7 +30,6 @@ use crate::v1beta1::LabelSelector;
     group = "ansible.cloudbending.dev",
     version = "v1beta1",
     kind = "NodeAccessPolicy",
-    namespaced,
     status = "NodeAccessPolicyStatus",
     printcolumn = r#"{"name":"Allowed nodes","type":"integer","jsonPath":".status.allowedNodeCount"}"#
 )]

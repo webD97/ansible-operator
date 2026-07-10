@@ -62,7 +62,7 @@ src/v1beta1/
     playbookplan.rs                  PlaybookPlan: spec, status, Phase (incl. UnauthorizedNamespace)
     cluster_inventory.rs             ClusterInventory: hosts resolved from Node labels → managed-ssh (node-root)
     static_inventory.rs              StaticInventory: literal names/IPs + embedded SSH config (BYO key); no controller/status
-    node_access_policy.rs            NodeAccessPolicy: admin-authored namespace→node ceiling (namespaced CRD; enforcement reads only the operator ns)
+    node_access_policy.rs            NodeAccessPolicy: admin-authored namespace→node ceiling (cluster-scoped CRD; enforcement reads all policies)
     generic.rs                       NodeSelectorTerm/SelectorExpression, LabelSelector, GenericMap
   controllers/
     playbookplancontroller/          the big one — see below
@@ -191,9 +191,9 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
   `k8s_openapi::…::Volume` via `serde_json` (any volume type without hand-modeling); errors
   surface per-item as `Result`, not a panic.
 - `ansible/playbook_renderer.rs` re-parses+re-serializes the playbook mostly as validation.
-- The `NodeAccessPolicy` CRD is *namespaced*, but enforcement reads **only** the operator
-  namespace — a policy created in a tenant namespace still gets a populated status yet is
-  ignored (fail-closed). Author policies in the operator namespace.
+- The `NodeAccessPolicy` CRD is *cluster-scoped* — creating one requires cluster RBAC, which is
+  what makes it an admin (not tenant) control. Enforcement reads **every** policy in the cluster;
+  a namespace's allow-set is the union across all policies whose `namespaceSelector` matches it.
 
 ## User & operator documentation (`docs/` mdBook) — keep in sync with the code
 

@@ -57,9 +57,9 @@ struct ReconciliationContext {
     /// The operator's ephemeral SSH certificate authority — generated in memory at startup and
     /// never persisted, so an operator restart rotates it (see `main.rs`/`ca.rs`).
     ca: Arc<CertificateAuthority>,
-    /// Reflector-backed cache of the admin-authored `NodeAccessPolicy` resources in the operator
-    /// namespace, read by `node_access::enforce` to clamp managed-ssh nodes without a per-reconcile
-    /// list. Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
+    /// Reflector-backed cache of the admin-authored, cluster-scoped `NodeAccessPolicy` resources,
+    /// read by `node_access::enforce` to clamp managed-ssh nodes without a per-reconcile list.
+    /// Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
     /// affected plans via `mappers::node_access_policy_to_playbookplans`.
     node_access_policies: Arc<Store<NodeAccessPolicy>>,
     /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5).
@@ -96,9 +96,8 @@ pub fn new(
     // seen and reported (`Phase::UnauthorizedNamespace`) rather than silently ignored (CRD reads stay
     // cluster-wide — see R1). Secret/Job watches below, by contrast, are scoped to the enrolled set.
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
-    // Policies only ever govern managed-ssh in the operator namespace, so cache/watch just those.
-    let node_access_policies_api: Api<NodeAccessPolicy> =
-        Api::namespaced(client.clone(), &operator_namespace);
+    // NodeAccessPolicy is cluster-scoped (admin-authored via cluster RBAC); cache/watch all of them.
+    let node_access_policies_api: Api<NodeAccessPolicy> = Api::all(client.clone());
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
 

@@ -44,7 +44,7 @@ schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
 | A1 | **Root on cluster nodes** (via proxy pods) | The ultimate target. Node-root ⇒ container escape, kubelet credential theft, cluster takeover. |
 | A2 | **The operator's SSH CA private key** (in-memory only, held in the operator process) | Signs *both* host and client certs. Whoever holds it can mint a client cert with principal `root` and SSH into any proxy pod → A1. Never persisted to the cluster; an operator restart rotates it. No in-process rotation or revocation. |
 | A3 | **Per-run client-cert Secret** (`managed-ssh-client-<hash>`, plan ns) | A live credential trusted by every proxy pod of that run. Created in the plan namespace so the Job pod can mount it (pods only mount same-namespace Secrets); owner-referenced to the PlaybookPlan and deleted by name at run completion. |
-| A4 | **NodeAccessPolicy resources** (operator ns) | The admin-authored ceiling that decides which namespace may target which nodes. Tampering = privilege escalation to more nodes. |
+| A4 | **NodeAccessPolicy resources** (cluster-scoped) | The admin-authored ceiling that decides which namespace may target which nodes. Cluster-scoped, so authoring one needs cluster RBAC. Tampering = privilege escalation to more nodes. |
 | A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read Secrets in its enrolled namespaces (operator ns ∪ `watchNamespaces`), not cluster-wide. |
 | A6 | **Playbook content & execution integrity** | The playbook runs as root on nodes. Tampering with it = arbitrary node code execution. |
 | A7 | **Cluster control plane / node kubelet identities** | Reachable *from* a rooted node (A1); the blast radius of A1. |
@@ -57,7 +57,7 @@ schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
 flowchart TB
   subgraph AdminDomain["Cluster-admin trust domain (most trusted)"]
     Admin["Cluster admin\n(Helm values, operator ns RBAC,\nNodeAccessPolicy)"]
-    NAP["NodeAccessPolicy\n(operator ns)"]
+    NAP["NodeAccessPolicy\n(cluster-scoped)"]
   end
 
   subgraph OperatorDomain["Operator trust domain (highly privileged)"]
@@ -101,10 +101,10 @@ flowchart TB
 - **TB-3 — Proxy pod → Node (privilege).** `nsenter` into host namespaces. This boundary
   is *intentionally collapsed* — that is the feature. The controls are all upstream of
   the SSH session (who gets a cert, which node the pod lands on).
-- **TB-4 — Admin → Operator (policy authorship).** `NodeAccessPolicy` lives in the operator
-  namespace, writable only by the admin (the CA is not a Secret — the operator mints it
-  in memory). The value of the whole scheme is that policy and request come from
-  **independent principals** (see §5, T-ESC-1).
+- **TB-4 — Admin → Operator (policy authorship).** `NodeAccessPolicy` is cluster-scoped,
+  writable only by principals with cluster RBAC (i.e. the admin; the CA is not a Secret — the
+  operator mints it in memory). The value of the whole scheme is that policy and request come
+  from **independent principals** (see §5, T-ESC-1).
 
 **Design principle (load-bearing):** a check only has teeth when its two sides come from
 independent principals. The *request* (ClusterInventory) is tenant-authored; the

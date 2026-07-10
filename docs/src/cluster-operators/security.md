@@ -28,8 +28,9 @@ Both default to "deny", by design. Neither is a suggestion you can skip:
 
 ## How node access is enforced (why it is trustworthy)
 
-A `NodeAccessPolicy` is authored only by principals who can write to the operator namespace (i.e.
-cluster admins) — a **different principal** than the tenant who authors the `ClusterInventory`.
+A `NodeAccessPolicy` is a cluster-scoped resource, so it is authored only by principals with
+cluster-level RBAC (i.e. cluster admins) — a **different principal** than the tenant who authors the
+namespaced `ClusterInventory`.
 Enforcement is a set **intersection**: a plan's requested Nodes are intersected with the union of
 Nodes the matching policies grant that namespace, so it can only ever *shrink* the request. A forged,
 buggy, or over-broad `ClusterInventory` can never reach a Node no policy allowed. The clamp runs at

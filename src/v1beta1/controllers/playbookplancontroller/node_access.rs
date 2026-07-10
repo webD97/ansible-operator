@@ -22,8 +22,8 @@ use crate::v1beta1::{
 /// excluded (for logging/status). Non-managed-ssh (`StaticInventory`) groups are untouched — they
 /// carry their own credentials and aren't node-root, so they're outside this policy.
 ///
-/// `policies` is the reflector-cached view of the operator namespace's `NodeAccessPolicy` resources
-/// (admin-authored, stable) — cheap to read every reconcile. The Node set is deliberately fetched
+/// `policies` is the reflector-cached view of the cluster's `NodeAccessPolicy` resources
+/// (cluster-scoped, admin-authored, stable) — cheap to read every reconcile. The Node set is fetched
 /// *live* rather than cached: it's the authoritative allow-set for a security gate, so it must not
 /// serve a node stale-labelled into a pool it has since left.
 pub async fn enforce(
@@ -58,7 +58,7 @@ async fn allowed_nodes_for_namespace(
     let namespace = namespaces.get(plan_namespace).await?;
     let namespace_labels = namespace.labels().clone();
 
-    // Policies are admin-authored, cached from the operator namespace.
+    // Policies are admin-authored, cluster-scoped, cached by the reflector.
     let policies = policies.state();
     let granting: Vec<&NodeAccessPolicy> = policies
         .iter()

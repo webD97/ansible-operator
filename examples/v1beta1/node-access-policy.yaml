@@ -1,8 +1,9 @@
 apiVersion: ansible.cloudbending.dev/v1beta1
 kind: NodeAccessPolicy
+# NodeAccessPolicy is cluster-scoped — no namespace. Creating one requires cluster-level RBAC, so
+# only cluster admins can author policies.
 metadata:
   name: business-team
-  namespace: ansible-system # the operator namespace — admin-only via RBAC
 spec:
   # Grant to a single namespace by its auto-stamped name label. Use matchExpressions here to cover
   # several namespaces at once, e.g. { key: team, operator: In, values: [business, payments] }.
@@ -18,7 +19,6 @@ apiVersion: ansible.cloudbending.dev/v1beta1
 kind: NodeAccessPolicy
 metadata:
   name: cluster-admins
-  namespace: ansible-system
 spec:
   # The admin's own namespace may target every node. Note there is no "match all" shortcut — an
   # empty selector matches nothing (fail-closed), so allow-all is expressed explicitly by matching a

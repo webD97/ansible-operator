@@ -13,9 +13,10 @@ helm install --create-namespace -n ansible-system ansible-operator ./chart
 ```
 
 Do **not** create `PlaybookPlan`s or inventories in the operator's own namespace — those belong in
-tenant namespaces. The operator namespace is where its runtime machinery lives: per-run Leases, the
-managed-SSH proxy pods/Secrets/NetworkPolicies, and the admin-authored `NodeAccessPolicy` objects.
-Keeping it separate means only this one namespace needs the privileged-pod exception below.
+tenant namespaces. The operator namespace is where its runtime machinery lives: per-run Leases and
+the managed-SSH proxy pods/Secrets/NetworkPolicies. (The admin-authored `NodeAccessPolicy` objects
+are cluster-scoped and live nowhere in particular.) Keeping it separate means only this one namespace
+needs the privileged-pod exception below.
 
 ## Pod Security Admission
 

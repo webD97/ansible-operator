@@ -87,9 +87,6 @@ async fn reconcile(
     object: Arc<NodeAccessPolicy>,
     context: Arc<ReconciliationContext>,
 ) -> Result<Action, ReconcileError> {
-    let namespace = ResourceExt::namespace(object.as_ref())
-        .ok_or(ReconcileError::PreconditionFailed("namespace not set"))?;
-
     // Fail-closed matching, identical to the enforcement path: an empty selector matches nothing.
     let namespaces_api: Api<Namespace> = Api::all(context.client.clone());
     let all_namespaces = namespaces_api.list_metadata(&ListParams::default()).await?;
@@ -116,7 +113,7 @@ async fn reconcile(
         allowed_nodes,
     };
 
-    let api: Api<NodeAccessPolicy> = Api::namespaced(context.client.clone(), &namespace);
+    let api: Api<NodeAccessPolicy> = Api::all(context.client.clone());
     patch_status(&api, &object, next_status).await?;
 
     Ok(Action::requeue(Duration::from_hours(1)))

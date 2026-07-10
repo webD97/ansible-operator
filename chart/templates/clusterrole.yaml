@@ -31,8 +31,8 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
-  # NodeAccessPolicy resources are admin-authored and only ever read by the operator (they live in
-  # the operator's own namespace; see also the Role). Read cluster-wide for simplicity/watch reuse.
+  # NodeAccessPolicy is a cluster-scoped resource, admin-authored (creating one requires cluster RBAC)
+  # and only ever read by the operator — never created or deleted by it.
   - apiGroups: ["ansible.cloudbending.dev"]
     resources: ["nodeaccesspolicies"]
     verbs: ["get", "list", "watch"]
