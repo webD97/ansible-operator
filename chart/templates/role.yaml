@@ -20,11 +20,14 @@ metadata:
 rules:
   # Plan-serving grants (R1) — scoped to enrolled namespaces only:
   #  - the workspace Secret is created/patched here and variable/file Secrets are read here;
+  #  - the per-run managed-ssh client-cert Secret is created here (the Job pod mounts it, and pods
+  #    can only mount Secrets from their own namespace) and deleted here at run completion, so
+  #    `delete` is required in every enrolled namespace, not just the operator's;
   #  - one Job per run is created + watched here;
   #  - the run's Job-owned pod is read here for its termination message.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "patch"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch", "create"]

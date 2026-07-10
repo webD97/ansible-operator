@@ -43,7 +43,7 @@ schedule onto, plus read/write access to Secrets in its **enrolled** namespaces
 |---|-------|----------------|
 | A1 | **Root on cluster nodes** (via proxy pods) | The ultimate target. Node-root ⇒ container escape, kubelet credential theft, cluster takeover. |
 | A2 | **The operator's SSH CA private key** (in-memory only, held in the operator process) | Signs *both* host and client certs. Whoever holds it can mint a client cert with principal `root` and SSH into any proxy pod → A1. Never persisted to the cluster; an operator restart rotates it. No in-process rotation or revocation. |
-| A3 | **Per-run client-cert Secret** (`managed-ssh-client-<hash>`, plan ns) | A live credential trusted by every proxy pod of that run. Mounted into the Job pod. |
+| A3 | **Per-run client-cert Secret** (`managed-ssh-client-<hash>`, plan ns) | A live credential trusted by every proxy pod of that run. Created in the plan namespace so the Job pod can mount it (pods only mount same-namespace Secrets); owner-referenced to the PlaybookPlan and deleted by name at run completion. |
 | A4 | **NodeAccessPolicy resources** (operator ns) | The admin-authored ceiling that decides which namespace may target which nodes. Tampering = privilege escalation to more nodes. |
 | A5 | **Tenant Secrets** referenced by PlaybookPlans (vars, files, StaticInventory SSH keys) | Contain credentials the playbook uses; the operator can read Secrets in its enrolled namespaces (operator ns ∪ `watchNamespaces`), not cluster-wide. |
 | A6 | **Playbook content & execution integrity** | The playbook runs as root on nodes. Tampering with it = arbitrary node code execution. |
@@ -215,10 +215,13 @@ Secret access is granted per **enrolled** namespace via a `Role`/`RoleBinding`
   `status.phase = UnauthorizedNamespace` before any Secret/Job call (fail-closed; no "all namespaces"
   escape hatch). Distroless image, no shell.
 - *Residual:* within the enrolled namespaces the grant is still broad — operator compromise ⇒
-  disclosure of Secrets in *those* namespaces and a Job-create write primitive *there*. Widening
-  `watchNamespaces` widens the blast radius accordingly; enrol conservatively.
-- *Severity:* **Medium** — compromise discloses Secrets and yields a Job-create primitive only within
-  the enrolled namespaces, not cluster-wide; the blast radius is bounded to the enrolled namespaces.
+  disclosure of Secrets in *those* namespaces, plus Job-create and Secret-`delete` write primitives
+  *there* (the per-run client-cert Secret is created and reaped in the plan namespace, so `delete` is
+  granted per enrolled namespace, not just the operator's). Widening `watchNamespaces` widens the
+  blast radius accordingly; enrol conservatively.
+- *Severity:* **Medium** — compromise discloses Secrets and yields Job-create / Secret-delete
+  primitives only within the enrolled namespaces, not cluster-wide; the blast radius is bounded to the
+  enrolled namespaces.
 
 **T-INFO-2 — CA private key disclosure.**
 - *Mitigation:* the CA is generated in-memory at operator startup and **never persisted** —
@@ -411,8 +414,8 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 
 | Resource | Verbs | Scope | Risk note |
 |----------|-------|-------|-----------|
-| secrets | get,list,watch,create,patch | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces, not cluster-wide. |
-| secrets | delete,deletecollection | operator ns | Run cleanup. |
+| secrets | get,list,watch,create,patch,delete | **enrolled ns only** | Reads/writes Secrets only in enrolled namespaces, not cluster-wide. `delete` reaps the per-run managed-ssh client-cert Secret, created in the plan namespace so the Job pod can mount it. |
+| secrets | delete,deletecollection | operator ns | Run cleanup (per-host proxy Secrets). |
 | jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. |
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
@@ -428,8 +431,8 @@ The *enrolled set* = the operator's own namespace (always) ∪ the chart's `watc
 `ClusterRole` (see [`role.yaml`](chart/templates/role.yaml)).
 
 **Net:** the operator is **Tier-0** for node-root capability *on enrolled namespaces*. Operator
-compromise does not imply whole-cluster Secret disclosure or a cluster-wide Job-create primitive —
-the blast radius is bounded to the enrolled namespaces. Node-root reach into only a few enrolled
+compromise does not imply whole-cluster Secret disclosure or a cluster-wide Job-create/Secret-delete
+primitive — the blast radius is bounded to the enrolled namespaces. Node-root reach into only a few enrolled
 tenant namespaces is materially smaller than "≈ cluster compromise."
 
 ---

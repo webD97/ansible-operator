@@ -13,7 +13,7 @@ use k8s_openapi::{
         },
     },
     apimachinery::pkg::{
-        apis::meta::v1::{LabelSelector, ObjectMeta},
+        apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference},
         util::intstr::IntOrString,
     },
 };
@@ -422,10 +422,17 @@ fn render_client_cert_files(
 
 /// Ensures this run's client-cert Secret exists — one client identity trusted by every proxy pod
 /// via the CA, not per-host `authorized_keys`. Idempotent.
+///
+/// `secrets_api` MUST be scoped to the **plan** namespace, not the operator namespace: the ansible
+/// Job pod (which lives in the plan namespace) mounts this Secret by name, and a pod can only mount
+/// Secrets from its own namespace. The `plan_owner` `OwnerReference` (the PlaybookPlan, same
+/// namespace) is the crash-safety backstop — Kubernetes GC reaps the Secret if the plan is deleted
+/// before `cleanup_proxy_infra`'s explicit delete runs; the explicit delete is the primary path.
 async fn ensure_client_cert(
     secrets_api: &Api<Secret>,
     execution_hash: &ExecutionHash,
     ca: &CertificateAuthority,
+    plan_owner: &OwnerReference,
 ) -> Result<(), ReconcileError> {
     let name = client_cert_secret_name(execution_hash);
 
@@ -442,6 +449,7 @@ async fn ensure_client_cert(
                 labels::PLAYBOOKPLAN_HASH.to_string(),
                 execution_hash.to_string(),
             )])),
+            owner_references: Some(vec![plan_owner.clone()]),
             ..Default::default()
         },
         string_data: Some(string_data),
@@ -455,6 +463,9 @@ async fn ensure_client_cert(
 
 /// Ensures a proxy pod (+ its Secret + the run's NetworkPolicy) exists and is Ready for every
 /// host in `hosts`. Safe to call every reconcile tick — only missing pieces are created.
+// Each argument is a distinct, unrelated input (two namespaces, run identity, hosts, CA, image,
+// owner); bundling them into a struct would only move the noise, so keep them explicit.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
@@ -464,10 +475,16 @@ pub async fn ensure_proxy_infra(
     tolerations: Option<&[Toleration]>,
     ca: &CertificateAuthority,
     proxy_image: &str,
+    plan_owner: &OwnerReference,
 ) -> Result<ProxyReadiness, ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
+    // The client-cert Secret is the one piece of proxy infra that lives in the PLAN namespace, not
+    // the operator namespace — the ansible Job pod mounts it, and pods can only mount Secrets from
+    // their own namespace. Everything else here (proxy pods, per-host Secrets, NetworkPolicy) stays
+    // in the operator namespace.
+    let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
 
     if !hosts.is_empty() {
         let netpol_name = format!("managed-ssh-{:x}", {
@@ -480,7 +497,7 @@ pub async fn ensure_proxy_infra(
             netpol_api.create(&PostParams::default(), &netpol).await?;
         }
 
-        ensure_client_cert(&secrets_api, execution_hash, ca).await?;
+        ensure_client_cert(&job_secrets_api, execution_hash, ca, plan_owner).await?;
     }
 
     let mut ready = Vec::new();
@@ -532,29 +549,37 @@ pub async fn ensure_proxy_infra(
     })
 }
 
-/// Deletes every operator-namespace resource belonging to this run — proxy pods, their per-host
-/// Secrets, the run's NetworkPolicy, and the shared client-cert Secret — via label-scoped
-/// `delete_collection`. This is why the host list isn't needed: GC-by-label catches everything
-/// tagged with the run's hash regardless of how the inventory drifted since the run started.
-/// (The CA is in-memory only, not a Secret, so nothing CA-related is in scope here.) Not reliant
-/// on ownerReferences, since
-/// Kubernetes GC doesn't act on references that cross namespaces (these live in the operator's
-/// namespace, the Job/PlaybookPlan live in the target namespace). Best-effort: delete errors are
-/// ignored, the next run's cleanup retries.
+/// Deletes every resource belonging to this run: the operator-namespace proxy pods, their per-host
+/// Secrets and the run's NetworkPolicy via label-scoped `delete_collection`, plus the plan-namespace
+/// client-cert Secret by exact name. The operator-ns sweep is by-label so the host list isn't needed
+/// — GC-by-label catches everything tagged with the run's hash regardless of how the inventory
+/// drifted since the run started. (The CA is in-memory only, not a Secret, so nothing CA-related is
+/// in scope here.) The operator-ns resources can't use ownerReferences, since Kubernetes GC ignores
+/// references that cross namespaces (they live in the operator namespace, the Job/PlaybookPlan in the
+/// plan namespace). Best-effort: delete errors are ignored, the next run's cleanup retries.
 ///
-/// Pods use a tighter selector than the Secrets/NetworkPolicy: the ansible Job pod carries the same
-/// `PLAYBOOKPLAN_HASH` label (the run's NetworkPolicy targets it by that label) but is NOT proxy
-/// infra — it must be reaped by its own Job's `ttlSecondsAfterFinished`, never here. That only
-/// collides when the operator and the plan share a namespace, but requiring the per-host
+/// The client-cert Secret is deleted **by name**, not by the hash label: it lives in the plan
+/// namespace where the ansible Job and its pod carry that same `PLAYBOOKPLAN_HASH` label, so a
+/// label-scoped `delete_collection` there would also sweep them. Its ownerReference on the
+/// PlaybookPlan is the backstop if this explicit delete never runs (operator crash / plan deleted
+/// mid-run). Deleting it is not the revocation mechanism — that is the deletion of the proxy pods
+/// below, after which the cert authenticates to nothing (INV-4 / T-INFO-3).
+///
+/// Pods use a tighter selector than the operator-ns Secrets/NetworkPolicy: the ansible Job pod
+/// carries the same `PLAYBOOKPLAN_HASH` label (the run's NetworkPolicy targets it by that label) but
+/// is NOT proxy infra — it must be reaped by its own Job's `ttlSecondsAfterFinished`, never here.
+/// That only collides when the operator and the plan share a namespace, but requiring the per-host
 /// `PLAYBOOKPLAN_HOST` label (which only proxy pods carry) excludes the ansible pod cleanly.
 pub async fn cleanup_proxy_infra(
     client: &kube::Client,
     operator_namespace: &str,
+    job_namespace: &str,
     execution_hash: &ExecutionHash,
 ) -> Result<(), ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
+    let job_secrets_api: Api<Secret> = Api::namespaced(client.clone(), job_namespace);
 
     let dp = DeleteParams::default();
     let hash_selector = format!("{}={execution_hash}", labels::PLAYBOOKPLAN_HASH);
@@ -568,6 +593,10 @@ pub async fn cleanup_proxy_infra(
     let _ = pods_api.delete_collection(&dp, &pods_lp).await;
     let _ = secrets_api.delete_collection(&dp, &rest_lp).await;
     let _ = netpol_api.delete_collection(&dp, &rest_lp).await;
+    // Plan-namespace client-cert Secret: by name, never by label (would catch the Job/pod). See doc.
+    let _ = job_secrets_api
+        .delete(&client_cert_secret_name(execution_hash), &dp)
+        .await;
 
     Ok(())
 }

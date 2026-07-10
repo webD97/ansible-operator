@@ -5,6 +5,7 @@ use k8s_openapi::api::{
     coordination::v1::Lease,
     core::v1::{Pod, Secret},
 };
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     Api,
     api::{ListParams, Patch, PatchParams, PostParams},
@@ -401,6 +402,10 @@ async fn try_start_run(
 
     let (managed_ssh_hosts, tolerations) = managed_ssh_hosts_and_tolerations(&run_groups);
 
+    // Owns the plan-namespace client-cert Secret so K8s GC reaps it if the plan is deleted before
+    // cleanup runs (the explicit per-run delete in `cleanup_proxy_infra` is the primary path).
+    let plan_owner = playbookplan_owner_ref(object)?;
+
     let proxy_readiness = managed_ssh::ensure_proxy_infra(
         &context.client,
         &context.operator_namespace,
@@ -410,6 +415,7 @@ async fn try_start_run(
         tolerations.as_deref(),
         &context.ca,
         &context.proxy_image,
+        &plan_owner,
     )
     .await?;
 
@@ -537,6 +543,7 @@ async fn advance_applying_run(
     managed_ssh::cleanup_proxy_infra(
         &context.client,
         &context.operator_namespace,
+        run.namespace,
         &run.execution_hash,
     )
     .await?;
@@ -844,6 +851,28 @@ async fn resolve_inventory(
     }
 
     Ok(groups)
+}
+
+/// Builds an `OwnerReference` to this PlaybookPlan for the plan-namespace resources it owns (the
+/// per-run managed-ssh client-cert Secret), so Kubernetes GC reaps them if the plan is deleted
+/// before explicit cleanup runs. Same pattern/namespace as the workspace secret
+/// (`workspace::render_secret`); a cross-namespace ownerReference would be ignored by GC, which is
+/// why the operator-namespace proxy infra uses label cleanup instead.
+fn playbookplan_owner_ref(object: &PlaybookPlan) -> Result<OwnerReference, ReconcileError> {
+    use kube::runtime::reflector::Lookup as _;
+    Ok(OwnerReference {
+        api_version: PlaybookPlan::api_version(&()).into(),
+        kind: PlaybookPlan::kind(&()).into(),
+        name: object
+            .name()
+            .ok_or(ReconcileError::PreconditionFailed("name not set"))?
+            .into(),
+        uid: object
+            .uid()
+            .ok_or(ReconcileError::PreconditionFailed("uid not set"))?
+            .into(),
+        ..Default::default()
+    })
 }
 
 fn extract_resource_info(object: &PlaybookPlan) -> Result<(&str, &str, i64), ReconcileError> {
