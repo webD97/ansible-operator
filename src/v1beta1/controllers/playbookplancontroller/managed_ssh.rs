@@ -111,12 +111,23 @@ fn run_labels(execution_hash: &ExecutionHash, host: &str) -> BTreeMap<String, St
 /// nsenter-ing the host's mount namespace already makes `/` the host's real root, so no chroot
 /// step is needed. `UsePAM` is omitted: some minimal sshd builds reject it outright (no PAM
 /// support), and auth here is pubkey/cert-only anyway.
+///
+/// `StrictModes no` is **required**, not cosmetic: the `AuthorizedPrincipalsFile` is the only file
+/// here that sshd runs through its `secure_filename` ownership/permission gate (the host key, host
+/// cert, ca.pub and this config are loaded directly and skip it). In-cluster those files live in a
+/// Kubernetes Secret mount — a tmpfs whose `..data/`-symlinked path and directory modes
+/// `secure_filename` refuses under the default `StrictModes yes`. sshd then silently *discards* the
+/// principals file, so no cert principal ever matches and every login fails with
+/// `Permission denied (publickey)`. Disabling StrictModes does not weaken isolation: the per-run
+/// `<hash>` principal check still runs (INV-4 / T-INFO-3); only the file-permission gate is skipped,
+/// and every file in the mount is operator-rendered and read-only.
 fn render_sshd_config() -> String {
     format!(
         "Port {PROXY_SSH_PORT}\n\
          HostKey {SSHD_CONFIG_MOUNT_PATH}/{HOST_KEY_FILENAME}\n\
          HostCertificate {SSHD_CONFIG_MOUNT_PATH}/{HOST_CERT_FILENAME}\n\
          TrustedUserCAKeys {SSHD_CONFIG_MOUNT_PATH}/{CA_PUB_FILENAME}\n\
+         StrictModes no\n\
          AuthorizedPrincipalsFile {SSHD_CONFIG_MOUNT_PATH}/{AUTHORIZED_PRINCIPALS_FILENAME}\n\
          ForceCommand {SSHD_CONFIG_MOUNT_PATH}/{ENTER_HOST_SCRIPT_FILENAME}\n\
          PermitRootLogin yes\n\
@@ -622,6 +633,10 @@ mod tests {
         assert!(config.contains(&format!(
             "AuthorizedPrincipalsFile {SSHD_CONFIG_MOUNT_PATH}/{AUTHORIZED_PRINCIPALS_FILENAME}"
         )));
+        // Required so sshd will actually READ the AuthorizedPrincipalsFile off the Kubernetes Secret
+        // mount — under the default `StrictModes yes`, secure_filename refuses the tmpfs/symlinked
+        // path and sshd discards the file, denying every login with `Permission denied (publickey)`.
+        assert!(config.contains("StrictModes no"));
         // HostCertificate isn't auto-discovered from the HostKey filename — omitting it makes
         // sshd present a bare key, failing host-key verification for `@cert-authority` clients.
         assert!(config.contains(&format!(
@@ -673,8 +688,14 @@ mod tests {
 /// production proxy image) configured entirely by `build_secret`/`render_sshd_config` must accept
 /// this run's client cert and reject another run's — purely on sshd's `AuthorizedPrincipalsFile`
 /// principal check, with the per-run NetworkPolicy out of the picture. It also exercises the host
-/// cert / `@cert-authority` known_hosts path and, crucially, sshd's StrictModes tolerance of the
-/// rendered config files (the runtime risk flagged when R3 was added).
+/// cert / `@cert-authority` known_hosts path.
+///
+/// NOTE: this test injects config via copy-to-container (a normal root-owned image-layer directory),
+/// so it does *not* reproduce the Kubernetes Secret tmpfs mount whose permissions make sshd's
+/// `secure_filename` refuse the `AuthorizedPrincipalsFile` under the default `StrictModes yes` — the
+/// real-cluster failure that forced `StrictModes no` in `render_sshd_config`. It therefore validates
+/// the principal *logic*, not the on-cluster mount permissions; keep the `StrictModes no` unit
+/// assertion as the guard for the latter.
 ///
 /// `#[ignore]`d by default — it needs a Docker/Podman API socket and an OpenSSH `ssh` client on the
 /// runner. With rootless podman (`systemctl --user start podman.socket`), run:
