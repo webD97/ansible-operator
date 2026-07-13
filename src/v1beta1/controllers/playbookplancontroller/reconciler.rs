@@ -296,19 +296,11 @@ async fn reconcile(
         holder_identity: &holder_identity,
     };
 
-    // What makes a run eligible to *start* this tick differs by mode:
-    //   - OneShot keeps applying until every host is on the current hash, then goes quiet — so it's
-    //     gated on there being outdated hosts left (which is exactly `hosts_to_trigger`).
-    //   - Recurring runs on every schedule tick regardless of host hashes (a successful run marks
-    //     all hosts up-to-date, so an outdated-based gate would fire once and never again). It's
-    //     gated only on having a schedule to tick on; slot dedup via `last_triggered_run` is what
-    //     stops a single tick from starting more than one run, and without a schedule there'd be no
-    //     slot to dedup against (it would busy-loop).
-    let eligible_to_start = !hosts_to_trigger.is_empty()
-        && match object.spec.mode {
-            ExecutionMode::OneShot => true,
-            ExecutionMode::Recurring => object.spec.schedule.is_some(),
-        };
+    let eligible_to_start = is_eligible_to_start(
+        &object.spec.mode,
+        object.spec.schedule.is_some(),
+        !hosts_to_trigger.is_empty(),
+    );
 
     if eligible_to_start && resource_status.phase != Phase::Applying {
         match timing {
@@ -372,6 +364,29 @@ fn slot_already_triggered(
     last_triggered_run: Option<DateTime<FixedOffset>>,
 ) -> bool {
     start.is_some() && start == last_triggered_run
+}
+
+/// Whether a run is eligible to *start* this tick, from the mode plus whether a schedule is set and
+/// whether any hosts still need triggering. Pure so the mode-specific gating is unit-testable — in
+/// particular the invariant that a schedule-less Recurring plan is never eligible.
+///
+///   - OneShot keeps applying until every host is on the current hash, then goes quiet — so it's
+///     gated purely on there being outdated hosts left (which is exactly `has_hosts_to_trigger`).
+///   - Recurring runs on every schedule tick regardless of host hashes (a successful run marks all
+///     hosts up-to-date, so an outdated-based gate would fire once and never again). It's gated only
+///     on having a schedule to tick on; slot dedup via `last_triggered_run` is what stops a single
+///     tick from starting more than one run, and without a schedule there'd be no slot to dedup
+///     against — it would busy-loop. That's why the schedule check lives here.
+fn is_eligible_to_start(
+    mode: &ExecutionMode,
+    has_schedule: bool,
+    has_hosts_to_trigger: bool,
+) -> bool {
+    has_hosts_to_trigger
+        && match mode {
+            ExecutionMode::OneShot => true,
+            ExecutionMode::Recurring => has_schedule,
+        }
 }
 
 /// Steps 2-5: acquire this run's per-host locks (all-or-nothing, renewed every tick for as long
@@ -1316,6 +1331,34 @@ spec:
             secrets,
             vec!["secret-with-variables", "secret-with-config-files"]
         );
+    }
+
+    #[test]
+    fn is_eligible_to_start_oneshot_gates_only_on_outdated_hosts() {
+        // OneShot with work to do starts whether or not a schedule is set.
+        assert!(is_eligible_to_start(&ExecutionMode::OneShot, false, true));
+        assert!(is_eligible_to_start(&ExecutionMode::OneShot, true, true));
+        // Nothing outdated -> goes quiet.
+        assert!(!is_eligible_to_start(&ExecutionMode::OneShot, true, false));
+    }
+
+    #[test]
+    fn is_eligible_to_start_recurring_requires_a_schedule() {
+        // The busy-loop guard: Recurring with hosts but no schedule must NOT start — there's no
+        // slot to dedup against, so it would re-trigger on every tick.
+        assert!(!is_eligible_to_start(
+            &ExecutionMode::Recurring,
+            false,
+            true
+        ));
+        // With a schedule it's eligible...
+        assert!(is_eligible_to_start(&ExecutionMode::Recurring, true, true));
+        // ...but still only when there are hosts to trigger.
+        assert!(!is_eligible_to_start(
+            &ExecutionMode::Recurring,
+            true,
+            false
+        ));
     }
 
     #[test]
