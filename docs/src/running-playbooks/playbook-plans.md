@@ -16,6 +16,7 @@ generated API reference.
 | `mode` | no (`OneShot`) | `OneShot` or `Recurring` — see [Scheduling and execution modes](./scheduling-and-modes.md). |
 | `schedule` | no | A 5-field cron expression gating when the plan may run. Omit for "as soon as possible". |
 | `timeZone` | no (UTC) | IANA time zone the `schedule` is evaluated in, e.g. `Europe/Berlin`. |
+| `suspend` | no (`false`) | Pause switch (like a CronJob's `suspend`): while `true` the operator starts no new runs. See [Suspending a plan](./scheduling-and-modes.md#suspending-a-plan). |
 | `template.variables` | no | Variables made available to the playbook — see [Variables and files](./variables-and-files.md). |
 | `template.files` | no | Files made available at runtime — see [Variables and files](./variables-and-files.md). |
 | `template.requirements` | no | An Ansible `requirements.yml` (e.g. collections) installed before the run. |

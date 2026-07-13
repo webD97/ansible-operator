@@ -306,6 +306,7 @@ async fn reconcile(
     };
 
     let eligible_to_start = is_eligible_to_start(
+        object.spec.suspend,
         &object.spec.mode,
         object.spec.schedule.is_some(),
         !hosts_to_trigger.is_empty(),
@@ -353,6 +354,16 @@ async fn reconcile(
         requeue_after = d;
     }
 
+    // While suspended, don't advertise a next run: the start gate above already blocks new runs, so
+    // a `nextRun` pointing at a slot that won't fire would be misleading. Applied after the advance
+    // step so it also clears the next slot a just-finished Recurring run would have set. A run still
+    // in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase keeps
+    // reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
+    // signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
+    if object.spec.suspend {
+        resource_status.next_run = None;
+    }
+
     patch_status(&api, &object, resource_status).await?;
 
     Ok(Action::requeue(requeue_after))
@@ -369,10 +380,14 @@ fn slot_already_triggered(
     start.is_some() && start == last_triggered_run
 }
 
-/// Whether a run is eligible to *start* this tick, from the mode plus whether a schedule is set and
-/// whether any hosts still need triggering. Pure so the mode-specific gating is unit-testable — in
-/// particular the invariant that a schedule-less Recurring plan is never eligible.
+/// Whether a run is eligible to *start* this tick, from whether the plan is suspended plus the mode,
+/// whether a schedule is set, and whether any hosts still need triggering. Pure so the gating is
+/// unit-testable — in particular the invariants that a suspended plan never starts and that a
+/// schedule-less Recurring plan is never eligible.
 ///
+///   - `suspend` is an operator override (`spec.suspend`, CronJob-style): while set, nothing starts,
+///     regardless of mode/schedule/hosts. It only gates *starting* — an in-flight run finishes on
+///     its own path (`advance_applying_run`), which is not routed through here.
 ///   - OneShot keeps applying until every host is on the current hash, then goes quiet — so it's
 ///     gated purely on there being outdated hosts left (which is exactly `has_hosts_to_trigger`).
 ///   - Recurring runs on every schedule tick regardless of host hashes (a successful run marks all
@@ -381,11 +396,13 @@ fn slot_already_triggered(
 ///     tick from starting more than one run, and without a schedule there'd be no slot to dedup
 ///     against — it would busy-loop. That's why the schedule check lives here.
 fn is_eligible_to_start(
+    suspended: bool,
     mode: &ExecutionMode,
     has_schedule: bool,
     has_hosts_to_trigger: bool,
 ) -> bool {
-    has_hosts_to_trigger
+    !suspended
+        && has_hosts_to_trigger
         && match mode {
             ExecutionMode::OneShot => true,
             ExecutionMode::Recurring => has_schedule,
@@ -1453,10 +1470,25 @@ spec:
     #[test]
     fn is_eligible_to_start_oneshot_gates_only_on_outdated_hosts() {
         // OneShot with work to do starts whether or not a schedule is set.
-        assert!(is_eligible_to_start(&ExecutionMode::OneShot, false, true));
-        assert!(is_eligible_to_start(&ExecutionMode::OneShot, true, true));
+        assert!(is_eligible_to_start(
+            false,
+            &ExecutionMode::OneShot,
+            false,
+            true
+        ));
+        assert!(is_eligible_to_start(
+            false,
+            &ExecutionMode::OneShot,
+            true,
+            true
+        ));
         // Nothing outdated -> goes quiet.
-        assert!(!is_eligible_to_start(&ExecutionMode::OneShot, true, false));
+        assert!(!is_eligible_to_start(
+            false,
+            &ExecutionMode::OneShot,
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -1464,17 +1496,50 @@ spec:
         // The busy-loop guard: Recurring with hosts but no schedule must NOT start — there's no
         // slot to dedup against, so it would re-trigger on every tick.
         assert!(!is_eligible_to_start(
+            false,
             &ExecutionMode::Recurring,
             false,
             true
         ));
         // With a schedule it's eligible...
-        assert!(is_eligible_to_start(&ExecutionMode::Recurring, true, true));
+        assert!(is_eligible_to_start(
+            false,
+            &ExecutionMode::Recurring,
+            true,
+            true
+        ));
         // ...but still only when there are hosts to trigger.
         assert!(!is_eligible_to_start(
+            false,
             &ExecutionMode::Recurring,
             true,
             false
+        ));
+    }
+
+    #[test]
+    fn is_eligible_to_start_suspended_never_starts() {
+        // `spec.suspend` overrides everything else: whatever the mode/schedule/host state would
+        // otherwise permit, a suspended plan starts nothing.
+        assert!(!is_eligible_to_start(
+            true,
+            &ExecutionMode::OneShot,
+            true,
+            true
+        ));
+        assert!(!is_eligible_to_start(
+            true,
+            &ExecutionMode::Recurring,
+            true,
+            true
+        ));
+        // Sanity: identical inputs with suspend cleared *would* be eligible, so it's the flag doing
+        // the gating here and nothing else.
+        assert!(is_eligible_to_start(
+            false,
+            &ExecutionMode::OneShot,
+            true,
+            true
         ));
     }
 

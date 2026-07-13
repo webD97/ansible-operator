@@ -19,6 +19,9 @@ spec:
     - jsonPath: .spec.schedule
       name: Schedule
       type: string
+    - jsonPath: .spec.suspend
+      name: Suspended
+      type: boolean
     - jsonPath: .status.lastTriggeredRun
       name: Previous run
       type: string
@@ -92,6 +95,15 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              suspend:
+                default: false
+                description: |-
+                  When true, the operator stops starting new runs for this plan — the same idea as a
+                  CronJob's `.spec.suspend`. A run already in progress is left to finish; only the *starting*
+                  of new runs is gated. While suspended the `Suspended` printer column reads `true` and
+                  `.status.nextRun` is cleared; the plan's phase keeps reflecting its underlying state.
+                  Defaults to false.
+                type: boolean
               template:
                 description: The playbook will be built from this, some fields will be set automatically (vars, hosts)
                 properties:

@@ -37,6 +37,7 @@ impl JsonSchema for GenericMap {
     status = "PlaybookPlanStatus",
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
+    printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
     printcolumn = r#"{"name":"Previous run","type":"string","jsonPath":".status.lastTriggeredRun"}"#,
     printcolumn = r#"{"name":"Next run","type":"string","jsonPath":".status.nextRun"}"#,
     printcolumn = r#"{"name":"Current hash","type":"string","jsonPath":".status.currentHash"}"#,
@@ -54,6 +55,14 @@ pub struct PlaybookPlanSpec {
     /// Controls if a playbook is executed once or repeatedly
     #[schemars(default)]
     pub mode: ExecutionMode,
+
+    /// When true, the operator stops starting new runs for this plan — the same idea as a
+    /// CronJob's `.spec.suspend`. A run already in progress is left to finish; only the *starting*
+    /// of new runs is gated. While suspended the `Suspended` printer column reads `true` and
+    /// `.status.nextRun` is cleared; the plan's phase keeps reflecting its underlying state.
+    /// Defaults to false.
+    #[serde(default)]
+    pub suspend: bool,
 
     /// 5-part cron expression that tells at which time the playbook may execute
     pub schedule: Option<String>,
@@ -285,6 +294,7 @@ mod tests {
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
                 mode: ExecutionMode::Recurring,
+                suspend: false,
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,
                 inventory_refs: vec![InventoryRef {

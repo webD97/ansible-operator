@@ -26,6 +26,23 @@ want runs pinned to a maintenance window.
 The plan's `.status.nextRun` shows the next computed fire time, and the `Next run` printer column
 surfaces it in `kubectl get playbookplan`.
 
+## Suspending a plan
+
+Set `spec.suspend: true` to stop the operator starting new runs — the same idea as a CronJob's
+`.spec.suspend`. It is a pause switch, not a delete:
+
+- A run **already in progress** is left to finish — suspending never kills a running Job.
+- No **new** run is started while suspended, in any mode: a `Recurring` plan skips its schedule
+  ticks, and a `OneShot` plan holds off even when hosts are out of date.
+- The `Suspended` printer column reads `true` and `.status.nextRun` is cleared — there is no next
+  run while paused. The plan's phase keeps showing its underlying state (e.g. `Scheduled` or
+  `Succeeded`); the column, not the phase, is what tells you it is paused.
+
+Clear the flag (`spec.suspend: false`, or remove it) to resume; a `Recurring` plan picks up again at
+its next scheduled tick. Suspending does not pause drift detection — editing the playbook or a
+referenced Secret while suspended still updates the current hash, so the run that eventually resumes
+reflects the latest inputs.
+
 ## Execution modes
 
 `spec.mode` is one of:
