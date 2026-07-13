@@ -2,8 +2,8 @@
 
 A playbook usually needs data: variables (often secret) and sometimes files (configs, binaries,
 archives). Both are supplied under `spec.template` and are folded into the
-[execution hash](./scheduling-and-modes.md#drift-detection-the-execution-hash), so changing them
-re-triggers the affected hosts.
+[execution hash](./scheduling-and-modes.md#drift-detection), so changing them re-triggers the
+affected hosts.
 
 ## Variables
 
@@ -47,8 +47,8 @@ kubectl create secret generic playbook-secrets \
 ```
 
 You can combine both kinds — e.g. inline non-secret defaults plus a `secretRef` for the sensitive
-bits. Because the operator watches referenced Secrets, editing the Secret changes the execution hash
-and re-applies the plan.
+values. Because the operator watches referenced Secrets, editing the Secret changes the execution
+hash and re-applies the plan.
 
 ## Files
 
@@ -60,7 +60,7 @@ reference a file entry named `my-assets` at:
 /run/ansible-operator/files/my-assets/...
 ```
 
-(the run's working directory is `/run/ansible-operator`, so `files/my-assets/...` works too).
+The run's working directory is `/run/ansible-operator`, so `files/my-assets/...` works too.
 
 ### From a Secret
 
@@ -75,14 +75,14 @@ template:
         name: some-configs        # each key of this Secret becomes a file under files/tls/
 ```
 
-### From any other Kubernetes volume (e.g. an image volume)
+### From another Kubernetes volume
 
 Any entry that is **not** a `secretRef` is passed through as a raw Kubernetes
 [Volume](https://kubernetes.io/docs/concepts/storage/volumes/): whatever fields you put next to
 `name` are interpreted as a volume source. This makes larger, non-secret blobs available without
-rebaking them into your Ansible `image`. The primary use is an
-[image volume](https://kubernetes.io/docs/tasks/configure-pod-container/image-volumes/), which
-mounts the contents of an OCI image (binaries, archives, static assets):
+rebaking them into your Ansible `image`. The main use is an
+[image volume](https://kubernetes.io/docs/tasks/configure-pod-container/image-volumes/), which mounts
+the contents of an OCI image (binaries, archives, static assets):
 
 ```yaml
 template:
@@ -95,13 +95,13 @@ template:
 
 The playbook then reads them from `/run/ansible-operator/files/binary-assets/...`.
 
-> **Note:** image volumes are a comparatively new Kubernetes feature and are not yet supported by
-> every container runtime. If your runtime lacks support, ship the blob a different way (a Secret
-> file, or bake it into the `image`). Because the field is a pass-through, an unsupported or
-> malformed volume surfaces as a reconcile error for that item rather than silently doing nothing.
+> **Note:** image volumes are a newer Kubernetes feature and are not yet supported by every container
+> runtime. If your runtime lacks support, ship the blob a different way (a Secret file, or bake it
+> into the `image`). Because the field is a pass-through, an unsupported or malformed volume surfaces
+> as a reconcile error for that item rather than silently doing nothing.
 
 ## Requirements (collections)
 
-Distinct from files/variables, `template.requirements` is an Ansible `requirements.yml` installed
+Distinct from files and variables, `template.requirements` is an Ansible `requirements.yml` installed
 before the playbook runs — see
 [Playbook plans → choosing the image](./playbook-plans.md#choosing-the-image).

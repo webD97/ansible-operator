@@ -1,26 +1,26 @@
 # Running playbooks
 
-This chapter is for **users** — anyone who authors resources in a tenant namespace to run
-playbooks. It assumes the operator is already installed and your namespace has been *enrolled* by a
-cluster admin. (If a plan you create is stuck in `UnauthorizedNamespace`, that is what is missing —
-see [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).)
+This chapter is for **users** — anyone who writes resources in a tenant namespace to run playbooks.
+It assumes the operator is already installed and your namespace has been *enrolled* by a cluster
+administrator. If a plan you create is stuck in `UnauthorizedNamespace`, enrollment is what is
+missing; see [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
-## The shape of a run
+## How a run works
 
 1. You write a `PlaybookPlan`: the playbook text, which inventories to target, a schedule, and any
-   variables/files.
+   variables and files.
 2. You write one or more inventories the plan references — a `ClusterInventory` for cluster Nodes
-   and/or a `StaticInventory` for external hosts.
+   and a `StaticInventory` for external hosts.
 3. When the schedule fires (or immediately, if there is no schedule), the operator renders a private
-   workspace, makes the target hosts reachable, and runs **one Kubernetes Job** that applies the
+   workspace, makes the target hosts reachable, and runs one Kubernetes Job that applies the
    playbook to every targeted host at once.
-4. When the Job finishes, the operator records a per-host outcome and a summary onto the plan's
-   `.status`, then either goes quiet (`OneShot`) or reschedules (`Recurring`).
+4. When the Job finishes, the operator records a per-host outcome and a summary on the plan's
+   `.status`, then stops (`OneShot`) or reschedules (`Recurring`).
 
-A single plan can mix both kinds of target in one run — cluster Nodes and external hosts land in one
+A single plan can mix both kinds of target in one run: cluster Nodes and external hosts land in one
 rendered inventory and one Job.
 
-## A minimal end-to-end example
+## Example
 
 Patch every worker node nightly:
 

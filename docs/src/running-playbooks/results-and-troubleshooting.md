@@ -1,9 +1,9 @@
 # Reading results and troubleshooting
 
-The operator reports everything about a run on the plan's `.status`. There is no separate dashboard
+The operator reports everything about a run on the plan's `.status`. There is no separate dashboard,
 and you do not need pod logs — the per-host recap travels back via the Job container's termination
 message, so `kubectl` is enough. For a durable history of *past* runs, the operator also records a
-[`Play`](#run-history-plays) per run attempt.
+[`Play`](#run-history) per run attempt.
 
 ## At a glance
 
@@ -39,7 +39,7 @@ per-host status, and the summary line.
 - **`Running`** — a Job is currently applying the playbook.
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
-current [execution hash](./scheduling-and-modes.md#drift-detection-the-execution-hash).
+current [execution hash](./scheduling-and-modes.md#drift-detection).
 
 ## Per-host outcomes
 
@@ -55,9 +55,9 @@ current [execution hash](./scheduling-and-modes.md#drift-detection-the-execution
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
 detection compares against) and `lastTransitionTime`.
 
-## Run history (`Play`s)
+## Run history
 
-The plan's `.status` only reflects the **current** run. For a durable, per-attempt **history**, the
+The plan's `.status` only reflects the **current** run. For a durable, per-attempt history, the
 operator records a `Play` for every run attempt — one `Play` per Job, in the plan's namespace, owned
 by the plan (so they are removed when you delete it). Unlike the run's Job, which Kubernetes reaps
 shortly after it finishes (`spec.ttlSecondsAfterFinished`), a `Play` keeps the recap for as long as
@@ -97,18 +97,18 @@ removes all of its Plays.
 
 ### The plan is stuck in `UnauthorizedNamespace`
 
-The plan's namespace has not been **enrolled** with the operator, so the operator has no RBAC to
-read its Secrets or create its Job and refuses to run it — fail-closed. This is a cluster-admin
-action, not something you can fix from the tenant side: an admin must add your namespace to the
-chart's `watchNamespaces` and roll the operator. See
+The plan's namespace has not been **enrolled** with the operator, so the operator has no RBAC to read
+its Secrets or create its Job and refuses to run it (fail-closed). This is a cluster-admin action,
+not something you can fix from the tenant side: an admin must add your namespace to the chart's
+`watchNamespaces` and roll the operator. See
 [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
-### A `ClusterInventory` resolves to zero hosts (for me)
+### A `ClusterInventory` resolves to zero hosts
 
 If Nodes clearly match your selector but the plan still targets nothing, the likely cause is that no
-`NodeAccessPolicy` grants your namespace those Nodes. Node access is **fail-closed**: with no
-matching policy a namespace may reach no Nodes at all. Check `.status.eligibleHosts` on the plan and
-ask your admin which policy applies to your namespace (see
+`NodeAccessPolicy` grants your namespace those Nodes. Node access is **fail-closed**: with no matching
+policy a namespace may reach no Nodes at all. Check `.status.eligibleHosts` on the plan and ask your
+admin which policy applies to your namespace (see
 [Node access policies](../cluster-operators/node-access-policies.md)). The `ClusterInventory`'s own
 `.status.hostCount` shows how many Nodes match *before* policy clamping, which helps localise the
 problem.
@@ -116,24 +116,23 @@ problem.
 ### Hosts show `NotReached`
 
 Expected when a play stops early — for example a `serial` batch that failed before reaching later
-hosts, or a `run_once` task that aborted. Fix the host that actually failed (its outcome is
-`Failed`); the `NotReached` hosts should proceed on the next run.
+hosts, or a `run_once` task that aborted. Fix the host that actually failed (its outcome is `Failed`);
+the `NotReached` hosts should proceed on the next run.
 
 ### Hosts show `Unknown`
 
 This means the operator could not parse a recap for the host — the operator's instrumentation, not
 the playbook, is the suspect. Common causes: the run image is missing something the recap callback
-needs, or the Job pod was killed before it could write its termination message (a disruptive
-playbook that took down its own runner is one way). Inspect the (not-yet-reaped) Job pod; raising
+needs, or the Job pod was killed before it could write its termination message (a disruptive playbook
+that took down its own runner is one way). Inspect the (not-yet-reaped) Job pod; raising
 `spec.ttlSecondsAfterFinished` buys time to look before it is cleaned up.
 
 ### A change is not being picked up
 
-Only inputs that feed the
-[execution hash](./scheduling-and-modes.md#drift-detection-the-execution-hash) — the playbook text
-and the **contents** of referenced Secrets — trigger a re-run of already current hosts. Editing an
-unrelated `spec` field (or a schedule that has not fired yet) will not. Confirm `.status.currentHash`
-actually changed after your edit.
+Only inputs that feed the [execution hash](./scheduling-and-modes.md#drift-detection) — the playbook
+text and the **contents** of referenced Secrets — trigger a re-run of already current hosts. Editing
+an unrelated `spec` field (or a schedule that has not fired yet) will not. Confirm
+`.status.currentHash` actually changed after your edit.
 
 ### It never seems to run
 

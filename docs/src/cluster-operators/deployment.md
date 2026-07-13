@@ -14,48 +14,40 @@ helm install --create-namespace -n ansible-system ansible-operator ./chart
 
 Do **not** create `PlaybookPlan`s or inventories in the operator's own namespace — those belong in
 tenant namespaces. The operator namespace is where its runtime machinery lives: per-run Leases and
-the managed-SSH proxy pods/Secrets/NetworkPolicies. (The admin-authored `NodeAccessPolicy` objects
-are cluster-scoped and live nowhere in particular.) Keeping it separate means only this one namespace
-needs the privileged-pod exception below.
+the managed-SSH proxy pods, Secrets, and NetworkPolicies. (The admin-authored `NodeAccessPolicy`
+objects are cluster-scoped and live in no namespace.) Keeping it separate means only this one
+namespace needs the privileged-pod exception below.
 
 ## Pod Security Admission
 
 Managed-SSH proxy pods (created dynamically by the operator at runtime, not by the chart) run with
-`hostPID: true` and added `SYS_ADMIN`/`SYS_PTRACE` capabilities so each SSH session can `nsenter`
-into the target Node's namespaces. That combination is only permitted under the **`privileged`** Pod
+`hostPID: true` and added `SYS_ADMIN`/`SYS_PTRACE` capabilities so each SSH session can `nsenter` into
+the target Node's namespaces. That combination is only permitted under the **`privileged`** Pod
 Security Standard, so the operator's namespace must carry the label:
 
 ```sh
 kubectl label namespace ansible-system pod-security.kubernetes.io/enforce=privileged
 ```
 
-Note the proxy pods deliberately do *not* use `privileged: true`, `hostNetwork`, or `hostIPC` — only
-`hostPID` plus the two capabilities. `hostPID` specifically cannot be avoided: `setns()` into the
-host PID namespace is impossible from a pod that is not already in it, so there is no
-capability-scoped workaround for that one flag (which is why `baseline`/`restricted` are not enough).
-Because this exception is scoped to the single operator namespace, tenant namespaces need no
-Pod-Security relaxation.
+The proxy pods do not use `privileged: true`, `hostNetwork`, or `hostIPC` — only `hostPID` plus the
+two capabilities. Because this exception is scoped to the single operator namespace, tenant
+namespaces need no Pod-Security relaxation.
 
 ## SELinux-enforcing nodes
 
 On SELinux-enforcing Nodes the proxy pods additionally set
-`securityContext.seLinuxOptions.type: spc_t` ("super-privileged container"). Joining the host's mount
-namespace via `nsenter` does not relabel the process — it keeps whatever label the runtime assigned
-(typically `container_t`), which is denied write to almost all host paths regardless of Unix
-permissions or capabilities. `spc_t` is the same label `privileged: true` pods and node-debug tools
-get, and is what actually lets the `nsenter`'d process touch the host filesystem. This is a no-op on
-non-SELinux nodes and needs no action from you.
+`securityContext.seLinuxOptions.type: spc_t` ("super-privileged container"), the label that lets the
+`nsenter`'d process touch the host filesystem. This is applied automatically, is a no-op on
+non-SELinux nodes, and needs no action from you.
 
 ## The managed-SSH proxy image
 
-Cluster-node access needs a **real OpenSSH `sshd`** image for the proxy pods; the operator's own
-image is distroless and cannot serve this role. It is configured via the chart's
-`managedSsh.proxyImage`.
+Cluster-node access needs a **real OpenSSH `sshd`** image for the proxy pods; the operator's own image
+is distroless and cannot serve this role. It is configured via the chart's `managedSsh.proxyImage`.
 
 **This is a node-root pod, so treat the image as node-root supply chain.** The chart default is a
-third-party `:latest` tag and is **not** digest-pinned — fine for a kick-the-tyres install, not for
-production. In production, override it with an image from a registry you trust and **pin it to a
-digest**:
+third-party `:latest` tag and is **not** digest-pinned — suitable for evaluation, not for production.
+In production, override it with an image from a registry you trust and **pin it to a digest**:
 
 ```yaml
 # values.yaml
@@ -70,9 +62,9 @@ the operator (via a `checksum/config` annotation) rather than hot-reloading.
 
 ## Enrolled namespaces
 
-The operator's cluster-wide RBAC intentionally does **not** include `secrets`, `jobs`, or `pods`.
-Those verbs are granted per-namespace, only for **enrolled** namespaces, via a `Role`/`RoleBinding`
-the chart renders. The enrolled set is the operator's own namespace ∪ the chart's `watchNamespaces`:
+The operator's cluster-wide RBAC does **not** include `secrets`, `jobs`, or `pods`. Those verbs are
+granted per-namespace, only for **enrolled** namespaces, via a `Role`/`RoleBinding` the chart renders.
+The enrolled set is the operator's own namespace plus the chart's `watchNamespaces`:
 
 ```yaml
 # values.yaml
@@ -82,9 +74,9 @@ watchNamespaces:
 ```
 
 A `PlaybookPlan` created in a namespace that is **not** enrolled is refused with
-`status.phase = UnauthorizedNamespace` — before any Secret is read or Job created. There is
-deliberately **no "all namespaces" escape hatch**: this allowlist is the boundary that bounds an
-operator compromise to the enrolled namespaces instead of the whole cluster.
+`status.phase = UnauthorizedNamespace`, before any Secret is read or Job created. There is no "all
+namespaces" option: this allowlist bounds an operator compromise to the enrolled namespaces rather
+than the whole cluster.
 
 Two consequences to plan for:
 
@@ -92,14 +84,14 @@ Two consequences to plan for:
   editing `watchNamespaces` and running `helm upgrade` rolls the operator so it re-reads the set. It
   is not hot-reloaded. (The same is true of `managedSsh.proxyImage`.)
 - **The operator can read *and delete* Secrets in every enrolled namespace.** Enroll only namespaces
-  **dedicated to Ansible ops**, not general-purpose application namespaces, so that this power covers
-  as few unrelated Secrets as possible. See
-  [Security model → the blast radius you accept](./security.md#the-blast-radius-you-accept).
+  **dedicated to Ansible ops**, not general-purpose application namespaces, so this power covers as
+  few unrelated Secrets as possible. See
+  [Security model → the blast radius you accept](./security.md#blast-radius).
 
 Under the hood this is driven by a small TOML config (`watch_namespaces`, `proxy_image`) that the
 chart renders into a mounted ConfigMap. For local development you can point the binary at a config
-file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace,
-always enrolled).
+file directly with `run --config <path>` and set `POD_NAMESPACE` (the operator's own namespace, always
+enrolled).
 
 ## Custom Resource Definitions
 
