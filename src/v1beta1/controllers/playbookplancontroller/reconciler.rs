@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
     batch::v1::Job,
@@ -555,36 +555,88 @@ async fn advance_applying_run(
         .sum();
     let outdated_count = find_outdated_hosts(resource_status, &run.execution_hash)?.len();
 
-    resource_status.summary = match outdated_count {
-        0 => Some(format!("{total_count}/{total_count} up-to-date")),
-        n => Some(format!("{n}/{total_count} outdated")),
+    // Recurring with no schedule can't reschedule; the eligibility gate normally stops such a plan
+    // from ever starting, so reaching here means the schedule was removed mid-run. Log the anomaly —
+    // `decide_terminal` deliberately leaves the plan in `Applying` for this case.
+    if matches!(object.spec.mode, ExecutionMode::Recurring) && object.spec.schedule.is_none() {
+        warn!("Mode is Recurring but schedule is not set!");
+    }
+
+    let outcome = decide_terminal(
+        &object.spec.mode,
+        object.spec.schedule.as_deref(),
+        outdated_count,
+        total_count,
+        Utc::now().with_timezone(&object.timezone().unwrap()),
+    );
+
+    resource_status.summary = Some(outcome.summary);
+    resource_status.phase = outcome.phase;
+    resource_status.next_run = outcome.next_run;
+
+    Ok(outcome.requeue)
+}
+
+/// The terminal-state decision for a finished run: what the plan's `phase`, `next_run`, `summary`,
+/// and the caller's requeue duration become once this run's Job has reached a terminal state. Pure
+/// (every wall-clock/inventory input is passed in) so the per-mode matrix is unit-testable without a
+/// kube client:
+///   - OneShot resolves to `Succeeded`/`Failed` solely by whether any host is still outdated and
+///     never reschedules.
+///   - Recurring with a schedule reschedules to the next slot and requeues until then.
+///   - Recurring *without* a schedule is the dead-end the eligibility gate normally prevents (the
+///     caller logs it): nothing to reschedule against, so the plan stays `Applying`.
+struct TerminalOutcome {
+    phase: Phase,
+    next_run: Option<DateTime<FixedOffset>>,
+    summary: String,
+    requeue: Option<std::time::Duration>,
+}
+
+fn decide_terminal<Tz: TimeZone>(
+    mode: &ExecutionMode,
+    schedule: Option<&str>,
+    outdated_count: usize,
+    total_count: usize,
+    now: DateTime<Tz>,
+) -> TerminalOutcome {
+    let summary = match outdated_count {
+        0 => format!("{total_count}/{total_count} up-to-date"),
+        n => format!("{n}/{total_count} outdated"),
     };
 
-    Ok(match &object.spec.mode {
-        ExecutionMode::OneShot => {
-            resource_status.next_run = None;
-            resource_status.phase = match outdated_count {
-                0 => Phase::Succeeded,
-                _ => Phase::Failed,
-            };
-            None
-        }
-        ExecutionMode::Recurring => match &object.spec.schedule {
-            Some(schedule) => {
-                let tz = object.timezone().unwrap();
-                let now = || Utc::now().with_timezone(&tz);
-
-                resource_status.phase = Phase::Scheduled;
-                let next = forecast_next_run(schedule, now(), Some(chrono::Duration::seconds(-5)));
-                resource_status.next_run = Some(next.fixed_offset());
-                Some((next - now()).to_std().unwrap())
-            }
-            None => {
-                warn!("Mode is Recurring but schedule is not set!");
-                None
-            }
+    match mode {
+        ExecutionMode::OneShot => TerminalOutcome {
+            phase: if outdated_count == 0 {
+                Phase::Succeeded
+            } else {
+                Phase::Failed
+            },
+            next_run: None,
+            summary,
+            requeue: None,
         },
-    })
+        ExecutionMode::Recurring => match schedule {
+            Some(schedule) => {
+                let next =
+                    forecast_next_run(schedule, now.clone(), Some(chrono::Duration::seconds(-5)));
+                let requeue = (next.clone() - now).to_std().ok();
+                TerminalOutcome {
+                    phase: Phase::Scheduled,
+                    next_run: Some(next.fixed_offset()),
+                    summary,
+                    requeue,
+                }
+            }
+            // Any prior forecast is now unreachable, so clear `next_run` and hold at `Applying`.
+            None => TerminalOutcome {
+                phase: Phase::Applying,
+                next_run: None,
+                summary,
+                requeue: None,
+            },
+        },
+    }
 }
 
 /// The `ansible-playbook` container's termination message — the recap the callback wrote to
@@ -1264,5 +1316,59 @@ spec:
             secrets,
             vec!["secret-with-variables", "secret-with-config-files"]
         );
+    }
+
+    #[test]
+    fn decide_terminal_oneshot_all_current_succeeds() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(&ExecutionMode::OneShot, None, 0, 3, now);
+
+        assert_eq!(outcome.phase, Phase::Succeeded);
+        assert_eq!(outcome.next_run, None);
+        assert_eq!(outcome.summary, "3/3 up-to-date");
+        assert_eq!(outcome.requeue, None);
+    }
+
+    #[test]
+    fn decide_terminal_oneshot_with_outdated_fails_and_never_reschedules() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        // A schedule is irrelevant in OneShot — even with one set it must resolve terminally and
+        // never reschedule.
+        let outcome = decide_terminal(&ExecutionMode::OneShot, Some("0 3 * * *"), 1, 3, now);
+
+        assert_eq!(outcome.phase, Phase::Failed);
+        assert_eq!(outcome.next_run, None);
+        assert_eq!(outcome.summary, "1/3 outdated");
+        assert_eq!(outcome.requeue, None);
+    }
+
+    #[test]
+    fn decide_terminal_recurring_with_schedule_reschedules_to_next_slot() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(&ExecutionMode::Recurring, Some("0 3 * * *"), 0, 2, now);
+
+        assert_eq!(outcome.phase, Phase::Scheduled);
+        assert_eq!(
+            outcome.next_run,
+            Some(
+                "2025-08-13T03:00:00Z"
+                    .parse::<DateTime<FixedOffset>>()
+                    .unwrap()
+            )
+        );
+        // Overrides the caller's default requeue so the plan wakes up at the next slot.
+        assert!(outcome.requeue.is_some());
+    }
+
+    #[test]
+    fn decide_terminal_recurring_without_schedule_is_a_dead_end() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(&ExecutionMode::Recurring, None, 0, 2, now);
+
+        // Nothing to reschedule against, so the plan holds at Applying (the eligibility gate
+        // normally prevents a schedule-less Recurring plan from ever starting a run).
+        assert_eq!(outcome.phase, Phase::Applying);
+        assert_eq!(outcome.next_run, None);
+        assert_eq!(outcome.requeue, None);
     }
 }
