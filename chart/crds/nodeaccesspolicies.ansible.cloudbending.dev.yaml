@@ -1,0 +1,159 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodeaccesspolicies.ansible.cloudbending.dev
+spec:
+  group: ansible.cloudbending.dev
+  names:
+    categories: []
+    kind: NodeAccessPolicy
+    plural: nodeaccesspolicies
+    shortNames: []
+    singular: nodeaccesspolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.allowedNodeCount
+      name: Allowed nodes
+      type: integer
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for NodeAccessPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Cluster-admin-authored, **cluster-scoped** policy that caps which cluster Nodes a namespace's
+              `ClusterInventory` resources may resolve.
+
+              `ClusterInventory` confers node-root (its managed-ssh proxy pods run with hostPID + nsenter), so
+              any namespace allowed to create one could otherwise target *any* node. A `NodeAccessPolicy` maps
+              a set of namespaces to a *ceiling* set of nodes; a `ClusterInventory`'s resolved nodes are
+              intersected with that ceiling before any proxy infra is created.
+
+              # Trust model
+
+              The policy is cluster-scoped, so authoring one requires cluster-level RBAC (the cluster admin) —
+              a different principal than the tenant who authors the namespaced `ClusterInventory`. Enforcement
+              is an intersection, so it can only ever *shrink* a tenant's node set: a forged or buggy request
+              can never reach a node the policy didn't grant.
+
+              # Fail-closed
+
+              A namespace with no matching policy resolves to zero allowed nodes. An empty selector (`{}`)
+              matches *nothing*, not everything — to grant all nodes, match a ubiquitous label explicitly,
+              e.g. `matchExpressions: [{ key: kubernetes.io/hostname, operator: Exists }]`. The effective
+              allow-set for a namespace is the union across every policy whose `namespaceSelector` matches it.
+            properties:
+              namespaceSelector:
+                description: |-
+                  Selects the namespaces this policy grants node access to, by namespace labels. Kubernetes
+                  stamps every namespace with its own name as `kubernetes.io/metadata.name`, so a single
+                  namespace is targeted with `matchLabels: { kubernetes.io/metadata.name: business-app }` —
+                  there is deliberately no separate name field. An empty selector matches no namespaces.
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          enum:
+                          - In
+                          - NotIn
+                          - Exists
+                          - DoesNotExist
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          nullable: true
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    nullable: true
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                type: object
+              nodeSelector:
+                description: |-
+                  The ceiling of Nodes that the matched namespaces' `ClusterInventory` resources may resolve,
+                  by node labels. A `ClusterInventory`'s resolved nodes are intersected with the Nodes
+                  matching this selector. An empty selector matches no nodes; to allow every node, match a
+                  ubiquitous label with `Exists` (see the type-level docs).
+                properties:
+                  matchExpressions:
+                    items:
+                      properties:
+                        key:
+                          type: string
+                        operator:
+                          enum:
+                          - In
+                          - NotIn
+                          - Exists
+                          - DoesNotExist
+                          type: string
+                        values:
+                          items:
+                            type: string
+                          nullable: true
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    nullable: true
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                type: object
+            required:
+            - namespaceSelector
+            - nodeSelector
+            type: object
+          status:
+            nullable: true
+            properties:
+              allowedNodeCount:
+                description: |-
+                  Number of Nodes currently matched by `nodeSelector` — the size of the ceiling. `i64` (not
+                  `usize`) so the generated CRD carries the Kubernetes-recognized `format: int64` rather than
+                  `uint`, which the API server warns about on apply.
+                format: int64
+                type: integer
+              allowedNodes:
+                description: |-
+                  Every node name currently matched by `nodeSelector`, alphabetically sorted — the concrete
+                  set of nodes this policy's ceiling resolves to. `allowedNodeCount` is its length (kept for
+                  the printer column, which can't take an array's length).
+                items:
+                  type: string
+                type: array
+              matchedNamespaces:
+                description: Namespaces currently matched by `namespaceSelector`, for observability.
+                items:
+                  type: string
+                type: array
+            required:
+            - allowedNodeCount
+            - allowedNodes
+            - matchedNamespaces
+            type: object
+        required:
+        - spec
+        title: NodeAccessPolicy
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

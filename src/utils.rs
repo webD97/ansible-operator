@@ -20,7 +20,7 @@ where
         api.patch(
             resource_name,
             &PatchParams::apply(field_manager),
-            &Patch::Apply(serde_yaml::to_value(&updated_resource).unwrap()),
+            &Patch::Apply(&updated_resource),
         )
         .await?;
     } else {

@@ -1,0 +1,38 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "chart.fullname" . }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+# Only genuinely cluster-scoped access lives here. Secret/Job/Pod access is deliberately NOT
+# cluster-wide anymore — it is granted per enrolled namespace via the Role (see role.yaml,
+# rolebinding.yaml and .Values.watchNamespaces). This bounds operator compromise to the enrolled
+# namespaces instead of the whole cluster (THREAT_MODEL R1 / T-INFO-1).
+rules:
+  # PlaybookPlan/ClusterInventory/StaticInventory are user-created and only ever read + watched by
+  # the operator — it never creates/deletes them itself. Read cluster-wide so plans in ANY namespace
+  # are discovered; a plan in a non-enrolled namespace is reported as UnauthorizedNamespace rather
+  # than silently ignored.
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["playbookplans", "clusterinventories", "staticinventories"]
+    verbs: ["get", "list", "watch"]
+  # Only PlaybookPlan and ClusterInventory have controllers writing status (StaticInventory has no
+  # controller of its own today). Cluster-wide so status (incl. UnauthorizedNamespace) can be written
+  # on plans in non-enrolled namespaces too.
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["playbookplans/status", "clusterinventories/status", "nodeaccesspolicies/status"]
+    verbs: ["get", "update"]
+  # ClusterInventory resolves node label selectors against real Nodes (cluster-scoped resource).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # NodeAccessPolicy enforcement reads the plan namespace's labels to match a policy's
+  # namespaceSelector (Namespaces are cluster-scoped resources).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # NodeAccessPolicy is a cluster-scoped resource, admin-authored (creating one requires cluster RBAC)
+  # and only ever read by the operator — never created or deleted by it.
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["nodeaccesspolicies"]
+    verbs: ["get", "list", "watch"]

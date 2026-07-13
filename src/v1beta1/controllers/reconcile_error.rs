@@ -12,6 +12,9 @@ pub enum ReconcileError {
     RenderError(#[from] ansible::RenderError),
 
     #[error(transparent)]
+    CaError(#[from] crate::v1beta1::ca::CaError),
+
+    #[error(transparent)]
     JsonSerializationError(#[from] serde_json::Error),
 
     #[error(transparent)]

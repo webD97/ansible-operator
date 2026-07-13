@@ -1,7 +1,11 @@
 use std::{borrow::Cow, collections::BTreeMap};
 
-use crate::{utils::Condition, v1beta1::LabelMap};
+use crate::{
+    utils::Condition,
+    v1beta1::{ResolvedHosts, UnsignedInt},
+};
 use chrono::{DateTime, FixedOffset};
+use chrono_tz::Tz;
 use kube::CustomResource;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
@@ -33,6 +37,8 @@ impl JsonSchema for GenericMap {
     status = "PlaybookPlanStatus",
     printcolumn = r#"{"name":"Mode","type":"string","jsonPath":".spec.mode"}"#,
     printcolumn = r#"{"name":"Schedule","type":"string","jsonPath":".spec.schedule"}"#,
+    printcolumn = r#"{"name":"Suspended","type":"boolean","jsonPath":".spec.suspend"}"#,
+    printcolumn = r#"{"name":"Previous run","type":"string","jsonPath":".status.lastTriggeredRun"}"#,
     printcolumn = r#"{"name":"Next run","type":"string","jsonPath":".status.nextRun"}"#,
     printcolumn = r#"{"name":"Current hash","type":"string","jsonPath":".status.currentHash"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
@@ -50,6 +56,14 @@ pub struct PlaybookPlanSpec {
     #[schemars(default)]
     pub mode: ExecutionMode,
 
+    /// When true, the operator stops starting new runs for this plan — the same idea as a
+    /// CronJob's `.spec.suspend`. A run already in progress is left to finish; only the *starting*
+    /// of new runs is gated. While suspended the `Suspended` printer column reads `true` and
+    /// `.status.nextRun` is cleared; the plan's phase keeps reflecting its underlying state.
+    /// Defaults to false.
+    #[serde(default)]
+    pub suspend: bool,
+
     /// 5-part cron expression that tells at which time the playbook may execute
     pub schedule: Option<String>,
 
@@ -57,13 +71,35 @@ pub struct PlaybookPlanSpec {
     pub time_zone: Option<String>,
 
     /// These host groups will be available in our playbook
-    pub inventory: Vec<Inventory>,
+    pub inventory_refs: Vec<InventoryRef>,
 
-    /// Used to decide on a connection plugin. We will always create one Ansible (cron)job per host.
-    pub connection_strategy: ConnectionStrategy,
+    /// How long a finished run's Job (and its pod) is kept before Kubernetes' TTL controller
+    /// reaps it. The operator never deletes the Job itself, so this governs the ansible pod's
+    /// lifetime. Values below 60 seconds are silently raised to 60; unset uses the operator's
+    /// default.
+    pub ttl_seconds_after_finished: Option<i32>,
+
+    /// How many successful `Play` history records to keep for this plan before the oldest are
+    /// pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
+    #[schemars(with = "Option<UnsignedInt>")]
+    pub successful_plays_history_limit: Option<u32>,
+
+    /// How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
+    /// larger than the successful limit so failures stay visible longer. Defaults to 10.
+    #[schemars(with = "Option<UnsignedInt>")]
+    pub failed_plays_history_limit: Option<u32>,
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryRef {
+    /// Name of the ClusterInventory resource being referenced
+    pub cluster_inventory: Option<String>,
+    /// Name of the StaticInventory resource being referenced
+    pub static_inventory: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
@@ -116,87 +152,11 @@ pub enum PlaybookVariableSource {
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct Inventory {
-    pub name: String,
-    pub hosts: Hosts,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(untagged)]
-pub enum Hosts {
-    FromClusterNodes {
-        #[serde(rename = "fromNodes")]
-        from_nodes: NodeSelectorTerm,
-    },
-    FromStaticList {
-        #[serde(rename = "fromList")]
-        from_list: Vec<String>,
-    },
-}
-
-impl Default for Hosts {
-    fn default() -> Self {
-        Self::FromClusterNodes {
-            from_nodes: NodeSelectorTerm::default(),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-#[serde(untagged)]
-pub enum NodeSelectorTerm {
-    MatchLabels {
-        #[serde(rename = "matchLabels")]
-        labels: LabelMap,
-    },
-}
-
-impl Default for NodeSelectorTerm {
-    fn default() -> Self {
-        Self::MatchLabels {
-            labels: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[serde(untagged)]
-#[serde(rename_all = "camelCase")]
-pub enum ConnectionStrategy {
-    Ssh { ssh: SshConfig },
-    Chroot { chroot: ChrootConfig },
-}
-
-impl Default for ConnectionStrategy {
-    fn default() -> Self {
-        Self::Chroot {
-            chroot: ChrootConfig { tolerations: None },
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SshConfig {
-    pub user: String,
-    pub secret_ref: SecretRef,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ChrootConfig {
-    pub tolerations: Option<Vec<Toleration>>,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct SecretRef {
     pub name: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-// #[serde(rename_all = "PascalCase")]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 pub enum Phase {
     /// Triggers have not yet been evaluated
     #[default]
@@ -211,66 +171,78 @@ pub enum Phase {
     /// Playbook is scheduled for reexecution.
     Scheduled,
 
-    /// Jobs for all hosts ran successfully (for OneShot mode only)
+    /// Some or all jobs failed (for OneShot mode only)
     Failed,
 
-    /// Some or all jobs failed (for OneShot mode only)
+    /// Jobs for all hosts ran successfully (for OneShot mode only)
     Succeeded,
-}
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-pub struct Toleration {
-    pub effect: Option<String>,
-    pub key: Option<String>,
-    pub operator: Option<String>,
-    pub toleration_seconds: Option<i64>,
-    pub value: Option<String>,
-}
-
-impl From<k8s_openapi::api::core::v1::Toleration> for Toleration {
-    fn from(other: k8s_openapi::api::core::v1::Toleration) -> Self {
-        Self {
-            effect: other.effect,
-            key: other.key,
-            operator: other.operator,
-            toleration_seconds: other.toleration_seconds,
-            value: other.value,
-        }
-    }
-}
-
-impl From<Toleration> for k8s_openapi::api::core::v1::Toleration {
-    fn from(t: Toleration) -> Self {
-        k8s_openapi::api::core::v1::Toleration {
-            key: t.key,
-            value: t.value,
-            effect: t.effect,
-            operator: t.operator,
-            toleration_seconds: t.toleration_seconds,
-        }
-    }
+    /// The PlaybookPlan's namespace is not enrolled for the operator (not in the chart's
+    /// `watchNamespaces`), so the operator has no RBAC to read its Secrets or create its Job and
+    /// refuses to run it. Terminal until an administrator enrols the namespace and the operator
+    /// restarts (see R1 / T-INFO-1).
+    UnauthorizedNamespace,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybookPlanStatus {
-    pub eligible_hosts: Option<BTreeMap<String, Vec<String>>>,
-    pub eligible_hosts_count: Option<usize>,
+    pub eligible_hosts: Vec<ResolvedHosts>,
     pub last_rendered_generation: Option<i64>,
     pub conditions: Vec<PlaybookPlanCondition>,
     pub hosts_status: Option<BTreeMap<String, HostStatus>>,
-    #[serde(with = "crate::v1beta1::resources::custom_rfc3339")]
+    // `default` is required, not just nice-to-have: status patches are JSON Merge Patches, where
+    // a `null` value deletes the key rather than setting it to null, so this key is genuinely
+    // absent whenever `None`. `#[serde(with = ...)]` opts out of serde's usual missing-`Option`
+    // tolerance, so `default` must be added back explicitly or deserialization hard-fails.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub next_run: Option<DateTime<FixedOffset>>,
-    pub phase: Option<Phase>,
-    pub current_hash: Option<String>,
+    /// The start of the schedule slot (`Timing::Now`'s window start) that a run was last started
+    /// for. The trigger gate compares the current slot against this so a run that completes inside
+    /// its grace window isn't immediately re-triggered by the next reconcile within that same
+    /// window. Reset whenever `current_hash` changes; `None` for unscheduled plans (no slot to
+    /// dedupe against).
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub last_triggered_run: Option<DateTime<FixedOffset>>,
+    pub phase: Phase,
+    pub current_hash: String,
     pub summary: Option<String>,
+    /// Name of the Job backing the currently-`Applying` run, if any. Looked up by name rather
+    /// than the `PLAYBOOKPLAN_HASH` label alone, since that label is stable across every retry
+    /// of an unchanged spec and could match an older, already-finished retry's Job.
+    pub current_job_name: Option<String>,
+    /// How many Jobs have been created for `current_hash` so far, including the current one —
+    /// distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
+    /// `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
+    #[schemars(with = "UnsignedInt")]
+    pub retry_count: u32,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HostStatus {
+    /// The execution hash last SUCCESSFULLY applied to this host. Only bumped on `HostOutcome::Succeeded`.
     pub last_applied_hash: String,
+    pub last_outcome: HostOutcome,
+    // See the `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
+    #[schemars(with = "Option<String>")]
+    pub last_transition_time: Option<DateTime<FixedOffset>>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
+pub enum HostOutcome {
+    /// The callback's output was missing or malformed for this run — distinct from `NotReached`:
+    /// this means the operator's own instrumentation broke, not that Ansible legitimately skipped the host.
+    #[default]
+    Unknown,
+    Succeeded,
+    Failed,
+    /// The host was in scope for this run but Ansible never reached it (e.g. an earlier host in its
+    /// `serial` batch stopped the play).
+    NotReached,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -281,7 +253,8 @@ pub struct PlaybookPlanCondition {
     pub status: String,
     pub reason: Option<String>,
     pub message: Option<String>,
-    #[serde(with = "crate::v1beta1::resources::custom_rfc3339")]
+    // See the identical `#[serde(default, ...)]` note on `PlaybookPlanStatus::next_run`.
+    #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub last_transition_time: Option<DateTime<FixedOffset>>,
 }
@@ -300,6 +273,16 @@ impl Condition for PlaybookPlanCondition {
     }
 }
 
+impl PlaybookPlan {
+    pub fn timezone(&self) -> Result<Tz, chrono_tz::ParseError> {
+        self.spec
+            .time_zone
+            .as_ref()
+            .map(|tz| tz.parse::<Tz>())
+            .unwrap_or(Ok(Tz::UTC))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,46 +294,16 @@ mod tests {
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
                 mode: ExecutionMode::Recurring,
+                suspend: false,
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,
-                inventory: vec![
-                    Inventory {
-                        name: "controlplane".into(),
-                        hosts: Hosts::FromClusterNodes {
-                            from_nodes: NodeSelectorTerm::MatchLabels {
-                                labels: {
-                                    let mut labels = BTreeMap::new();
-                                    labels.insert(
-                                        "node.kubernetes.io/role".into(),
-                                        "controlplane".into(),
-                                    );
-                                    labels
-                                },
-                            },
-                        },
-                    },
-                    Inventory {
-                        name: "workers".into(),
-                        hosts: Hosts::FromClusterNodes {
-                            from_nodes: NodeSelectorTerm::MatchLabels {
-                                labels: {
-                                    let mut labels = BTreeMap::new();
-                                    labels
-                                        .insert("node.kubernetes.io/role".into(), "worker".into());
-                                    labels
-                                },
-                            },
-                        },
-                    },
-                ],
-                connection_strategy: ConnectionStrategy::Ssh {
-                    ssh: SshConfig {
-                        user: "root".into(),
-                        secret_ref: SecretRef {
-                            name: "ssh-key".into(),
-                        },
-                    },
-                },
+                inventory_refs: vec![InventoryRef {
+                    cluster_inventory: Some("controlplanes".into()),
+                    static_inventory: Some("others".into()),
+                }],
+                ttl_seconds_after_finished: None,
+                successful_plays_history_limit: None,
+                failed_plays_history_limit: None,
                 template: PlaybookTemplate {
                     variables: Some(vec![PlaybookVariableSource::SecretRef {
                         secret_ref: SecretRef {
@@ -390,22 +343,9 @@ metadata:
   name: an-example
 spec:
   image: docker.io/serversideup/ansible-core:2.18
-  inventory:
-    - name: ccu
-      hosts:
-        fromList:
-          - ccu.fritz.box
-    - name: k3s
-      hosts:
-        fromNodes:
-          matchLabels:
-            node.kubernetes.io/instance-type: k3s
+  inventoryRefs:
+    - name: controlplanes
   mode: OneShot
-  connectionStrategy:
-    ssh:
-      user: root
-      secretRef:
-        name: ssh
   template:
     variables:
       - inline:
@@ -450,5 +390,48 @@ spec:
         ));
 
         println!("{pp:?}");
+    }
+
+    /// Regression test: JSON Merge Patches delete a key entirely rather than setting it null, so
+    /// `nextRun`/`lastTransitionTime` are genuinely absent from the stored object when `None`.
+    /// Without `#[serde(default)]` this used to fail deserialization with "missing field".
+    #[test]
+    fn status_deserializes_when_optional_timestamps_are_entirely_absent() {
+        let json = serde_json::json!({
+            "eligibleHosts": [],
+            "lastRenderedGeneration": null,
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": null,
+                "message": null
+                // lastTransitionTime deliberately omitted
+            }],
+            "hostsStatus": {
+                "some-host": {
+                    "lastAppliedHash": "",
+                    "lastOutcome": "Unknown"
+                    // lastTransitionTime deliberately omitted
+                }
+            },
+            // nextRun deliberately omitted
+            "phase": "Applying",
+            "currentHash": "abc123",
+            "summary": null,
+            "currentJobName": null,
+            "retryCount": 1
+        });
+
+        let status: PlaybookPlanStatus = serde_json::from_value(json).unwrap();
+
+        assert_eq!(status.next_run, None);
+        assert_eq!(
+            status.conditions.first().unwrap().last_transition_time,
+            None
+        );
+        assert_eq!(
+            status.hosts_status.unwrap()["some-host"].last_transition_time,
+            None
+        );
     }
 }

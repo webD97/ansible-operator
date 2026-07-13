@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chart.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+data:
+  # The operator reads this at startup (mounted at /etc/ansible-operator/config.toml). It is NOT
+  # hot-reloaded: a change here rolls the Deployment via the checksum/config pod annotation
+  # (see deployment.yaml), and the restarted process picks up the new config.
+  config.toml: |
+    # Enrolled tenant namespaces the operator may read/write Secrets and create Jobs in (R1). The
+    # operator's own namespace ({{ .Release.Namespace }}) is ALWAYS enrolled implicitly by the
+    # operator, so it does not need to be listed here.
+    watch_namespaces = [
+    {{- range (.Values.watchNamespaces | default list) }}
+      {{ . | quote }},
+    {{- end }}
+    ]
+    {{- with .Values.managedSsh }}{{ with .proxyImage }}{{ if .repository }}
+    # Image for the node-root managed-ssh proxy pods (THREAT_MODEL T-ESC-5). Pin to a trusted digest
+    # in production; omit `tag` and put a `@sha256:...` digest in `repository` to do so.
+    proxy_image = {{ printf "%s%s" .repository (ternary (printf ":%s" (.tag | toString)) "" (ne (.tag | toString) "")) | quote }}
+    {{- end }}{{ end }}{{ end }}

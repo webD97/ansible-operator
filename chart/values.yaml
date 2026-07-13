@@ -1,0 +1,80 @@
+# Default values for the ansible-operator chart.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/webd97/ansible-operator
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# Image used for managed-ssh proxy pods (created dynamically by the operator itself at runtime,
+# not by this chart) — must run a real OpenSSH sshd. The operator's own image is distroless and
+# cannot serve this role. This value is rendered into the operator's config (configmap.yaml) and
+# consumed at pod-build time; a change rolls the operator via checksum/config.
+#
+# This is a node-root pod (THREAT_MODEL T-ESC-5): the default is a third-party `:latest` tag and
+# is NOT digest-pinned. In production, override with an image from a registry you trust and pin it
+# to a digest — set `tag: ""` and put the digest in `repository`, e.g.
+#   repository: my-registry.example.com/sshd@sha256:<digest>
+managedSsh:
+  proxyImage:
+    repository: testcontainers/sshd
+    tag: latest
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1). The operator may read/write Secrets and
+# create Jobs ONLY in these namespaces plus its own (.Release.Namespace, always enrolled). This is
+# the security boundary that replaces the old cluster-wide Secret/Job/Pod grants — an operator
+# compromise is bounded to the enrolled namespaces, not the whole cluster.
+#
+# Fail-closed: a PlaybookPlan created in a namespace NOT listed here (and not the operator namespace)
+# is refused with status.phase = UnauthorizedNamespace. There is deliberately no "all namespaces"
+# escape hatch. Enrolling a namespace is an admin action: edit this list and `helm upgrade` (which
+# rolls the operator so it re-reads the enrollment config).
+#
+# Example:
+#   watchNamespaces:
+#     - team-a
+#     - team-b
+watchNamespaces: []
+
+# IMPORTANT: install this chart into its own dedicated namespace, e.g.:
+#   helm install --create-namespace -n ansible-system ansible-operator ./chart
+# All namespaced resources in this chart (Deployment, ServiceAccount, Role/RoleBinding) use
+# .Release.Namespace. That namespace is also where per-run Leases, managed-ssh proxy
+# pods/Secrets/NetworkPolicies live at runtime — never the namespace a PlaybookPlan happens to
+# be created in. (The operator's SSH CA is in-memory only) Keeping this separate means only this
+# one namespace needs privileged-pod exceptions (Pod Security Admission), not every tenant namespace.
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+  # The operator's own pod needs no special privilege — it never touches node filesystems
+  # itself, only the ephemeral managed-ssh proxy pods it creates do.
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user.
+  # limits:
+  #   cpu: 200m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 50m
+  #   memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

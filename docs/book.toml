@@ -1,0 +1,20 @@
+[book]
+title = "Ansible Operator Guide"
+description = "User and cluster-operator guide for the Ansible Operator: run Ansible playbooks against cluster nodes and external hosts from Kubernetes resources."
+authors = ["Christian Danscheid"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/webd97/ansible-operator"
+edit-url-template = "https://github.com/webd97/ansible-operator/edit/main/docs/{path}"
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

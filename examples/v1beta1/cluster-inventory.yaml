@@ -1,0 +1,14 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: ClusterInventory
+metadata:
+  name: cluster-nodes
+spec:
+  hosts:
+    - name: controlplanes
+      matchLabels:
+        kubernetes.io/os: linux
+        node-role.kubernetes.io/control-plane: "true"
+    - name: workers
+      matchExpressions:
+        - { key: kubernetes.io/os, operator: In, values: [linux] }
+        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }

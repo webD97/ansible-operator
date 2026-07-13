@@ -1,0 +1,76 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: staticinventories.ansible.cloudbending.dev
+spec:
+  group: ansible.cloudbending.dev
+  names:
+    categories: []
+    kind: StaticInventory
+    plural: staticinventories
+    shortNames: []
+    singular: staticinventory
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for StaticInventorySpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              hosts:
+                items:
+                  properties:
+                    hosts:
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      type: string
+                  required:
+                  - hosts
+                  - name
+                  type: object
+                type: array
+              ssh:
+                description: |-
+                  How to reach these hosts over SSH. Mandatory: a StaticInventory with no reachability
+                  info isn't usable by any PlaybookPlan.
+                properties:
+                  secretRef:
+                    properties:
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  user:
+                    type: string
+                required:
+                - secretRef
+                - user
+                type: object
+            required:
+            - hosts
+            - ssh
+            type: object
+          status:
+            nullable: true
+            properties:
+              hostCount:
+                format: uint
+                minimum: 0.0
+                type: integer
+            required:
+            - hostCount
+            type: object
+        required:
+        - spec
+        title: StaticInventory
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

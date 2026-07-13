@@ -1,0 +1,56 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: NodeAccessPolicy
+metadata:
+  name: full-cluster
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: default
+  nodeSelector:
+    matchExpressions:
+      - { key: kubernetes.io/hostname, operator: Exists }
+---
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: ClusterInventory
+metadata:
+  name: cluster-nodes
+spec:
+  hosts:
+    - name: controlplanes
+      matchLabels:
+        kubernetes.io/os: linux
+        node-role.kubernetes.io/control-plane: "true"
+    - name: workers
+      matchExpressions:
+        - { key: kubernetes.io/os, operator: In, values: [linux] }
+        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+  # The managed-ssh proxy pod is already pinned to one exact node via nodeSelector (see
+  # managed_ssh.rs), so tolerating everything here doesn't risk it landing anywhere unintended —
+  # it just stops that one node's own taints (e.g. the control-plane NoSchedule taint) from
+  # blocking it from scheduling there at all.
+  tolerations:
+    - operator: Exists
+---
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  name: oneshot-fail
+spec:
+  image: docker.io/serversideup/ansible-core:2.18
+  schedule: "* * * * *"
+  timeZone: Europe/Berlin
+  ttlSecondsAfterFinished: 300
+  inventoryRefs:
+    - clusterInventory: cluster-nodes
+  template:
+    # requirements: |
+    #   collections:
+    #     - name: community.general
+    #       version: ">=6.0.0"
+    playbook: |
+      - hosts: all
+
+        tasks:
+          - name: Fail
+            ansible.builtin.fail:
+              msg: This is supposed to fail.
