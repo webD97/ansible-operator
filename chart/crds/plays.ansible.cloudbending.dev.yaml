@@ -79,10 +79,23 @@ spec:
               executionHash:
                 description: The execution hash the run applied — matches the backing Job's hash label.
                 type: string
-              hosts:
-                description: The hosts this run targeted.
+              inventory:
+                description: |-
+                  The inventory this run targeted, preserving the groups the user designed (each group's name
+                  and its hosts) rather than a flat host list. Same shape as the plan's `.status.eligibleHosts`,
+                  filtered to the hosts this attempt actually ran.
                 items:
-                  type: string
+                  properties:
+                    hosts:
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      type: string
+                  required:
+                  - hosts
+                  - name
+                  type: object
                 type: array
               playbookPlan:
                 description: The `PlaybookPlan` this run belongs to (also this Play's ownerReference).
@@ -90,7 +103,7 @@ spec:
             required:
             - attempt
             - executionHash
-            - hosts
+            - inventory
             - playbookPlan
             type: object
           status:

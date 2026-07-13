@@ -14,6 +14,7 @@ use tracing::debug;
 
 use crate::v1beta1::{
     HostOutcome, Play, PlayHostResult, PlayPhase, PlayRecap, PlaySpec, PlayStatus, PlaybookPlan,
+    ResolvedHosts,
     controllers::reconcile_error::ReconcileError,
     labels,
     playbookplancontroller::{
@@ -31,13 +32,14 @@ pub const DEFAULT_FAILED_PLAYS_HISTORY_LIMIT: u32 = 10;
 const FIELD_MANAGER: &str = "ansible-operator";
 
 /// Identifies one run attempt for the history calls: the plan it belongs to, the backing Job's name
-/// (which is also the Play's name), the execution hash, the attempt/retry number, and the hosts it
-/// targeted.
+/// (which is also the Play's name), the execution hash, the attempt/retry number, the inventory it
+/// targeted (grouped, for the Play spec), and the flat host list (for per-host status).
 pub struct PlayRef<'a> {
     pub plan: &'a PlaybookPlan,
     pub job_name: &'a str,
     pub hash: &'a ExecutionHash,
     pub attempt: u32,
+    pub inventory: &'a [ResolvedHosts],
     pub hosts: &'a [String],
 }
 
@@ -196,7 +198,7 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
             playbook_plan: plan_name.to_string(),
             execution_hash: play.hash.to_string(),
             attempt: play.attempt,
-            hosts: play.hosts.to_vec(),
+            inventory: play.inventory.to_vec(),
         },
     );
     object.metadata.labels = Some(BTreeMap::from([(

@@ -69,14 +69,18 @@ struct ReconciliationContext {
 }
 
 /// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
-/// namespace/name, which hosts this run targets, its execution hash, and the Lease holder identity
-/// derived from them. Kube `Api<T>` handles are deliberately *not* here — those are plumbing built
-/// on demand from `ReconciliationContext::client` plus `namespace`, not run identity.
+/// namespace/name, which hosts this run targets (flat, plus the same set grouped as `run_groups`),
+/// its execution hash, and the Lease holder identity derived from them. Kube `Api<T>` handles are
+/// deliberately *not* here — those are plumbing built on demand from `ReconciliationContext::client`
+/// plus `namespace`, not run identity.
 struct RunContext<'a> {
     namespace: &'a str,
     name: &'a str,
     execution_hash: ExecutionHash,
     hosts_to_trigger: &'a [String],
+    /// This run's resolved inventory filtered to `hosts_to_trigger`, preserving the user's groups.
+    /// Shared so the Job/proxy/render path and the Play history record see the same grouped set.
+    run_groups: &'a [ResolvedInventoryGroup],
     holder_identity: &'a str,
 }
 
@@ -287,12 +291,17 @@ async fn reconcile(
         ExecutionMode::Recurring => all_hosts.clone(),
     };
 
+    // Filter the resolved inventory to this run's hosts once, preserving the user's groups, so the
+    // Job/proxy/render path and the Play history record share one grouped view.
+    let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
+
     let holder_identity = format!("{namespace}/{name}/{execution_hash}");
     let run = RunContext {
         namespace,
         name,
         execution_hash,
         hosts_to_trigger: &hosts_to_trigger,
+        run_groups: &run_groups,
         holder_identity: &holder_identity,
     };
 
@@ -323,14 +332,8 @@ async fn reconcile(
                         requeue_after = (next - now()).to_std().unwrap_or_default();
                         resource_status.next_run = Some(next.fixed_offset());
                     }
-                } else if let Some(d) = try_start_run(
-                    &context,
-                    &run,
-                    &target_groups,
-                    &object,
-                    &mut resource_status,
-                )
-                .await?
+                } else if let Some(d) =
+                    try_start_run(&context, &run, &object, &mut resource_status).await?
                 {
                     requeue_after = d;
                 } else {
@@ -397,7 +400,6 @@ fn is_eligible_to_start(
 async fn try_start_run(
     context: &ReconciliationContext,
     run: &RunContext<'_>,
-    target_groups: &[ResolvedInventoryGroup],
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
 ) -> Result<Option<std::time::Duration>, ReconcileError> {
@@ -405,7 +407,7 @@ async fn try_start_run(
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), run.namespace);
     let leases_api = Api::<Lease>::namespaced(context.client.clone(), &context.operator_namespace);
 
-    let run_groups = filter_groups_to_hosts(target_groups, run.hosts_to_trigger);
+    let run_groups = run.run_groups;
 
     let blocked =
         locking::ensure_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
@@ -414,7 +416,7 @@ async fn try_start_run(
         return Ok(Some(std::time::Duration::from_secs(15)));
     }
 
-    let (managed_ssh_hosts, tolerations) = managed_ssh_hosts_and_tolerations(&run_groups);
+    let (managed_ssh_hosts, tolerations) = managed_ssh_hosts_and_tolerations(run_groups);
 
     // Owns the plan-namespace client-cert Secret so K8s GC reaps it if the plan is deleted before
     // cleanup runs (the explicit per-run delete in `cleanup_proxy_infra` is the primary path).
@@ -462,7 +464,7 @@ async fn try_start_run(
         upsert_workspace_secret(
             &secrets_api,
             run.name,
-            render_secret(object, &run_groups, &managed_ssh_hosts_map)?,
+            render_secret(object, run_groups, &managed_ssh_hosts_map)?,
         )
         .await?;
         resource_status.last_rendered_generation = object.metadata.generation;
@@ -471,7 +473,7 @@ async fn try_start_run(
     spawn_ansible_job(
         &jobs_api,
         run.execution_hash,
-        &run_groups,
+        run_groups,
         object,
         resource_status,
     )
@@ -480,6 +482,7 @@ async fn try_start_run(
     // Record this attempt as a Play (history), named after the Job spawn just settled on. The
     // attempt number is `retry_count`, which `spawn_ansible_job` set for exactly this Job.
     if let Some(job_name) = resource_status.current_job_name.as_deref() {
+        let inventory = flatten_hosts(run.run_groups);
         play_history::record_running(
             &context.client,
             run.namespace,
@@ -488,6 +491,7 @@ async fn try_start_run(
                 job_name,
                 hash: &run.execution_hash,
                 attempt: resource_status.retry_count,
+                inventory: &inventory,
                 hosts: run.hosts_to_trigger,
             },
         )
@@ -572,6 +576,7 @@ async fn advance_applying_run(
     );
 
     // Stamp the terminal recap onto this attempt's Play (durable run history), then prune old ones.
+    let inventory = flatten_hosts(run.run_groups);
     play_history::record_finished(
         &context.client,
         run.namespace,
@@ -580,6 +585,7 @@ async fn advance_applying_run(
             job_name: &job_name,
             hash: &run.execution_hash,
             attempt: resource_status.retry_count,
+            inventory: &inventory,
             hosts: run.hosts_to_trigger,
         },
         parsed.as_ref(),

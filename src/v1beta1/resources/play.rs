@@ -5,7 +5,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v1beta1::{HostOutcome, UnsignedInt};
+use crate::v1beta1::{HostOutcome, ResolvedHosts, UnsignedInt};
 
 /// A single Ansible execution — one attempt of a `PlaybookPlan` run, backed 1:1 by one Job in the
 /// plan's namespace. Purely a durable *history record*: the operator writes it, nothing reconciles
@@ -49,8 +49,10 @@ pub struct PlaySpec {
     #[schemars(with = "UnsignedInt")]
     pub attempt: u32,
 
-    /// The hosts this run targeted.
-    pub hosts: Vec<String>,
+    /// The inventory this run targeted, preserving the groups the user designed (each group's name
+    /// and its hosts) rather than a flat host list. Same shape as the plan's `.status.eligibleHosts`,
+    /// filtered to the hosts this attempt actually ran.
+    pub inventory: Vec<ResolvedHosts>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
