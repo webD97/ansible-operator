@@ -418,6 +418,8 @@ From [`clusterrole.yaml`](chart/templates/clusterrole.yaml) (cluster-wide) and
 | secrets | delete,deletecollection | operator ns | Run cleanup (per-host proxy Secrets). |
 | jobs | get,list,watch,create | **enrolled ns only** | One Job per run in the plan ns, not cluster-wide. |
 | pods | get,list,watch | **enrolled ns only** | Read termination message, not cluster-wide. |
+| plays | get,list,create,delete | **enrolled ns only** | Operator-authored run-history records, one per run attempt in the plan ns; listed and pruned to enforce the per-plan history limits. Owned by their PlaybookPlan, so cascade-deleted with it. Low sensitivity — they carry only recap tallies/outcomes, no Secret material. |
+| plays/status | get,update,patch | **enrolled ns only** | Writes the recap/outcome onto each Play. |
 | pods | create,delete,deletecollection | operator ns | **Creates node-root proxy pods.** |
 | networkpolicies | get,list,watch,create,delete,deletecollection | operator ns | Run isolation. |
 | leases | full | operator ns | Per-node mutual exclusion. |

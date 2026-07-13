@@ -24,7 +24,10 @@ rules:
   #    can only mount Secrets from their own namespace) and deleted here at run completion, so
   #    `delete` is required in every enrolled namespace, not just the operator's;
   #  - one Job per run is created + watched here;
-  #  - the run's Job-owned pod is read here for its termination message.
+  #  - the run's Job-owned pod is read here for its termination message;
+  #  - one Play history record per run attempt is created/status-patched/listed/deleted here (it is
+  #    owned by its PlaybookPlan in the same namespace, so it cascades on plan deletion). Not watched
+  #    — the operator only writes Plays, nothing reconciles them.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "patch", "delete"]
@@ -34,6 +37,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["plays"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["ansible.cloudbending.dev"]
+    resources: ["plays/status"]
+    verbs: ["get", "update", "patch"]
   {{- if eq $ns $.Release.Namespace }}
   # Operator-namespace-only infra. Leases, managed-ssh proxy pods, their NetworkPolicies, and
   # cleanup (delete/deletecollection) of per-run cert Secrets only ever exist in the operator's own

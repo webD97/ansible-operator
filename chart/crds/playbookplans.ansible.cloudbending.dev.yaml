@@ -50,6 +50,14 @@ spec:
         properties:
           spec:
             properties:
+              failedPlaysHistoryLimit:
+                description: |-
+                  How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
+                  larger than the successful limit so failures stay visible longer. Defaults to 10.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
               image:
                 description: An OCI image with Ansible and all required collections
                 type: string
@@ -78,6 +86,14 @@ spec:
                 description: 5-part cron expression that tells at which time the playbook may execute
                 nullable: true
                 type: string
+              successfulPlaysHistoryLimit:
+                description: |-
+                  How many successful `Play` history records to keep for this plan before the oldest are
+                  pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
               template:
                 description: The playbook will be built from this, some fields will be set automatically (vars, hosts)
                 properties:

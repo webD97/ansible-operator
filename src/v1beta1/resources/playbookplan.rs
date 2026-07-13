@@ -67,6 +67,14 @@ pub struct PlaybookPlanSpec {
     /// default.
     pub ttl_seconds_after_finished: Option<i32>,
 
+    /// How many successful `Play` history records to keep for this plan before the oldest are
+    /// pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
+    pub successful_plays_history_limit: Option<u32>,
+
+    /// How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
+    /// larger than the successful limit so failures stay visible longer. Defaults to 10.
+    pub failed_plays_history_limit: Option<u32>,
+
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
     pub template: PlaybookTemplate,
 }
@@ -278,6 +286,8 @@ mod tests {
                     static_inventory: Some("others".into()),
                 }],
                 ttl_seconds_after_finished: None,
+                successful_plays_history_limit: None,
+                failed_plays_history_limit: None,
                 template: PlaybookTemplate {
                     variables: Some(vec![PlaybookVariableSource::SecretRef {
                         secret_ref: SecretRef {

@@ -69,11 +69,13 @@ async fn main() {
 /// generation). See `chart/README.md` for how the bundled `crds/` snapshot is regenerated.
 fn render_crds() -> String {
     let playbookplan = v1beta1::PlaybookPlan::crd();
+    let play = v1beta1::Play::crd();
     let cluster_inventory = v1beta1::ClusterInventory::crd();
     let static_inventory = v1beta1::StaticInventory::crd();
     let node_access_policy = v1beta1::NodeAccessPolicy::crd();
     [
         serde_yaml::to_string(&playbookplan).unwrap(),
+        serde_yaml::to_string(&play).unwrap(),
         serde_yaml::to_string(&cluster_inventory).unwrap(),
         serde_yaml::to_string(&static_inventory).unwrap(),
         serde_yaml::to_string(&node_access_policy).unwrap(),

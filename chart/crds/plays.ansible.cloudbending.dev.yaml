@@ -1,0 +1,245 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: plays.ansible.cloudbending.dev
+spec:
+  group: ansible.cloudbending.dev
+  names:
+    categories: []
+    kind: Play
+    plural: plays
+    shortNames: []
+    singular: play
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.playbookPlan
+      name: Plan
+      type: string
+    - jsonPath: .spec.attempt
+      name: Attempt
+      priority: 1
+      type: integer
+    - jsonPath: .status.hostCount
+      name: Hosts
+      type: integer
+    - jsonPath: .status.recap.ok
+      name: Ok
+      type: integer
+    - jsonPath: .status.recap.changed
+      name: Changed
+      type: integer
+    - jsonPath: .status.recap.failed
+      name: Failed
+      type: integer
+    - jsonPath: .status.recap.unreachable
+      name: Unreachable
+      type: integer
+    - jsonPath: .status.recap.rescued
+      name: Rescued
+      priority: 1
+      type: integer
+    - jsonPath: .status.recap.skipped
+      name: Skipped
+      priority: 1
+      type: integer
+    - jsonPath: .status.recap.ignored
+      name: Ignored
+      priority: 1
+      type: integer
+    - jsonPath: .status.phase
+      name: Status
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for PlaySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              A single Ansible execution — one attempt of a `PlaybookPlan` run, backed 1:1 by one Job in the
+              plan's namespace. Purely a durable *history record*: the operator writes it, nothing reconciles
+              it into further cluster state. It exists so a run's Ansible recap survives the backing Job/pod's
+              short `ttlSecondsAfterFinished`, and so `kubectl get plays` gives an at-a-glance run history with
+              the recap tallies as columns.
+
+              Owned (ownerReference) by its `PlaybookPlan`, so deleting the plan cascades to all its Plays;
+              retention beyond that is bounded per-plan by `successfulPlaysHistoryLimit`/
+              `failedPlaysHistoryLimit`. Correlated to its Job by the shared execution hash plus `attempt`.
+            properties:
+              attempt:
+                description: |-
+                  Retry number within this hash: 1 for the first attempt, incrementing per retry. Mirrors the
+                  backing Job's numbered name (`apply-{plan}-{shortid}-{attempt}`).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              executionHash:
+                description: The execution hash the run applied — matches the backing Job's hash label.
+                type: string
+              hosts:
+                description: The hosts this run targeted.
+                items:
+                  type: string
+                type: array
+              playbookPlan:
+                description: The `PlaybookPlan` this run belongs to (also this Play's ownerReference).
+                type: string
+            required:
+            - attempt
+            - executionHash
+            - hosts
+            - playbookPlan
+            type: object
+          status:
+            nullable: true
+            properties:
+              failedHostCount:
+                description: How many hosts ended `Failed` or `Unreachable`.
+                format: uint32
+                minimum: 0.0
+                type: integer
+              finishedAt:
+                description: |-
+                  When the backing Job reached a terminal state. The run's *start* is the Play's own
+                  `metadata.creationTimestamp` (the Play is created when the run's Job is), so it isn't
+                  duplicated here. See the `#[serde(default, ...)]` timestamp note on
+                  `PlaybookPlanStatus::next_run`: merge patches drop `null` keys, so this is genuinely absent
+                  when `None`.
+                nullable: true
+                type: string
+              hostCount:
+                description: Number of hosts this run targeted (mirrors `spec.hosts.len()`, surfaced as a column).
+                format: uint32
+                minimum: 0.0
+                type: integer
+              hosts:
+                additionalProperties:
+                  properties:
+                    outcome:
+                      enum:
+                      - Succeeded
+                      - Failed
+                      - Unknown
+                      - NotReached
+                      type: string
+                    recap:
+                      description: |-
+                        The seven Ansible recap counters (`PLAY RECAP` line). Field order is irrelevant here — unlike
+                        the positional wire format in `callback_output::HostStats`, these are named/`camelCase` for
+                        JSONPath columns and merge-patch friendliness.
+                      properties:
+                        changed:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        failed:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        ignored:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        ok:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        rescued:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        skipped:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                        unreachable:
+                          format: uint32
+                          minimum: 0.0
+                          type: integer
+                      required:
+                      - changed
+                      - failed
+                      - ignored
+                      - ok
+                      - rescued
+                      - skipped
+                      - unreachable
+                      type: object
+                  required:
+                  - outcome
+                  - recap
+                  type: object
+                description: Per-host recap and outcome, for drilling into which host did what.
+                type: object
+              jobName:
+                description: |-
+                  Name of the backing Job in the plan's namespace. The Job/pod may already have been reaped by
+                  Kubernetes' TTL controller; this Play outlives them.
+                nullable: true
+                type: string
+              phase:
+                enum:
+                - Running
+                - Succeeded
+                - Failed
+                - Unknown
+                type: string
+              recap:
+                description: The Ansible recap, summed across every targeted host — the recap columns read from here.
+                properties:
+                  changed:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  failed:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  ignored:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  ok:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  rescued:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  skipped:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  unreachable:
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                required:
+                - changed
+                - failed
+                - ignored
+                - ok
+                - rescued
+                - skipped
+                - unreachable
+                type: object
+            required:
+            - failedHostCount
+            - hostCount
+            - hosts
+            - phase
+            - recap
+            type: object
+        required:
+        - spec
+        title: Play
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

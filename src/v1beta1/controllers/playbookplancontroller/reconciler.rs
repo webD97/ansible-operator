@@ -38,7 +38,7 @@ use crate::{
         playbookplancontroller::{
             callback_output,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, node_access, status,
+            job_builder, mappers, node_access, play_history, status,
         },
     },
 };
@@ -477,6 +477,23 @@ async fn try_start_run(
     )
     .await?;
 
+    // Record this attempt as a Play (history), named after the Job spawn just settled on. The
+    // attempt number is `retry_count`, which `spawn_ansible_job` set for exactly this Job.
+    if let Some(job_name) = resource_status.current_job_name.as_deref() {
+        play_history::record_running(
+            &context.client,
+            run.namespace,
+            &play_history::PlayRef {
+                plan: object,
+                job_name,
+                hash: &run.execution_hash,
+                attempt: resource_status.retry_count,
+                hosts: run.hosts_to_trigger,
+            },
+        )
+        .await?;
+    }
+
     Ok(None)
 }
 
@@ -553,6 +570,22 @@ async fn advance_applying_run(
         parsed.as_ref(),
         resource_status,
     );
+
+    // Stamp the terminal recap onto this attempt's Play (durable run history), then prune old ones.
+    play_history::record_finished(
+        &context.client,
+        run.namespace,
+        &play_history::PlayRef {
+            plan: object,
+            job_name: &job_name,
+            hash: &run.execution_hash,
+            attempt: resource_status.retry_count,
+            hosts: run.hosts_to_trigger,
+        },
+        parsed.as_ref(),
+    )
+    .await?;
+    play_history::prune(&context.client, run.namespace, object).await?;
 
     managed_ssh::cleanup_proxy_infra(
         &context.client,
@@ -924,7 +957,9 @@ async fn resolve_inventory(
 /// before explicit cleanup runs. Same pattern/namespace as the workspace secret
 /// (`workspace::render_secret`); a cross-namespace ownerReference would be ignored by GC, which is
 /// why the operator-namespace proxy infra uses label cleanup instead.
-fn playbookplan_owner_ref(object: &PlaybookPlan) -> Result<OwnerReference, ReconcileError> {
+pub(crate) fn playbookplan_owner_ref(
+    object: &PlaybookPlan,
+) -> Result<OwnerReference, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
     Ok(OwnerReference {
         api_version: PlaybookPlan::api_version(&()).into(),

@@ -34,6 +34,6 @@ clippy:
 # The full pre-change gate: build + test + clippy + guide + API docs.
 check: build test clippy docs apidoc
 
-# Dump all four CRDs (PlaybookPlan, ClusterInventory, StaticInventory, NodeAccessPolicy) to stdout.
+# Dump all CRDs (PlaybookPlan, Play, ClusterInventory, StaticInventory, NodeAccessPolicy) to stdout.
 crds:
     cargo run --quiet -- crds
