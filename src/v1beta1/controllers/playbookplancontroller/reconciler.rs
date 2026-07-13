@@ -970,6 +970,33 @@ fn newest_active_job(jobs: &[Job]) -> Option<&Job> {
         .max_by_key(|job| job.metadata.creation_timestamp.as_ref().map(|t| t.0))
 }
 
+/// The decision `spawn_ansible_job` makes from the Jobs currently labelled for this run: adopt an
+/// already-active one, or start a new numbered attempt. Split out (and pure) so the `retry_count`
+/// bookkeeping — advanced once per genuinely-new attempt, never on adoption — is unit-testable.
+#[derive(Debug, PartialEq)]
+enum JobAction {
+    /// An active Job already exists for this run; record it without creating anything.
+    Adopt { job_name: String },
+    /// No active Job — start a new attempt numbered `retry_count`.
+    CreateNext { retry_count: u32 },
+}
+
+fn decide_job_action(existing: &[Job], current_retry_count: u32) -> JobAction {
+    use kube::runtime::reflector::Lookup as _;
+
+    match newest_active_job(existing) {
+        Some(active) => JobAction::Adopt {
+            job_name: active
+                .name()
+                .expect("a listed Job always has a name")
+                .to_string(),
+        },
+        None => JobAction::CreateNext {
+            retry_count: current_retry_count + 1,
+        },
+    }
+}
+
 /// Ensures exactly one active Job exists for this run, adopting an already-active one instead of
 /// creating a duplicate.
 ///
@@ -993,62 +1020,60 @@ async fn spawn_ansible_job(
         .list(&ListParams::default().labels(&format!("{}={hash}", labels::PLAYBOOKPLAN_HASH)))
         .await?;
 
-    if let Some(active) = newest_active_job(&existing.items) {
-        let job_name = active.name().expect("a listed Job always has a name");
-        debug!("Adopting already-active job {job_name} for this run");
-        resource_status.current_job_name = Some(job_name.to_string());
-        resource_status.phase = Phase::Applying;
-        resource_status.next_run = None;
-        return Ok(());
-    }
+    let job_name = match decide_job_action(&existing.items, resource_status.retry_count) {
+        JobAction::Adopt { job_name } => {
+            debug!("Adopting already-active job {job_name} for this run");
+            job_name
+        }
+        JobAction::CreateNext { retry_count } => {
+            // A genuinely new attempt. `retry_count` climbs monotonically so the new name is
+            // expected not to collide with an already-finished attempt's; it's reset to 0 in
+            // `reconcile` whenever `current_hash` changes.
+            resource_status.retry_count = retry_count;
 
-    // No active Job for this run — a genuinely new attempt. `retry_count` climbs monotonically so
-    // the new name is expected not to collide with an already-finished attempt's; it's reset to 0
-    // in `reconcile` whenever `current_hash` changes.
-    resource_status.retry_count += 1;
+            let job =
+                job_builder::create_job_for_run(&hash, retry_count, run_groups, playbookplan)?;
+            let job_name = job
+                .name()
+                .expect(".metadata.name must be set at this point")
+                .to_string();
 
-    let job = job_builder::create_job_for_run(
-        &hash,
-        resource_status.retry_count,
-        run_groups,
-        playbookplan,
-    )?;
-    let job_name = job
-        .name()
-        .expect(".metadata.name must be set at this point")
-        .to_string();
+            info!("Creating job {job_name}");
+            match api
+                .create(
+                    &PostParams {
+                        field_manager: Some("ansible-operator".into()),
+                        ..Default::default()
+                    },
+                    &job,
+                )
+                .await
+            {
+                Ok(_) => {}
+                // A Job by this exact name already exists. In principle `retry_count` should always
+                // be ahead of every name already in the cluster, but if a previous tick created a
+                // Job and then errored *before* `patch_status` ran, the bump above never got
+                // persisted — so this tick recomputes the same name a real Job already holds.
+                // Treating that as fatal (instead of adopting it here) would be the actual bug:
+                // erroring via `?` skips `patch_status` too, so nothing this tick would get
+                // persisted either, and the next tick would recompute the exact same name and hit
+                // the exact same 409 — a permanent stall on one name, observed live. Adopting
+                // instead means current_job_name/phase are persisted this tick regardless, so the
+                // run can proceed against whatever Job holds that name, and the next genuinely-new
+                // attempt computes its retry_count from state that now matches reality.
+                Err(err) if is_conflict(&err) => {
+                    info!("Job {job_name} already exists, adopting it");
+                }
+                Err(err) => return Err(err.into()),
+            }
 
-    resource_status.current_job_name = Some(job_name.clone());
+            job_name
+        }
+    };
+
+    resource_status.current_job_name = Some(job_name);
     resource_status.phase = Phase::Applying;
     resource_status.next_run = None;
-
-    info!("Creating job {job_name}");
-    match api
-        .create(
-            &PostParams {
-                field_manager: Some("ansible-operator".into()),
-                ..Default::default()
-            },
-            &job,
-        )
-        .await
-    {
-        Ok(_) => {}
-        // A Job by this exact name already exists. In principle `retry_count` should always be
-        // ahead of every name already in the cluster, but if a previous tick created a Job and
-        // then errored *before* `patch_status` ran, the bump above never got persisted — so this
-        // tick recomputes the same name a real Job already holds. Treating that as fatal (instead
-        // of adopting it here) would be the actual bug: erroring via `?` skips `patch_status` too,
-        // so nothing this tick would get persisted either, and the next tick would recompute the
-        // exact same name and hit the exact same 409 — a permanent stall on one name, observed
-        // live. Adopting instead means current_job_name/phase are persisted this tick regardless,
-        // so the run can proceed against whatever Job actually holds that name, and the next
-        // genuinely-new attempt computes its retry_count from state that now matches reality.
-        Err(err) if is_conflict(&err) => {
-            info!("Job {job_name} already exists, adopting it");
-        }
-        Err(err) => return Err(err.into()),
-    }
 
     Ok(())
 }
@@ -1230,6 +1255,57 @@ mod tests {
         assert!(newest_active_job(&all_finished).is_none());
 
         assert!(newest_active_job(&[]).is_none());
+    }
+
+    #[test]
+    fn decide_job_action_adopts_active_else_starts_next_numbered_attempt() {
+        use k8s_openapi::api::batch::v1::{Job, JobCondition, JobStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+        use k8s_openapi::jiff::Timestamp;
+
+        fn job(name: &str, created_secs: i64, finished: bool) -> Job {
+            let conditions = finished.then(|| {
+                vec![JobCondition {
+                    type_: "Complete".into(),
+                    status: "True".into(),
+                    ..Default::default()
+                }]
+            });
+            Job {
+                metadata: ObjectMeta {
+                    name: Some(name.into()),
+                    creation_timestamp: Some(Time(Timestamp::from_second(created_secs).unwrap())),
+                    ..Default::default()
+                },
+                status: Some(JobStatus {
+                    conditions,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        // An active Job exists -> adopt it by name; retry_count is left untouched (no new attempt).
+        let with_active = vec![job("apply-x-2", 100, true), job("apply-x-3", 200, false)];
+        assert_eq!(
+            decide_job_action(&with_active, 3),
+            JobAction::Adopt {
+                job_name: "apply-x-3".into()
+            }
+        );
+
+        // Every prior attempt is terminal -> a new attempt, numbered one past the current count.
+        let all_finished = vec![job("apply-x-2", 100, true), job("apply-x-3", 200, true)];
+        assert_eq!(
+            decide_job_action(&all_finished, 3),
+            JobAction::CreateNext { retry_count: 4 }
+        );
+
+        // First run (no Jobs yet) -> attempt number 1.
+        assert_eq!(
+            decide_job_action(&[], 0),
+            JobAction::CreateNext { retry_count: 1 }
+        );
     }
 
     #[test]
