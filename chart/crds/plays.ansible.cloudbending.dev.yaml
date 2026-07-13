@@ -74,7 +74,6 @@ spec:
                 description: |-
                   Retry number within this hash: 1 for the first attempt, incrementing per retry. Mirrors the
                   backing Job's numbered name (`apply-{plan}-{shortid}-{attempt}`).
-                format: uint32
                 minimum: 0.0
                 type: integer
               executionHash:
@@ -99,7 +98,6 @@ spec:
             properties:
               failedHostCount:
                 description: How many hosts ended `Failed` or `Unreachable`.
-                format: uint32
                 minimum: 0.0
                 type: integer
               finishedAt:
@@ -113,7 +111,6 @@ spec:
                 type: string
               hostCount:
                 description: Number of hosts this run targeted (mirrors `spec.hosts.len()`, surfaced as a column).
-                format: uint32
                 minimum: 0.0
                 type: integer
               hosts:
@@ -133,31 +130,24 @@ spec:
                         JSONPath columns and merge-patch friendliness.
                       properties:
                         changed:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                         failed:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                         ignored:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                         ok:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                         rescued:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                         skipped:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                         unreachable:
-                          format: uint32
                           minimum: 0.0
                           type: integer
                       required:
@@ -192,31 +182,24 @@ spec:
                 description: The Ansible recap, summed across every targeted host — the recap columns read from here.
                 properties:
                   changed:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                   failed:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                   ignored:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                   ok:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                   rescued:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                   skipped:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                   unreachable:
-                    format: uint32
                     minimum: 0.0
                     type: integer
                 required:

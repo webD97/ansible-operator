@@ -1,6 +1,9 @@
 use std::{borrow::Cow, collections::BTreeMap};
 
-use crate::{utils::Condition, v1beta1::ResolvedHosts};
+use crate::{
+    utils::Condition,
+    v1beta1::{ResolvedHosts, UnsignedInt},
+};
 use chrono::{DateTime, FixedOffset};
 use chrono_tz::Tz;
 use kube::CustomResource;
@@ -69,10 +72,12 @@ pub struct PlaybookPlanSpec {
 
     /// How many successful `Play` history records to keep for this plan before the oldest are
     /// pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
+    #[schemars(with = "Option<UnsignedInt>")]
     pub successful_plays_history_limit: Option<u32>,
 
     /// How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
     /// larger than the successful limit so failures stay visible longer. Defaults to 10.
+    #[schemars(with = "Option<UnsignedInt>")]
     pub failed_plays_history_limit: Option<u32>,
 
     /// The playbook will be built from this, some fields will be set automatically (vars, hosts)
@@ -202,6 +207,7 @@ pub struct PlaybookPlanStatus {
     /// How many Jobs have been created for `current_hash` so far, including the current one —
     /// distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
     /// `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
+    #[schemars(with = "UnsignedInt")]
     pub retry_count: u32,
 }
 

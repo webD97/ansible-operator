@@ -54,7 +54,6 @@ spec:
                 description: |-
                   How many failed (or outcome-unknown) `Play` history records to keep for this plan. Kept
                   larger than the successful limit so failures stay visible longer. Defaults to 10.
-                format: uint32
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -90,7 +89,6 @@ spec:
                 description: |-
                   How many successful `Play` history records to keep for this plan before the oldest are
                   pruned. Unlike the Job's short TTL, Plays are the durable run history. Defaults to 3.
-                format: uint32
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -254,7 +252,6 @@ spec:
                   How many Jobs have been created for `current_hash` so far, including the current one —
                   distinguishes retries in the Job name (`apply-{plan}-{shortid}-{n}`). Reset to 0 whenever
                   `current_hash` changes; incremented once per Job actually created, in `spawn_ansible_job`.
-                format: uint32
                 minimum: 0.0
                 type: integer
               summary:

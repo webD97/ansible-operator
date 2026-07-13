@@ -5,7 +5,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v1beta1::HostOutcome;
+use crate::v1beta1::{HostOutcome, UnsignedInt};
 
 /// A single Ansible execution — one attempt of a `PlaybookPlan` run, backed 1:1 by one Job in the
 /// plan's namespace. Purely a durable *history record*: the operator writes it, nothing reconciles
@@ -46,6 +46,7 @@ pub struct PlaySpec {
 
     /// Retry number within this hash: 1 for the first attempt, incrementing per retry. Mirrors the
     /// backing Job's numbered name (`apply-{plan}-{shortid}-{attempt}`).
+    #[schemars(with = "UnsignedInt")]
     pub attempt: u32,
 
     /// The hosts this run targeted.
@@ -71,9 +72,11 @@ pub struct PlayStatus {
     pub finished_at: Option<DateTime<FixedOffset>>,
 
     /// Number of hosts this run targeted (mirrors `spec.hosts.len()`, surfaced as a column).
+    #[schemars(with = "UnsignedInt")]
     pub host_count: u32,
 
     /// How many hosts ended `Failed` or `Unreachable`.
+    #[schemars(with = "UnsignedInt")]
     pub failed_host_count: u32,
 
     /// The Ansible recap, summed across every targeted host — the recap columns read from here.
@@ -89,12 +92,19 @@ pub struct PlayStatus {
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayRecap {
+    #[schemars(with = "UnsignedInt")]
     pub ok: u32,
+    #[schemars(with = "UnsignedInt")]
     pub changed: u32,
+    #[schemars(with = "UnsignedInt")]
     pub unreachable: u32,
+    #[schemars(with = "UnsignedInt")]
     pub failed: u32,
+    #[schemars(with = "UnsignedInt")]
     pub skipped: u32,
+    #[schemars(with = "UnsignedInt")]
     pub rescued: u32,
+    #[schemars(with = "UnsignedInt")]
     pub ignored: u32,
 }
 

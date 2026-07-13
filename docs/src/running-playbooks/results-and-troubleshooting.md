@@ -2,7 +2,8 @@
 
 The operator reports everything about a run on the plan's `.status`. There is no separate dashboard
 and you do not need pod logs — the per-host recap travels back via the Job container's termination
-message, so `kubectl` is enough.
+message, so `kubectl` is enough. For a durable history of *past* runs, the operator also records a
+[`Play`](#run-history-plays) per run attempt.
 
 ## At a glance
 
@@ -53,6 +54,44 @@ current [execution hash](./scheduling-and-modes.md#drift-detection-the-execution
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
 detection compares against) and `lastTransitionTime`.
+
+## Run history (`Play`s)
+
+The plan's `.status` only reflects the **current** run. For a durable, per-attempt **history**, the
+operator records a `Play` for every run attempt — one `Play` per Job, in the plan's namespace, owned
+by the plan (so they are removed when you delete it). Unlike the run's Job, which Kubernetes reaps
+shortly after it finishes (`spec.ttlSecondsAfterFinished`), a `Play` keeps the recap for as long as
+retention allows.
+
+```sh
+kubectl get plays -n my-team
+# NAME                        PLAN        HOSTS  OK  CHANGED  FAILED  UNREACHABLE  STATUS     AGE
+# apply-web-config-a1b2c3-1   web-config      3   0        0       2            0  Failed      9m
+# apply-web-config-a1b2c3-2   web-config      3  12        3       0            0  Succeeded   8m
+```
+
+The columns mirror the Ansible **recap**, summed across every host the run targeted. `kubectl get
+plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`) and the attempt
+number. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
+
+```sh
+kubectl get play apply-web-config-a1b2c3-2 -n my-team -o yaml
+```
+
+A `Play`'s `.status.phase` is `Running`, `Succeeded`, `Failed`, or `Unknown` (the recap could not be
+read — same meaning as the per-host [`Unknown`](#hosts-show-unknown) outcome).
+
+### How many are kept
+
+Retention is per plan and split by outcome, so failures stay visible longer than successes:
+
+| Field | Default | Keeps |
+|---|---|---|
+| `spec.successfulPlaysHistoryLimit` | 3 | most recent **succeeded** Plays |
+| `spec.failedPlaysHistoryLimit` | 10 | most recent **failed / unknown** Plays |
+
+Plays beyond these limits are pruned automatically as new runs finish. Deleting the `PlaybookPlan`
+removes all of its Plays.
 
 ## Troubleshooting
 
