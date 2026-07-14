@@ -7,7 +7,7 @@ use k8s_openapi::{
     jiff,
 };
 use kube::{Api, api::PostParams};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::v1beta1::controllers::reconcile_error::ReconcileError;
 
@@ -215,6 +215,90 @@ pub async fn ensure_locks(
     Ok(blocked)
 }
 
+/// What `renew_locks` should do with one host's Lease while a run is in progress. Pure so the
+/// "still ours vs. lost it" branching is unit-testable without a client.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenewalAction {
+    /// The lock is still ours, or its Lease object has gone missing — (re)assert it with a fresh
+    /// renewTime. `resource_version` is `Some` to replace the existing object, `None` to create one.
+    Reassert { resource_version: Option<String> },
+    /// Another holder now owns the lock: this run's lease lapsed and a competing run took it over
+    /// mid-flight. There's nothing safe to do about it from here beyond reporting it.
+    Lost { holder: String },
+}
+
+/// Pure decision for renewing a lock we expect to already hold. Unlike `decide` (which is about
+/// *acquiring*), expiry is irrelevant here: any *other* holder's identity on the Lease means we've
+/// lost it, and we don't try to reclaim it out from under a live run.
+pub fn renewal_decision(existing: Option<&Lease>, holder_identity: &str) -> RenewalAction {
+    let Some(lease) = existing else {
+        return RenewalAction::Reassert {
+            resource_version: None,
+        };
+    };
+
+    let holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_deref());
+    match holder {
+        Some(other) if other != holder_identity => RenewalAction::Lost {
+            holder: other.to_string(),
+        },
+        _ => RenewalAction::Reassert {
+            resource_version: lease.metadata.resource_version.clone(),
+        },
+    }
+}
+
+/// Renews every per-host Lease this run holds, extending each for another `LEASE_DURATION_SECONDS`.
+/// Called every tick while a run is in progress (`Applying`) so a run that outlasts the lease
+/// duration doesn't have its locks silently reclaimed by a competing plan mid-flight.
+///
+/// Deliberately *not* `ensure_locks`: this never acquires locks it doesn't hold and never releases
+/// on conflict (releasing a still-running run's other locks would be exactly the double-run hazard
+/// we're guarding against). A lock that another holder has taken over is reported and skipped — the
+/// run keeps going, but its `.status`/logs surface that the host is no longer protected.
+pub async fn renew_locks(
+    api: &Api<Lease>,
+    target_hosts: &[String],
+    holder_identity: &str,
+) -> Result<(), ReconcileError> {
+    let now = Utc::now();
+
+    for host in target_hosts {
+        let name = lease_name(host);
+        let existing = api.get_opt(&name).await?;
+
+        match renewal_decision(existing.as_ref(), holder_identity) {
+            RenewalAction::Lost { holder } => {
+                warn!(
+                    "Lock for host {host} is now held by {holder}, not this run — its lease lapsed \
+                     and another run took it over; both may target {host} concurrently"
+                );
+            }
+            RenewalAction::Reassert { resource_version } => {
+                let mut lease = build_lease(&name, holder_identity, now);
+                lease.metadata.resource_version = resource_version.clone();
+
+                let result = match resource_version {
+                    Some(_) => api.replace(&name, &PostParams::default(), &lease).await.map(drop),
+                    None => api.create(&PostParams::default(), &lease).await.map(drop),
+                };
+
+                match result {
+                    Ok(()) => {}
+                    // Raced with another writer; the next tick re-reads and renews again, still
+                    // well within the lease duration.
+                    Err(err) if is_conflict(&err) => {
+                        debug!("Lease renewal for host {host} conflicted, will retry next tick");
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Releases every Lease this run holds for `target_hosts`. Called explicitly when a run
 /// finishes (success or terminal failure) — TTL expiry is the crash safety net only, not the
 /// everyday release path.
@@ -362,6 +446,41 @@ mod tests {
         let mut sorted = ordered_names.clone();
         sorted.sort();
         assert_eq!(ordered_names, sorted);
+    }
+
+    #[test]
+    fn renewal_reasserts_when_still_ours_or_object_missing() {
+        let now = Utc::now();
+
+        // Lease object gone -> recreate it (no resourceVersion to replace).
+        assert_eq!(
+            renewal_decision(None, "ns/plan/hash"),
+            RenewalAction::Reassert {
+                resource_version: None
+            }
+        );
+
+        // Still held by us -> replace in place, carrying its resourceVersion.
+        let ours = lease_with("ns/plan/hash", now - Duration::seconds(10), 90);
+        assert_eq!(
+            renewal_decision(Some(&ours), "ns/plan/hash"),
+            RenewalAction::Reassert {
+                resource_version: Some("42".into())
+            }
+        );
+    }
+
+    #[test]
+    fn renewal_reports_loss_when_another_holder_took_over() {
+        // Another holder's identity means we lost the lock mid-run — even if it's expired we do not
+        // reclaim it here, we report it, so we never resurrect a lock a live run is now holding.
+        let stolen = lease_with("ns/other/hash", Utc::now() - Duration::seconds(500), 90);
+        assert_eq!(
+            renewal_decision(Some(&stolen), "ns/plan/hash"),
+            RenewalAction::Lost {
+                holder: "ns/other/hash".into()
+            }
+        );
     }
 
     #[test]

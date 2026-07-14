@@ -550,10 +550,13 @@ async fn advance_applying_run(
     };
     let job = jobs_api.get_opt(&job_name).await?;
 
-    // Still running -> keep waiting.
+    // Still running -> renew this run's host locks so a run that outlasts the lease duration keeps
+    // them (they're acquired once at start and otherwise never touched again while Applying), then
+    // keep waiting.
     if let Some(job) = &job
         && !status::job_finished(job)
     {
+        locking::renew_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
         status::evaluate_playbookplan_conditions(
             run.hosts_to_trigger,
             false,
