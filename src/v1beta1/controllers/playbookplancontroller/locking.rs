@@ -16,6 +16,17 @@ use crate::v1beta1::controllers::reconcile_error::ReconcileError;
 /// stale lock around for a short window before it's eligible for reclaim.
 pub const LEASE_DURATION_SECONDS: i32 = 90;
 
+/// Why `ensure_locks` couldn't take the full set this tick: the first host whose lock is held by
+/// someone else, and — when the lease recorded one — that holder's `namespace/name/hash` identity
+/// so the caller can name the run that's blocking it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlockedBy {
+    pub host: String,
+    /// The current holder's identity (`namespace/name/hash`), or `None` when we simply lost a write
+    /// race (a 409) rather than observing a live holder.
+    pub holder: Option<String>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum LeaseDecision {
     /// No Lease exists yet for this host.
@@ -115,19 +126,35 @@ fn is_conflict(err: &kube::Error) -> bool {
     matches!(err, kube::Error::Api(status) if status.code == 409)
 }
 
-/// Attempts to acquire or renew the per-host Lease for every host in `target_hosts`, all under
-/// the same `holder_identity`. Returns the subset of hosts that are still held by someone else —
-/// an empty result means every lock is held by us. Safe to call every reconcile tick: hosts we
-/// already hold just get their renewTime bumped.
+/// A deterministic global order for acquiring per-host Leases, keyed by the (hashed) lease name so
+/// it is identical for every plan regardless of how its inventory happens to enumerate the hosts.
+/// `ensure_locks` acquires in this order; together with its all-or-nothing release that is what
+/// keeps two plans over overlapping hosts from deadlocking — they contend for the lowest-ordered
+/// lock first instead of each pinning a disjoint subset the other still needs.
+fn acquisition_order(hosts: &[String]) -> Vec<&String> {
+    let mut ordered: Vec<&String> = hosts.iter().collect();
+    ordered.sort_by_cached_key(|host| lease_name(host));
+    ordered
+}
+
+/// Acquires or renews the per-host Lease for every host in `target_hosts` under `holder_identity`,
+/// all-or-nothing: on return this holder owns either *all* of the requested locks (`None`) or *none*
+/// of them (`Some(BlockedBy)` naming the host — and, when known, the other run — that blocked us).
+/// If any lock can't be taken this tick, the ones already taken are released before returning, so a
+/// partially-held set is never left pinned across ticks waiting for the rest — which is exactly the
+/// deadlock two plans over overlapping hosts would otherwise fall into. That, plus acquiring in a
+/// fixed global order (`acquisition_order`), turns contention into clean serialization: one plan
+/// takes the whole set and runs while the others wait their turn. Safe to call every reconcile tick
+/// — locks we already hold just get their renewTime bumped.
 pub async fn ensure_locks(
     api: &Api<Lease>,
     target_hosts: &[String],
     holder_identity: &str,
-) -> Result<Vec<String>, ReconcileError> {
+) -> Result<Option<BlockedBy>, ReconcileError> {
     let now = Utc::now();
-    let mut blocked = Vec::new();
+    let mut blocked = None;
 
-    for host in target_hosts {
+    for host in acquisition_order(target_hosts) {
         let name = lease_name(host);
         let existing = api.get_opt(&name).await?;
         let decision = decide(existing.as_ref(), holder_identity, now);
@@ -137,29 +164,52 @@ pub async fn ensure_locks(
                 let lease = build_lease(&name, holder_identity, now);
                 api.create(&PostParams::default(), &lease).await.map(drop)
             }
-            LeaseDecision::Replace { resource_version } | LeaseDecision::Renew { resource_version } => {
+            LeaseDecision::Replace { resource_version }
+            | LeaseDecision::Renew { resource_version } => {
                 let mut lease = build_lease(&name, holder_identity, now);
                 lease.metadata.resource_version = Some(resource_version);
                 api.replace(&name, &PostParams::default(), &lease)
                     .await
                     .map(drop)
             }
+            // Held by another plan and not expired. Because we acquire in a fixed global order,
+            // nothing after this can complete the set either — stop, record what (and who) blocked
+            // us, and fall through to release whatever we already took this tick.
             LeaseDecision::HeldByOther => {
-                blocked.push(host.clone());
-                continue;
+                let holder = existing
+                    .as_ref()
+                    .and_then(|lease| lease.spec.as_ref())
+                    .and_then(|spec| spec.holder_identity.clone());
+                blocked = Some(BlockedBy {
+                    host: host.clone(),
+                    holder,
+                });
+                break;
             }
         };
 
         match result {
             Ok(()) => {}
-            // Someone else raced us between our read and write — treat as blocked for this
-            // tick, we'll re-evaluate next time rather than treating it as a hard failure.
+            // Someone else raced us between our read and write — treat as blocked for this tick and
+            // stop; we'll re-evaluate from scratch next time rather than treating it as a hard
+            // failure. We didn't see the winning holder, so we can't name it.
             Err(err) if is_conflict(&err) => {
                 debug!("Lease conflict for host {host}, will retry next tick");
-                blocked.push(host.clone());
+                blocked = Some(BlockedBy {
+                    host: host.clone(),
+                    holder: None,
+                });
+                break;
             }
             Err(err) => return Err(err.into()),
         }
+    }
+
+    // All-or-nothing: if we couldn't take every requested lock, drop the ones we did take so no lock
+    // is ever held across ticks by a plan that isn't running. A plan pinning a strict subset while
+    // it waits for the rest is precisely the deadlock this avoids.
+    if blocked.is_some() {
+        release_locks(api, target_hosts, holder_identity).await?;
     }
 
     Ok(blocked)
@@ -284,6 +334,34 @@ mod tests {
                 resource_version: "42".into()
             }
         );
+    }
+
+    #[test]
+    fn acquisition_order_is_independent_of_input_ordering() {
+        // Two plans may enumerate the same hosts in different orders (different inventory groups).
+        // The acquisition order must come out identical for both so they contend for the same lock
+        // first — that shared ordering is what makes the all-or-nothing acquisition deadlock-free.
+        let one = vec![
+            "homelab-ctrl-0".to_string(),
+            "homelab-worker-1".to_string(),
+            "homelab-worker-0".to_string(),
+        ];
+        let two = vec![
+            "homelab-worker-0".to_string(),
+            "homelab-ctrl-0".to_string(),
+            "homelab-worker-1".to_string(),
+        ];
+
+        assert_eq!(acquisition_order(&one), acquisition_order(&two));
+
+        // ...and that order is ascending by lease name.
+        let ordered_names: Vec<String> = acquisition_order(&one)
+            .iter()
+            .map(|host| lease_name(host))
+            .collect();
+        let mut sorted = ordered_names.clone();
+        sorted.sort();
+        assert_eq!(ordered_names, sorted);
     }
 
     #[test]

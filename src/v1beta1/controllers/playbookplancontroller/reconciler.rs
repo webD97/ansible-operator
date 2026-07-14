@@ -426,12 +426,21 @@ async fn try_start_run(
 
     let run_groups = run.run_groups;
 
-    let blocked =
-        locking::ensure_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?;
-    if !blocked.is_empty() {
-        debug!("Waiting on per-host locks for: {blocked:?}");
+    if let Some(blocked) =
+        locking::ensure_locks(&leases_api, run.hosts_to_trigger, run.holder_identity).await?
+    {
+        warn!(
+            "PlaybookPlan {}/{} is blocked: host '{}' is locked by {}",
+            run.namespace,
+            run.name,
+            blocked.host,
+            blocked.holder.as_deref().unwrap_or("another run"),
+        );
+        status::set_blocked_condition(resource_status, Some(&blocked));
         return Ok(Some(std::time::Duration::from_secs(15)));
     }
+    // Locks are ours this tick — clear any stale Blocked condition from a previous contended tick.
+    status::set_blocked_condition(resource_status, None);
 
     let (managed_ssh_hosts, tolerations) = managed_ssh_hosts_and_tolerations(run_groups);
 

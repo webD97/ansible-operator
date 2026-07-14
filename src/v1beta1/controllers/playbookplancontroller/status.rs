@@ -7,7 +7,7 @@ use crate::{
     v1beta1::{HostOutcome, PlaybookPlanCondition, PlaybookPlanStatus},
 };
 
-use super::{callback_output::CallbackOutput, execution_evaluator::ExecutionHash};
+use super::{callback_output::CallbackOutput, execution_evaluator::ExecutionHash, locking::BlockedBy};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -53,6 +53,42 @@ pub fn evaluate_host_outcomes(
         entry.last_outcome = outcome;
         entry.last_transition_time = Some(now);
     }
+}
+
+/// Sets the plan-level `Blocked` condition, which reports whether this run is currently waiting on
+/// a per-host lock held by another run (locks are global per node — see `locking::ensure_locks`).
+/// `Some(blocked)` sets it `True` with the offending host and, when known, the holding run named in
+/// the message; `None` — the run holds (or could take) all its locks — sets it `False`. The `phase`
+/// stays whatever it was (typically `Scheduled`): being blocked is an orthogonal, transient overlay
+/// on the plan's lifecycle, not a lifecycle state of its own, so a condition models it better than a
+/// phase would.
+pub fn set_blocked_condition(status: &mut PlaybookPlanStatus, blocked: Option<&BlockedBy>) {
+    let now = chrono::Local::now().fixed_offset();
+
+    let condition = match blocked {
+        Some(blocked) => {
+            let holder = blocked.holder.as_deref().unwrap_or("another run");
+            PlaybookPlanCondition {
+                type_: "Blocked".into(),
+                status: "True".into(),
+                reason: Some("HostLockHeld".into()),
+                message: Some(format!(
+                    "waiting for a lock on host '{}' held by {holder}",
+                    blocked.host
+                )),
+                last_transition_time: Some(now),
+            }
+        }
+        None => PlaybookPlanCondition {
+            type_: "Blocked".into(),
+            status: "False".into(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(now),
+        },
+    };
+
+    upsert_condition(&mut status.conditions, condition);
 }
 
 /// Recomputes the plan-level `Running`/`Ready` conditions from this run's host-outcome tally,
@@ -190,6 +226,67 @@ mod tests {
 
         let hosts_status = status.hosts_status.unwrap();
         assert_eq!(hosts_status["host-1"].last_outcome, HostOutcome::Unknown);
+    }
+
+    #[test]
+    fn blocked_condition_names_the_holder_then_clears_in_place() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_blocked_condition(
+            &mut status,
+            Some(&BlockedBy {
+                host: "homelab-ctrl-0".into(),
+                holder: Some("default/oneshot-fail/87882ca3".into()),
+            }),
+        );
+        let blocked = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Blocked")
+            .unwrap();
+        assert_eq!(blocked.status, "True");
+        assert_eq!(blocked.reason.as_deref(), Some("HostLockHeld"));
+        let message = blocked.message.as_deref().unwrap();
+        assert!(message.contains("homelab-ctrl-0"), "{message}");
+        assert!(message.contains("default/oneshot-fail/87882ca3"), "{message}");
+
+        set_blocked_condition(&mut status, None);
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .filter(|c| c.type_ == "Blocked")
+                .count(),
+            1,
+            "upsert must replace the condition in place, not append a second one"
+        );
+        let cleared = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Blocked")
+            .unwrap();
+        assert_eq!(cleared.status, "False");
+    }
+
+    #[test]
+    fn blocked_condition_falls_back_when_holder_unknown() {
+        let mut status = PlaybookPlanStatus::default();
+        set_blocked_condition(
+            &mut status,
+            Some(&BlockedBy {
+                host: "homelab-worker-0".into(),
+                holder: None,
+            }),
+        );
+        let message = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "Blocked")
+            .unwrap()
+            .message
+            .clone()
+            .unwrap();
+        assert!(message.contains("another run"), "{message}");
     }
 
     #[test]
