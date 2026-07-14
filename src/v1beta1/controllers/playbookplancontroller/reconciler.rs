@@ -43,6 +43,10 @@ use crate::{
     },
 };
 
+/// Default grace window after a scheduled tick during which a run may still start, when the plan
+/// does not set `spec.startingDeadlineSeconds`. See that field's docs.
+const DEFAULT_STARTING_DEADLINE_SECONDS: u32 = 30;
+
 struct ReconciliationContext {
     client: kube::Client,
     /// Namespace the operator itself runs in — where per-run Leases and managed-ssh proxy pods
@@ -281,7 +285,13 @@ async fn reconcile(
     // Step 1: compute outdated hosts / evaluate schedule — unchanged from before.
     let tz = object.timezone().unwrap();
     let now = || Utc::now().with_timezone(&tz);
-    let time_window = chrono::Duration::seconds(15);
+    let time_window = chrono::Duration::seconds(
+        object
+            .spec
+            .starting_deadline_seconds
+            .unwrap_or(DEFAULT_STARTING_DEADLINE_SECONDS)
+            .into(),
+    );
     let timing = evaluate_schedule(object.spec.schedule.as_deref(), now(), time_window);
     let outdated_hosts = find_outdated_hosts(&resource_status, &execution_hash)?;
     let all_hosts = find_all_hosts(&resource_status);

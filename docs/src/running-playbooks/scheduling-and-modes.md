@@ -10,13 +10,20 @@ Two independent things decide *when* a plan runs and *what* runs:
 
 `spec.schedule` is a standard **5-field cron** expression (`minute hour day-of-month month
 day-of-week`). `spec.timeZone` is the IANA time zone it is evaluated in; if omitted, **UTC** is used.
-A run fires inside a short time window around each scheduled tick, so an exact match to the second is
-not required, but the granularity is minutes, not seconds.
+The granularity is minutes, not seconds.
+
+The operator evaluates the schedule on its own reconcile cycle rather than exactly on the tick, so a
+run starts within a short window *after* each scheduled time. `spec.startingDeadlineSeconds` sets how
+wide that window is: if the run has not started within this many seconds of the tick — because the
+operator was busy or restarting — that tick is skipped and the run waits for the next one. It
+defaults to **30** seconds. Raise it for a plan that must not miss a tick even if the operator is
+briefly down at the scheduled time. This is the same idea as a CronJob's `.spec.startingDeadlineSeconds`.
 
 ```yaml
 spec:
-  schedule: "0 3 * * *"      # 03:00 every day
-  timeZone: Europe/Berlin    # ...in Berlin local time (honours DST)
+  schedule: "0 3 * * *"          # 03:00 every day
+  timeZone: Europe/Berlin        # ...in Berlin local time (honours DST)
+  startingDeadlineSeconds: 300   # still fire if the operator catches up within 5 minutes
 ```
 
 **Omitting `schedule`** means "eligible to run as soon as possible", not "never": the plan is not

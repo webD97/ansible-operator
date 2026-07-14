@@ -70,6 +70,15 @@ pub struct PlaybookPlanSpec {
     /// Time zone for the _schedule_ field, if unset UTC is assumed
     pub time_zone: Option<String>,
 
+    /// Grace window, in seconds, after a scheduled tick during which a run may still start. The
+    /// operator evaluates the schedule on a requeue rather than exactly on the tick, so this
+    /// absorbs the gap between a tick and the next reconcile (e.g. the operator was busy or
+    /// restarting). If more than this many seconds pass past a tick without the run starting, that
+    /// tick is skipped and the run waits for the next one. The same idea as a CronJob's
+    /// `.spec.startingDeadlineSeconds`. Only affects scheduled (`schedule`) plans. Defaults to 30.
+    #[schemars(with = "Option<UnsignedInt>")]
+    pub starting_deadline_seconds: Option<u32>,
+
     /// These host groups will be available in our playbook
     pub inventory_refs: Vec<InventoryRef>,
 
@@ -297,6 +306,7 @@ mod tests {
                 suspend: false,
                 schedule: Some("0 1 * * *".into()),
                 time_zone: None,
+                starting_deadline_seconds: None,
                 inventory_refs: vec![InventoryRef {
                     cluster_inventory: Some("controlplanes".into()),
                     static_inventory: Some("others".into()),
