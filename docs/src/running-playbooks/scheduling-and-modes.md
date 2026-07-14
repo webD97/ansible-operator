@@ -86,6 +86,28 @@ Within a single hash, if a run's Job needs to be retried the operator numbers su
 so the hash alone cannot distinguish attempts. You generally do not interact with this; it is why you
 may see more than one Job object for the same run.
 
+## Host locks
+
+The operator applies at most one playbook to a given host at a time, across the whole cluster. Before
+a run starts it takes a short-lived lock — a Kubernetes `Lease` in the operator's namespace — on every
+host the run targets, and releases them when the run finishes. Locks are keyed by host and shared by
+every plan, so two plans that target the same Node cannot run against it at once, even when they live
+in different namespaces.
+
+Acquisition is all-or-nothing: a run starts only once it holds the lock for **every** host it targets.
+If another run holds any of them, the plan waits and retries rather than running against part of its
+inventory. Plans whose hosts overlap therefore take turns — one run finishes and releases its locks,
+then the next acquires them. Plans over completely separate hosts never block each other.
+
+While a plan is waiting on a lock held by another run, its
+[`Blocked` condition](./results-and-troubleshooting.md#conditions) is `True`, its `.status` names the
+host and the run holding it, and the operator logs a warning. The plan's phase stays `Scheduled` (or
+`Pending`) meanwhile: being blocked is a temporary wait, not a failure, and the run proceeds on its
+own as soon as the lock is free.
+
+A crashed operator's locks expire on their own after a short period, so a host is never left locked
+indefinitely.
+
 ## Cleaning up finished Jobs
 
 `spec.ttlSecondsAfterFinished` controls how long a finished run's Job and its pod linger before

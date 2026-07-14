@@ -52,15 +52,16 @@ hash and re-applies the plan.
 
 ## Files
 
-`template.files` makes blobs available to the run at a predictable path. Each entry has a `name`
-(which becomes the directory the content is mounted under) and a source. Inside the playbook,
-reference a file entry named `my-assets` at:
+`template.files` makes blobs available inside the run's **workspace** — the directory
+`/run/ansible-operator`, which is also the playbook's working directory. Each entry has a `name`
+(which becomes a subdirectory under `files/`) and a source. A file entry named `my-assets` is mounted
+at:
 
 ```text
 /run/ansible-operator/files/my-assets/...
 ```
 
-The run's working directory is `/run/ansible-operator`, so `files/my-assets/...` works too.
+so the playbook can read it there, or via the relative path `files/my-assets/...`.
 
 ### From a Secret
 

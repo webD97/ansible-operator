@@ -24,7 +24,7 @@ per-host status, and the summary line.
 | Phase | Meaning |
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation or after the inputs changed. |
-| `Delayed` | Execution was deferred (e.g. waiting on a lock or on proxy readiness). Transient. |
+| `Delayed` | Execution was deferred (e.g. waiting on proxy readiness). Transient. |
 | `Applying` | A Job is running the playbook right now. The `Running` condition is `True`. |
 | `Scheduled` | (`Recurring`) The run finished and the plan is waiting for the next schedule tick. |
 | `Succeeded` | (`OneShot`) Every host has succeeded on the current hash; the plan is quiet until the inputs change. |
@@ -33,10 +33,15 @@ per-host status, and the summary line.
 
 ## Conditions
 
-`.status.conditions` carries two `True`/`False` conditions surfaced as columns:
+`.status.conditions` carries `True`/`False` conditions. `Ready` and `Running` are also surfaced as
+printer columns:
 
 - **`Ready`** — the plan is in a healthy, settled state.
 - **`Running`** — a Job is currently applying the playbook.
+- **`Blocked`** — the run is due but waiting on a per-host lock held by another run; the condition
+  message names the host and the run holding it. This one is not a column — read it with `kubectl
+  describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
+  [Host locks](./scheduling-and-modes.md#host-locks).
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
 current [execution hash](./scheduling-and-modes.md#drift-detection).
@@ -113,6 +118,16 @@ admin which policy applies to your namespace (see
 `.status.hostCount` shows how many Nodes match *before* policy clamping, which helps localise the
 problem.
 
+### A plan is not starting and its `Blocked` condition is `True`
+
+Another run is holding a lock on a host this plan targets, so the plan is waiting its turn — host
+locks are cluster-wide, and a Node is applied to by one run at a time (see
+[Host locks](./scheduling-and-modes.md#host-locks)). `kubectl describe playbookplan <name>` shows the
+host and the run holding it, and the operator logs a matching warning. This is normal when two plans
+share hosts: the run proceeds once the other finishes. If it never clears, look at the run named as
+the holder — a plan that runs very often (a `Recurring` plan on a tight schedule, or a `OneShot` that
+keeps failing and retrying) can keep an overlapping plan waiting for a long time.
+
 ### Hosts show `NotReached`
 
 Expected when a play stops early — for example a `serial` batch that failed before reaching later
@@ -138,4 +153,5 @@ an unrelated `spec` field (or a schedule that has not fired yet) will not. Confi
 
 Check the `schedule`/`timeZone` and `.status.nextRun`. Remember that `OneShot` goes quiet once every
 host is current — that is success, not a hang. A `Recurring` plan with no `schedule` has nothing
-telling it when to fire.
+telling it when to fire. If the `Blocked` condition is `True`, it is waiting on host locks held by
+another run — see above.

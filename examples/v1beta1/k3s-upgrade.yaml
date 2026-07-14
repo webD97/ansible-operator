@@ -1,0 +1,88 @@
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: ClusterInventory
+metadata:
+  namespace: ansible-system
+  name: cluster-nodes
+spec:
+  tolerations:
+    - operator: Exists
+  hosts:
+    - name: controlplanes
+      matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: In
+          values: ["true"]
+    - name: workers
+      matchExpressions:
+        - key: node-role.kubernetes.io/control-plane
+          operator: DoesNotExist
+---
+apiVersion: ansible.cloudbending.dev/v1beta1
+kind: PlaybookPlan
+metadata:
+  namespace: ansible-system
+  name: k3s-upgrade
+spec:
+  mode: OneShot
+  schedule: "* * * * *"
+  image: docker.io/serversideup/ansible-core:2.18
+  timeZone: Europe/Berlin
+  ttlSecondsAfterFinished: 300
+  inventoryRefs:
+    - clusterInventory: cluster-nodes
+  template:
+    files:
+      - name: k3s
+        image:
+          reference: docker.io/rancher/k3s-upgrade:v1.36.2-k3s1
+    playbook: |
+      - hosts: controlplanes
+        gather_facts: false
+        serial: 1
+        tasks:
+          - name: Ensure k3s binary is installed
+            notify: Restart_k3s
+            register: k3s_binary
+            ansible.builtin.copy:
+              src: ./files/k3s/opt/k3s
+              dest: /usr/local/bin/k3s
+              backup: true
+              owner: root
+              group: root
+              mode: 0750
+
+          - name: Run restorecon if necessary
+            when: k3s_binary.changed
+            ansible.builtin.command: restorecon /usr/local/bin/k3s
+
+          - name: Restart_k3s
+            when: k3s_binary.changed
+            ansible.builtin.systemd:
+              name: k3s.service
+              state: restarted
+
+      - hosts: workers
+        gather_facts: false
+        serial: 1
+        tasks:
+          - name: Ensure k3s binary is installed
+            notify: Restart_k3s
+            register: k3s_binary
+            ansible.builtin.copy:
+              src: ./files/k3s/opt/k3s
+              dest: /usr/local/bin/k3s
+              backup: true
+              owner: root
+              group: root
+              mode: 0750
+
+          - name: Run restorecon if necessary
+            when: k3s_binary.changed
+            changed_when: true
+            ansible.builtin.command: restorecon /usr/local/bin/k3s
+            
+          - name: Restart_k3s
+            when: k3s_binary.changed
+            ansible.builtin.systemd:
+              name: k3s.service
+              state: restarted
