@@ -70,6 +70,9 @@ struct ReconciliationContext {
     /// Admin-overridable via the chart's `managedSsh.proxyImage`; resolved in `new` to the configured
     /// value or `managed_ssh::DEFAULT_PROXY_IMAGE` when unset.
     proxy_image: String,
+    /// How long to wait for a `NotReady` node's proxy pod to become Ready before treating the node as
+    /// unreachable, scaled by the node's heartbeat age. From the chart's `managedSsh.readiness`.
+    proxy_grace: managed_ssh::ProxyGracePolicy,
 }
 
 /// Per-tick identifiers shared by `try_start_run` and `advance_applying_run`: the resource's
@@ -94,6 +97,7 @@ pub fn new(
     enrolled_namespaces: std::collections::BTreeSet<String>,
     ca: Arc<CertificateAuthority>,
     proxy_image: Option<String>,
+    proxy_grace: managed_ssh::ProxyGracePolicy,
 ) -> impl Stream<
     Item = Result<
         (ObjectRef<v1beta1::PlaybookPlan>, Action),
@@ -164,6 +168,7 @@ pub fn new(
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
         proxy_image,
+        proxy_grace,
     });
 
     let mut controller = Controller::new(playbookplans_api, watcher::Config::default()).watches(
@@ -465,21 +470,33 @@ async fn try_start_run(
         &run.execution_hash,
         &managed_ssh_hosts,
         tolerations.as_deref(),
+        &context.proxy_grace,
         &context.ca,
         &context.proxy_image,
         &plan_owner,
     )
     .await?;
 
-    let proxy_infos = match proxy_readiness {
-        managed_ssh::ProxyReadiness::Pending => {
-            debug!("Waiting for managed-ssh proxy pods to become Ready");
+    let (proxy_infos, unreachable_hosts) = match proxy_readiness {
+        managed_ssh::ProxyReadiness::Pending { waiting } => {
+            debug!("Waiting for managed-ssh proxy pods to become Ready on {waiting:?}");
+            status::set_waiting_for_nodes_condition(resource_status, Some(&waiting));
             return Ok(Some(std::time::Duration::from_secs(5)));
         }
-        managed_ssh::ProxyReadiness::AllReady(infos) => infos,
+        managed_ssh::ProxyReadiness::Ready { ready, unreachable } => {
+            status::set_waiting_for_nodes_condition(resource_status, None);
+            (ready, unreachable)
+        }
     };
 
-    let managed_ssh_hosts_map: BTreeMap<String, ansible::ManagedSshHostInfo> = proxy_infos
+    if !unreachable_hosts.is_empty() {
+        warn!(
+            "PlaybookPlan {}/{}: proceeding without node(s) {:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
+            run.namespace, run.name, unreachable_hosts,
+        );
+    }
+
+    let mut managed_ssh_hosts_map: BTreeMap<String, ansible::ManagedSshHostInfo> = proxy_infos
         .into_iter()
         .map(|p| {
             (
@@ -487,10 +504,24 @@ async fn try_start_run(
                 ansible::ManagedSshHostInfo {
                     pod_ip: p.pod_ip,
                     port: p.port,
+                    unreachable: false,
                 },
             )
         })
         .collect();
+
+    // Hosts whose proxy never became Ready in time have no pod IP; point Ansible at the unroutable
+    // sentinel (with a short connect timeout, see inventory_renderer) so it records them unreachable.
+    for host in unreachable_hosts {
+        managed_ssh_hosts_map.insert(
+            host,
+            ansible::ManagedSshHostInfo {
+                pod_ip: managed_ssh::UNREACHABLE_SENTINEL_IP.to_string(),
+                port: managed_ssh::PROXY_SSH_PORT,
+                unreachable: true,
+            },
+        );
+    }
 
     // Proxy pod IPs are fresh every run even with an unchanged spec, so rendering is also
     // triggered on "a run is starting now", not generation alone.

@@ -56,6 +56,9 @@ spec:
     - operator: Exists
 ```
 
+The `not-ready` and `unreachable` taints Kubernetes applies to a `NotReady` Node are tolerated
+automatically — you do not need to list them. See [NotReady nodes](#notready-nodes).
+
 ## How managed SSH reaches a Node
 
 You do not configure any of this; it is background for the security model and for troubleshooting.
@@ -76,6 +79,17 @@ There is **no standing agent or DaemonSet** on your Nodes: proxy pods exist only
 a run. The security properties of this path — per-run certificate isolation, the in-memory CA, and
 why `NodeAccessPolicy` is mandatory — are covered in
 [Security model](../cluster-operators/security.md).
+
+## NotReady nodes
+
+A Node matched by a `ClusterInventory` stays in the inventory even when it is `NotReady`. The operator
+still schedules the proxy pod onto it and waits for the pod to become Ready. While it waits, the
+`PlaybookPlan` carries a `WaitingForNodes` condition naming the pending Node(s).
+
+If the proxy pod does not become Ready within the wait window, the run proceeds without that Node:
+Ansible reports it **unreachable** for the run, and the Node is retried on the next run, so it heals on
+its own once it recovers. The wait window is set by the cluster operator and shrinks the longer a Node
+has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
 
 ## Requirements and limitations
 

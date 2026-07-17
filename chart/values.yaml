@@ -22,6 +22,18 @@ managedSsh:
     repository: testcontainers/sshd
     tag: latest
 
+  # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
+  # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on
+  # the next run). The wait is only for pods stuck before Running; a pod that has reached Running is
+  # waited on until Ready as usual. The wait scales with how long the node has been silent: it is
+  # `graceSeconds` for a node whose last heartbeat is within `thresholdDays[0]`, divided by
+  # `aggressiveness` again at each further threshold, and 0 (given up immediately) past the last one.
+  # Defaults give 600 / 300 / 150 / 0 seconds at 3 / 7 / 30 day boundaries.
+  readiness:
+    graceSeconds: 600
+    aggressiveness: 2
+    thresholdDays: [3, 7, 30]
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""

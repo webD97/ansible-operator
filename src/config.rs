@@ -42,6 +42,38 @@ pub struct OperatorConfig {
     /// exactly like `watch_namespaces`. Accepts a digest-pinned reference (`repo@sha256:…`).
     #[serde(default)]
     pub proxy_image: Option<String>,
+
+    /// How long the operator waits for a `NotReady` node's managed-ssh proxy pod to become Ready
+    /// before treating the node as unreachable for the run (see `ProxyGracePolicy`). Rendered by the
+    /// Helm chart from `managedSsh.readiness` into the `[managed_ssh]` table; absent ⇒ all defaults.
+    #[serde(default)]
+    pub managed_ssh: ManagedSshConfig,
+}
+
+/// The `[managed_ssh]` config table: tunables for the adaptive readiness gate. The base wait is
+/// divided by `aggressiveness` at each successive heartbeat-age tier (`threshold_days`), so a node
+/// that has been silent longer is given up on faster. Defaults reproduce a 600 → 300 → 150 → 0
+/// (seconds) schedule at 3 / 7 / 30 day boundaries.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ManagedSshConfig {
+    /// Full (tier-0) wait, in seconds, for a recently-alive node. Default 600.
+    pub grace_seconds: i64,
+    /// Divisor applied to the wait at each successive tier. Default 2; clamped to `>= 1` downstream.
+    pub aggressiveness: u32,
+    /// Three ascending heartbeat-age boundaries, in days. Past the last one the wait is 0.
+    /// Default `[3, 7, 30]`.
+    pub threshold_days: [i64; 3],
+}
+
+impl Default for ManagedSshConfig {
+    fn default() -> Self {
+        Self {
+            grace_seconds: 600,
+            aggressiveness: 2,
+            threshold_days: [3, 7, 30],
+        }
+    }
 }
 
 impl OperatorConfig {
@@ -115,6 +147,36 @@ mod tests {
         assert_eq!(
             overridden.proxy_image.as_deref(),
             Some("registry.example.com/sshd@sha256:abc")
+        );
+    }
+
+    #[test]
+    fn managed_ssh_defaults_when_table_absent() {
+        let config: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
+        assert_eq!(config.managed_ssh.grace_seconds, 600);
+        assert_eq!(config.managed_ssh.aggressiveness, 2);
+        assert_eq!(config.managed_ssh.threshold_days, [3, 7, 30]);
+    }
+
+    #[test]
+    fn managed_ssh_table_round_trips_and_rejects_unknown_keys() {
+        let overridden: OperatorConfig = toml::from_str(
+            "[managed_ssh]\ngrace_seconds = 300\naggressiveness = 4\nthreshold_days = [1, 2, 5]\n",
+        )
+        .unwrap();
+        assert_eq!(overridden.managed_ssh.grace_seconds, 300);
+        assert_eq!(overridden.managed_ssh.aggressiveness, 4);
+        assert_eq!(overridden.managed_ssh.threshold_days, [1, 2, 5]);
+
+        // Unknown key under the table is rejected (deny_unknown_fields).
+        assert!(
+            toml::from_str::<OperatorConfig>("[managed_ssh]\nnope = 1\n").is_err(),
+            "unknown [managed_ssh] key must be rejected"
+        );
+        // The three boundaries are enforced by the fixed-size array.
+        assert!(
+            toml::from_str::<OperatorConfig>("[managed_ssh]\nthreshold_days = [1, 2]\n").is_err(),
+            "threshold_days of the wrong length must be rejected"
         );
     }
 

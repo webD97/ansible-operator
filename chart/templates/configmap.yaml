@@ -23,3 +23,12 @@ data:
     # in production; omit `tag` and put a `@sha256:...` digest in `repository` to do so.
     proxy_image = {{ printf "%s%s" .repository (ternary (printf ":%s" (.tag | toString)) "" (ne (.tag | toString) "")) | quote }}
     {{- end }}{{ end }}{{ end }}
+    {{- with (.Values.managedSsh).readiness }}
+
+    # Adaptive readiness grace for managed-ssh proxy pods on NotReady nodes: wait `grace_seconds`,
+    # divided by `aggressiveness` at each `threshold_days` boundary, then give up (report unreachable).
+    [managed_ssh]
+    grace_seconds = {{ .graceSeconds | int }}
+    aggressiveness = {{ .aggressiveness | int }}
+    threshold_days = [{{ range $i, $d := .thresholdDays }}{{ if $i }}, {{ end }}{{ $d | int }}{{ end }}]
+    {{- end }}

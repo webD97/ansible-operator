@@ -107,6 +107,14 @@ async fn run(args: RunArgs) {
     // default. Pin to a trusted digest in production.
     let proxy_image = operator_config.proxy_image.clone();
 
+    // Adaptive readiness-grace policy for managed-ssh proxy pods on NotReady nodes, from the chart's
+    // `managedSsh.readiness`. `ProxyGracePolicy::new` clamps `aggressiveness` and converts days→secs.
+    let proxy_grace = v1beta1::playbookplancontroller::ProxyGracePolicy::new(
+        operator_config.managed_ssh.grace_seconds,
+        operator_config.managed_ssh.aggressiveness,
+        operator_config.managed_ssh.threshold_days,
+    );
+
     // Ephemeral, in-memory CA: a fresh keypair per operator process, never persisted to the
     // cluster. Restarting the operator rotates the CA and invalidates all outstanding certs.
     let ca = Arc::new(
@@ -120,6 +128,7 @@ async fn run(args: RunArgs) {
         enrolled_namespaces,
         ca,
         proxy_image,
+        proxy_grace,
     )
     .for_each(|res| async move {
         match res {

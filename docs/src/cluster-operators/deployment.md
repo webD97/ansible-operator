@@ -60,6 +60,29 @@ managedSsh:
 The value is rendered into the operator's config and consumed at pod-build time; changing it rolls
 the operator (via a `checksum/config` annotation) rather than hot-reloading.
 
+## NotReady nodes
+
+When a `ClusterInventory` targets a `NotReady` Node, the operator still schedules its proxy pod and
+waits for the pod to become Ready. If it does not become Ready in time, the run proceeds without that
+Node — Ansible reports it unreachable, and it is retried on the next run. The wait applies only to a
+pod that has not yet started; a pod that has reached `Running` is waited on until Ready as usual.
+
+The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
+just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via
+`managedSsh.readiness`:
+
+```yaml
+# values.yaml
+managedSsh:
+  readiness:
+    graceSeconds: 600         # full wait for a node whose last heartbeat is within thresholdDays[0]
+    aggressiveness: 2         # divide the wait at each further threshold
+    thresholdDays: [3, 7, 30] # heartbeat-age boundaries; past the last one the node is given up at once
+```
+
+The defaults wait 600 / 300 / 150 / 0 seconds for a Node last seen within 3 / 7 / 30 / more days.
+Like the other config values, a change rolls the operator rather than hot-reloading.
+
 ## Enrolled namespaces
 
 The operator's cluster-wide RBAC does **not** include `secrets`, `jobs`, or `pods`. Those verbs are

@@ -7,7 +7,9 @@ use crate::{
     v1beta1::{HostOutcome, PlaybookPlanCondition, PlaybookPlanStatus},
 };
 
-use super::{callback_output::CallbackOutput, execution_evaluator::ExecutionHash, locking::BlockedBy};
+use super::{
+    callback_output::CallbackOutput, execution_evaluator::ExecutionHash, locking::BlockedBy,
+};
 
 /// Whether this run's single Job has reached a terminal state — `Complete` or `Failed`.
 pub fn job_finished(job: &batch::v1::Job) -> bool {
@@ -81,6 +83,41 @@ pub fn set_blocked_condition(status: &mut PlaybookPlanStatus, blocked: Option<&B
         }
         None => PlaybookPlanCondition {
             type_: "Blocked".into(),
+            status: "False".into(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(now),
+        },
+    };
+
+    upsert_condition(&mut status.conditions, condition);
+}
+
+/// Sets the plan-level `WaitingForNodes` condition, reporting whether this run is currently waiting
+/// for managed-ssh proxy pods to become Ready on one or more target nodes (a node may be `NotReady`
+/// or its proxy pod still starting). `Some(hosts)` sets it `True` naming the pending hosts; `None` —
+/// the proxies are all Ready, or timed out and the run is proceeding — sets it `False`. Like
+/// `Blocked`, this is an orthogonal transient overlay on the plan's lifecycle, not a phase of its own,
+/// so a condition models it better than a phase would.
+pub fn set_waiting_for_nodes_condition(
+    status: &mut PlaybookPlanStatus,
+    waiting: Option<&[String]>,
+) {
+    let now = chrono::Local::now().fixed_offset();
+
+    let condition = match waiting {
+        Some(hosts) => PlaybookPlanCondition {
+            type_: "WaitingForNodes".into(),
+            status: "True".into(),
+            reason: Some("ProxyPodsNotReady".into()),
+            message: Some(format!(
+                "waiting for managed-ssh proxy pods on host(s): {}",
+                hosts.join(", ")
+            )),
+            last_transition_time: Some(now),
+        },
+        None => PlaybookPlanCondition {
+            type_: "WaitingForNodes".into(),
             status: "False".into(),
             reason: None,
             message: None,
@@ -188,7 +225,13 @@ mod tests {
     fn succeeded_host_bumps_hash_others_do_not() {
         let mut status = PlaybookPlanStatus::default();
         let mut processed = BTreeMap::new();
-        processed.insert("host-1".to_string(), HostStats { ok: 1, ..Default::default() });
+        processed.insert(
+            "host-1".to_string(),
+            HostStats {
+                ok: 1,
+                ..Default::default()
+            },
+        );
         processed.insert(
             "host-2".to_string(),
             HostStats {
@@ -200,7 +243,11 @@ mod tests {
         let h = hash();
 
         evaluate_host_outcomes(
-            &["host-1".to_string(), "host-2".to_string(), "host-3".to_string()],
+            &[
+                "host-1".to_string(),
+                "host-2".to_string(),
+                "host-3".to_string(),
+            ],
             Some(&output),
             &h,
             &mut status,
@@ -248,7 +295,10 @@ mod tests {
         assert_eq!(blocked.reason.as_deref(), Some("HostLockHeld"));
         let message = blocked.message.as_deref().unwrap();
         assert!(message.contains("homelab-ctrl-0"), "{message}");
-        assert!(message.contains("default/oneshot-fail/87882ca3"), "{message}");
+        assert!(
+            message.contains("default/oneshot-fail/87882ca3"),
+            "{message}"
+        );
 
         set_blocked_condition(&mut status, None);
         assert_eq!(
@@ -287,6 +337,43 @@ mod tests {
             .clone()
             .unwrap();
         assert!(message.contains("another run"), "{message}");
+    }
+
+    #[test]
+    fn waiting_for_nodes_condition_names_hosts_then_clears_in_place() {
+        let mut status = PlaybookPlanStatus::default();
+
+        set_waiting_for_nodes_condition(
+            &mut status,
+            Some(&["worker-1".to_string(), "worker-2".to_string()]),
+        );
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "WaitingForNodes")
+            .unwrap();
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("ProxyPodsNotReady"));
+        let message = waiting.message.as_deref().unwrap();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("worker-2"), "{message}");
+
+        set_waiting_for_nodes_condition(&mut status, None);
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .filter(|c| c.type_ == "WaitingForNodes")
+                .count(),
+            1,
+            "upsert must replace the condition in place, not append a second one"
+        );
+        let cleared = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "WaitingForNodes")
+            .unwrap();
+        assert_eq!(cleared.status, "False");
     }
 
     #[test]

@@ -4,12 +4,20 @@ use serde_yaml::{Mapping, Value};
 
 use crate::v1beta1::ResolvedInventoryGroup;
 
+/// Connect timeout (seconds) rendered for a host we already know is unreachable — its proxy pod never
+/// became Ready, so `pod_ip` is the unroutable sentinel. Kept low because the dial is certain to
+/// fail; it only bounds how long Ansible waits to confirm that (vs. the 10s default × retries).
+const UNREACHABLE_CONNECT_TIMEOUT_SECONDS: i64 = 5;
+
 /// Resolved managed-ssh connection details for the hosts in this run, keyed by hostname — proxy
 /// pod IP/port are only known once the proxy pods are Ready, so this is threaded in by the caller.
 #[derive(Default)]
 pub struct ManagedSshHostInfo {
     pub pod_ip: String,
     pub port: i32,
+    /// The proxy pod never became Ready in time: `pod_ip` is the unroutable sentinel, and the host is
+    /// rendered with a short connect timeout so Ansible fails fast and records it `unreachable`.
+    pub unreachable: bool,
 }
 
 pub struct RenderContext<'a> {
@@ -64,11 +72,22 @@ fn render_managed_ssh_host_vars(hostname: &str, ctx: &RenderContext) -> Mapping 
     let mut vars = Mapping::new();
 
     if let Some(info) = ctx.managed_ssh_hosts.get(hostname) {
-        vars.insert(Value::String("ansible_host".into()), Value::String(info.pod_ip.clone()));
+        vars.insert(
+            Value::String("ansible_host".into()),
+            Value::String(info.pod_ip.clone()),
+        );
         vars.insert(
             Value::String("ansible_port".into()),
             Value::Number(info.port.into()),
         );
+        // Known-unreachable host: fail the (doomed) dial to the sentinel fast instead of burning the
+        // default connect timeout — Ansible then records it `unreachable`.
+        if info.unreachable {
+            vars.insert(
+                Value::String("ansible_timeout".into()),
+                Value::Number(UNREACHABLE_CONNECT_TIMEOUT_SECONDS.into()),
+            );
+        }
     }
 
     vars.insert(
@@ -102,7 +121,9 @@ fn render_ssh_host_vars(
         Value::String(config.user.clone()),
     );
 
-    if let Some((key_path, known_hosts_path)) = ctx.ssh_paths_by_static_inventory.get(static_inventory_name) {
+    if let Some((key_path, known_hosts_path)) =
+        ctx.ssh_paths_by_static_inventory.get(static_inventory_name)
+    {
         vars.insert(
             Value::String("ansible_ssh_private_key_file".into()),
             Value::String(key_path.clone()),
@@ -137,6 +158,7 @@ mod tests {
             ManagedSshHostInfo {
                 pod_ip: "10.0.0.5".into(),
                 port: 22,
+                unreachable: false,
             },
         );
 
@@ -152,11 +174,49 @@ mod tests {
 
         assert!(rendered.contains("ansible_host: 10.0.0.5"));
         assert!(rendered.contains("ansible_port: 22"));
+        // A reachable host gets no connect-timeout override.
+        assert!(!rendered.contains("ansible_timeout"));
         assert!(rendered.contains("client_key"));
         // The host cert's principal is the node name, not the proxy pod IP dialed via
         // ansible_host, so the SSH client needs HostKeyAlias to check the cert/known_hosts
         // entry against the right name.
         assert!(rendered.contains("-o HostKeyAlias=worker-1"));
+    }
+
+    #[test]
+    fn renders_unreachable_host_with_sentinel_and_short_timeout() {
+        let group = ResolvedInventoryGroup::ManagedSsh {
+            hosts: ResolvedHosts {
+                name: "controlplanes".into(),
+                hosts: vec!["worker-9".into()],
+            },
+            tolerations: None,
+        };
+
+        let mut managed_ssh_hosts = BTreeMap::new();
+        managed_ssh_hosts.insert(
+            "worker-9".to_string(),
+            ManagedSshHostInfo {
+                pod_ip: "192.0.2.1".into(),
+                port: 22,
+                unreachable: true,
+            },
+        );
+
+        let ssh_paths = BTreeMap::new();
+        let ctx = RenderContext {
+            managed_ssh_hosts: &managed_ssh_hosts,
+            managed_ssh_client_key_path: "/run/ansible-operator/managed-ssh/client_key",
+            managed_ssh_known_hosts_path: "/run/ansible-operator/managed-ssh/known_hosts",
+            ssh_paths_by_static_inventory: &ssh_paths,
+        };
+
+        let rendered = render_inventory(&[group], &ctx).unwrap();
+
+        // Dialed at the unroutable sentinel, with a short connect timeout so Ansible fails fast and
+        // records it unreachable.
+        assert!(rendered.contains("ansible_host: 192.0.2.1"));
+        assert!(rendered.contains("ansible_timeout: 5"));
     }
 
     #[test]

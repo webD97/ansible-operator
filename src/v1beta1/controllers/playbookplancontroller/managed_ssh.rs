@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use k8s_openapi::{
     api::{
         core::v1::{
-            Capabilities, Container, HostPathVolumeSource, Pod, PodSpec, Probe, Secret,
+            Capabilities, Container, HostPathVolumeSource, Node, Pod, PodSpec, Probe, Secret,
             SecurityContext, TCPSocketAction, Volume, VolumeMount,
         },
         networking::v1::{
@@ -70,6 +70,45 @@ const SFTP_SUBSYSTEM_MARKER: &str = "ansible-operator-sftp";
 /// PID namespace has to start out as the host's.
 const HOST_PROC_MOUNT_PATH: &str = "/host/proc";
 
+/// Unroutable stand-in `ansible_host` for a node whose proxy pod never became Ready in time (so it
+/// has no pod IP). `192.0.2.1` is RFC 5737 TEST-NET-1, a documentation range that never routes — the
+/// SSH dial to it is certain to fail, which is exactly what makes Ansible record the host
+/// `unreachable`. Rendered with a short connect timeout (see `inventory_renderer`).
+pub const UNREACHABLE_SENTINEL_IP: &str = "192.0.2.1";
+
+/// The two taints Kubernetes automatically applies to a `NotReady`/unreachable Node. We tolerate
+/// them with an **empty `effect`** (matches every effect, i.e. both `NoSchedule` and `NoExecute`) and
+/// no `tolerationSeconds`, so a managed-ssh proxy pod created *after* a node is already `NotReady` can
+/// still be scheduled onto it (the `NoSchedule` variant gates that) and isn't evicted from it.
+const NODE_NOT_READY_TAINT: &str = "node.kubernetes.io/not-ready";
+const NODE_UNREACHABLE_TAINT: &str = "node.kubernetes.io/unreachable";
+
+/// How long the operator waits for a proxy pod stuck *before* `Running` to become Ready, scaled by
+/// how stale the target Node's `Ready`-condition heartbeat is. Built from operator config at startup
+/// (see `config::ManagedSshConfig`); seconds throughout.
+#[derive(Debug, Clone)]
+pub struct ProxyGracePolicy {
+    /// The full (tier-0) wait for a recently-alive node.
+    pub grace_seconds: i64,
+    /// The wait is divided by this at each successive tier; clamped to `>= 1` so it never divides by
+    /// zero. Tier `k`'s wait is `grace_seconds / aggressiveness^k`.
+    pub aggressiveness: u32,
+    /// Three ascending heartbeat-age boundaries (seconds). Past the last one the wait is `0`.
+    pub threshold_secs: [i64; 3],
+}
+
+impl ProxyGracePolicy {
+    /// Builds a policy from raw config: converts the day-thresholds to seconds and clamps
+    /// `aggressiveness` to `>= 1` (a `0` would divide by zero at tier >= 1).
+    pub fn new(grace_seconds: i64, aggressiveness: u32, threshold_days: [i64; 3]) -> Self {
+        Self {
+            grace_seconds,
+            aggressiveness: aggressiveness.max(1),
+            threshold_secs: threshold_days.map(|d| d.saturating_mul(86_400)),
+        }
+    }
+}
+
 pub struct ProxyPodInfo {
     pub host: String,
     pub pod_ip: String,
@@ -77,8 +116,110 @@ pub struct ProxyPodInfo {
 }
 
 pub enum ProxyReadiness {
-    AllReady(Vec<ProxyPodInfo>),
-    Pending,
+    /// Every proxy pod has settled: `ready` carries the reachable hosts (with a live pod IP);
+    /// `unreachable` names hosts whose pod never became Ready within its grace window.
+    Ready {
+        ready: Vec<ProxyPodInfo>,
+        unreachable: Vec<String>,
+    },
+    /// At least one proxy pod is still `Running`-not-yet-Ready or within its pre-`Running` grace
+    /// window; `waiting` names them so the caller can report them on the plan.
+    Pending { waiting: Vec<String> },
+}
+
+/// A proxy pod's k8s state as far as the readiness gate cares: Ready (with its pod IP), still
+/// `Running` (waited on indefinitely), or stuck before `Running` (subject to the grace window).
+#[derive(Debug, PartialEq)]
+enum PodReadyState {
+    ReadyWithIp(String),
+    Running,
+    PreRunning,
+}
+
+/// Pure classification of a proxy pod. Ready-condition `True` + a pod IP ⇒ `ReadyWithIp`; else a pod
+/// that has reached `Running` ⇒ `Running` (sshd still coming up — waited on with no timeout, as
+/// before); anything earlier (`Pending`/`Unknown`/absent phase) ⇒ `PreRunning`, the only state the
+/// grace window applies to.
+fn proxy_pod_readiness(pod: &Pod) -> PodReadyState {
+    let status = pod.status.as_ref();
+    let ready = status
+        .and_then(|s| s.conditions.as_ref())
+        .map(|conditions| {
+            conditions
+                .iter()
+                .any(|c| c.type_ == "Ready" && c.status == "True")
+        })
+        .unwrap_or(false);
+    let pod_ip = status.and_then(|s| s.pod_ip.clone());
+
+    if let (true, Some(ip)) = (ready, pod_ip) {
+        return PodReadyState::ReadyWithIp(ip);
+    }
+
+    match status.and_then(|s| s.phase.as_deref()) {
+        Some("Running") => PodReadyState::Running,
+        _ => PodReadyState::PreRunning,
+    }
+}
+
+/// Seconds since the Node's `Ready` condition last reported (`lastHeartbeatTime`) — a proxy for how
+/// long the node has been silent. `None` if the node/condition/timestamp is missing, which the caller
+/// treats conservatively (full grace).
+fn node_ready_heartbeat_age_secs(node: &Node, now_epoch_secs: i64) -> Option<i64> {
+    let ready = node
+        .status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Ready")?;
+    let last = ready.last_heartbeat_time.as_ref()?;
+    Some(now_epoch_secs - last.0.as_second())
+}
+
+/// The effective grace for a pre-`Running` pod: `grace_seconds / aggressiveness^k` for the first tier
+/// `k` whose boundary the heartbeat age falls within, `0` past the last boundary. An unknown age ⇒
+/// full grace (never shorten on missing data). A healthy node's heartbeat is always recent, so it
+/// always lands in tier 0.
+fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePolicy) -> i64 {
+    let Some(age) = heartbeat_age_secs else {
+        return policy.grace_seconds;
+    };
+    for (k, &threshold) in policy.threshold_secs.iter().enumerate() {
+        if age <= threshold {
+            let divisor = (policy.aggressiveness as i64).saturating_pow(k as u32);
+            return policy.grace_seconds / divisor;
+        }
+    }
+    0
+}
+
+/// Node taints Kubernetes auto-applies to a `NotReady` node tolerated by every proxy pod, merged with
+/// any user `spec.tolerations`. A user toleration for the same key wins (we skip our default for it).
+/// See [`NODE_NOT_READY_TAINT`] for why the effect is left empty.
+fn merge_default_tolerations(
+    user: Option<&[Toleration]>,
+) -> Vec<k8s_openapi::api::core::v1::Toleration> {
+    let mut merged: Vec<k8s_openapi::api::core::v1::Toleration> = user
+        .map(|ts| ts.iter().map(|t| t.clone().into()).collect())
+        .unwrap_or_default();
+
+    let existing_keys: std::collections::BTreeSet<String> =
+        merged.iter().filter_map(|t| t.key.clone()).collect();
+
+    for key in [NODE_NOT_READY_TAINT, NODE_UNREACHABLE_TAINT] {
+        if !existing_keys.contains(key) {
+            merged.push(k8s_openapi::api::core::v1::Toleration {
+                key: Some(key.to_string()),
+                operator: Some("Exists".to_string()),
+                effect: None,
+                value: None,
+                toleration_seconds: None,
+            });
+        }
+    }
+
+    merged
 }
 
 /// Deterministic, human-readable resource name for a (host, run) pair. The host is used verbatim
@@ -317,7 +458,9 @@ fn build_pod(
                 "kubernetes.io/hostname".into(),
                 host.into(),
             )])),
-            tolerations: tolerations.map(|ts| ts.iter().map(|t| t.clone().into()).collect()),
+            // Always tolerate the NotReady/unreachable taints (merged with the user's), so the proxy
+            // pod still schedules onto a NotReady node — see `merge_default_tolerations`.
+            tolerations: Some(merge_default_tolerations(tolerations)),
             ..Default::default()
         }),
         ..Default::default()
@@ -473,11 +616,13 @@ pub async fn ensure_proxy_infra(
     execution_hash: &ExecutionHash,
     hosts: &[String],
     tolerations: Option<&[Toleration]>,
+    grace_policy: &ProxyGracePolicy,
     ca: &CertificateAuthority,
     proxy_image: &str,
     plan_owner: &OwnerReference,
 ) -> Result<ProxyReadiness, ReconcileError> {
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), operator_namespace);
+    let nodes_api: Api<Node> = Api::all(client.clone());
     let secrets_api: Api<Secret> = Api::namespaced(client.clone(), operator_namespace);
     let netpol_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), operator_namespace);
     // The client-cert Secret is the one piece of proxy infra that lives in the PLAN namespace, not
@@ -500,8 +645,11 @@ pub async fn ensure_proxy_infra(
         ensure_client_cert(&job_secrets_api, execution_hash, ca, plan_owner).await?;
     }
 
+    let now = chrono::Utc::now().timestamp();
+
     let mut ready = Vec::new();
-    let mut all_ready = true;
+    let mut unreachable = Vec::new();
+    let mut waiting = Vec::new();
 
     for host in hosts {
         let name = resource_name(host, execution_hash);
@@ -511,6 +659,7 @@ pub async fn ensure_proxy_infra(
             secrets_api.create(&PostParams::default(), &secret).await?;
         }
 
+        // Create the pod for EVERY host, including a NotReady one — we want to attempt scheduling it.
         let pod = match pods_api.get_opt(&name).await? {
             Some(pod) => pod,
             None => {
@@ -519,33 +668,39 @@ pub async fn ensure_proxy_infra(
             }
         };
 
-        let pod_ready = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .map(|conditions| {
-                conditions
-                    .iter()
-                    .any(|c| c.type_ == "Ready" && c.status == "True")
-            })
-            .unwrap_or(false);
-
-        let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.clone());
-
-        match (pod_ready, pod_ip) {
-            (true, Some(ip)) => ready.push(ProxyPodInfo {
+        match proxy_pod_readiness(&pod) {
+            PodReadyState::ReadyWithIp(ip) => ready.push(ProxyPodInfo {
                 host: host.clone(),
                 pod_ip: ip,
                 port: PROXY_SSH_PORT,
             }),
-            _ => all_ready = false,
+            // Reached Running — sshd is coming up; wait indefinitely, exactly as before (no timeout).
+            PodReadyState::Running => waiting.push(host.clone()),
+            // Stuck before Running: give it a heartbeat-scaled grace window, then give up. Fetch the
+            // Node only here, so healthy runs incur no extra reads once pods are Running.
+            PodReadyState::PreRunning => {
+                let heartbeat_age = match nodes_api.get_opt(host).await? {
+                    Some(node) => node_ready_heartbeat_age_secs(&node, now),
+                    None => None,
+                };
+                let grace = effective_grace_secs(heartbeat_age, grace_policy);
+                let pod_age = pod
+                    .metadata
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|t| now - t.0.as_second());
+                match pod_age {
+                    Some(age) if age >= grace => unreachable.push(host.clone()),
+                    _ => waiting.push(host.clone()),
+                }
+            }
         }
     }
 
-    Ok(if all_ready {
-        ProxyReadiness::AllReady(ready)
+    Ok(if waiting.is_empty() {
+        ProxyReadiness::Ready { ready, unreachable }
     } else {
-        ProxyReadiness::Pending
+        ProxyReadiness::Pending { waiting }
     })
 }
 
@@ -710,6 +865,192 @@ mod tests {
                 "missing candidate path {candidate}"
             );
         }
+    }
+
+    fn toleration(key: &str) -> Toleration {
+        Toleration {
+            key: Some(key.to_string()),
+            operator: Some("Exists".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_tolerations_cover_notready_taints_in_every_effect() {
+        let merged = merge_default_tolerations(None);
+
+        for key in [NODE_NOT_READY_TAINT, NODE_UNREACHABLE_TAINT] {
+            let t = merged
+                .iter()
+                .find(|t| t.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("missing default toleration for {key}"));
+            assert_eq!(t.operator.as_deref(), Some("Exists"));
+            // Empty effect is load-bearing: it matches BOTH NoSchedule (needed to *schedule onto* an
+            // already-NotReady node) and NoExecute — not just NoExecute like a DaemonSet.
+            assert_eq!(t.effect, None, "{key} toleration must not pin an effect");
+            assert_eq!(
+                t.toleration_seconds, None,
+                "{key} must tolerate indefinitely"
+            );
+        }
+    }
+
+    #[test]
+    fn user_tolerations_are_merged_and_not_duplicated() {
+        let user = vec![
+            toleration("node-role.kubernetes.io/control-plane"),
+            // A user-supplied not-ready toleration must win — no duplicate default for it.
+            toleration(NODE_NOT_READY_TAINT),
+        ];
+        let merged = merge_default_tolerations(Some(&user));
+
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|t| t.key.as_deref() == Some(NODE_NOT_READY_TAINT))
+                .count(),
+            1,
+            "the user's not-ready toleration must not be duplicated"
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|t| t.key.as_deref() == Some("node-role.kubernetes.io/control-plane")),
+            "user tolerations must be preserved"
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|t| t.key.as_deref() == Some(NODE_UNREACHABLE_TAINT)),
+            "the unreachable default must still be added"
+        );
+    }
+
+    fn pod_with(
+        phase: Option<&str>,
+        ready: bool,
+        pod_ip: Option<&str>,
+        created_secs: Option<i64>,
+    ) -> Pod {
+        use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        Pod {
+            metadata: ObjectMeta {
+                creation_timestamp: created_secs.map(|s| Time(Timestamp::from_second(s).unwrap())),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: phase.map(|p| p.to_string()),
+                pod_ip: pod_ip.map(|s| s.to_string()),
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: if ready { "True" } else { "False" }.to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn proxy_pod_readiness_classifies_by_ready_ip_and_phase() {
+        assert_eq!(
+            proxy_pod_readiness(&pod_with(Some("Running"), true, Some("10.0.0.5"), Some(0))),
+            PodReadyState::ReadyWithIp("10.0.0.5".to_string())
+        );
+        // Ready condition true but no IP yet ⇒ not usable; falls through to phase (Running ⇒ wait).
+        assert_eq!(
+            proxy_pod_readiness(&pod_with(Some("Running"), true, None, Some(0))),
+            PodReadyState::Running
+        );
+        assert_eq!(
+            proxy_pod_readiness(&pod_with(Some("Running"), false, None, Some(0))),
+            PodReadyState::Running
+        );
+        assert_eq!(
+            proxy_pod_readiness(&pod_with(Some("Pending"), false, None, Some(0))),
+            PodReadyState::PreRunning
+        );
+        assert_eq!(
+            proxy_pod_readiness(&pod_with(Some("Unknown"), false, None, Some(0))),
+            PodReadyState::PreRunning
+        );
+        assert_eq!(
+            proxy_pod_readiness(&pod_with(None, false, None, Some(0))),
+            PodReadyState::PreRunning
+        );
+    }
+
+    fn node_with_ready_heartbeat(heartbeat_secs: Option<i64>) -> Node {
+        use k8s_openapi::api::core::v1::{NodeCondition, NodeStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+
+        Node {
+            status: Some(NodeStatus {
+                conditions: Some(vec![NodeCondition {
+                    type_: "Ready".to_string(),
+                    status: "Unknown".to_string(),
+                    last_heartbeat_time: heartbeat_secs
+                        .map(|s| Time(Timestamp::from_second(s).unwrap())),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn node_heartbeat_age_is_now_minus_last_heartbeat_or_none() {
+        let node = node_with_ready_heartbeat(Some(1_000));
+        assert_eq!(node_ready_heartbeat_age_secs(&node, 1_300), Some(300));
+
+        // No timestamp on the Ready condition ⇒ None.
+        assert_eq!(
+            node_ready_heartbeat_age_secs(&node_with_ready_heartbeat(None), 1_300),
+            None
+        );
+        // No status/conditions ⇒ None.
+        assert_eq!(node_ready_heartbeat_age_secs(&Node::default(), 1_300), None);
+    }
+
+    fn policy(aggressiveness: u32) -> ProxyGracePolicy {
+        ProxyGracePolicy::new(600, aggressiveness, [3, 7, 30])
+    }
+
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn effective_grace_halves_per_tier_by_default_then_drops_to_zero() {
+        let p = policy(2);
+        assert_eq!(effective_grace_secs(Some(2 * DAY), &p), 600); // <=3d  → full
+        assert_eq!(effective_grace_secs(Some(5 * DAY), &p), 300); // <=7d  → /2
+        assert_eq!(effective_grace_secs(Some(20 * DAY), &p), 150); // <=30d → /4
+        assert_eq!(effective_grace_secs(Some(40 * DAY), &p), 0); // older → 0
+        // Boundary equality lands in the lower (earlier) tier.
+        assert_eq!(effective_grace_secs(Some(3 * DAY), &p), 600);
+        assert_eq!(effective_grace_secs(Some(7 * DAY), &p), 300);
+        // Unknown heartbeat ⇒ conservative full grace.
+        assert_eq!(effective_grace_secs(None, &p), 600);
+    }
+
+    #[test]
+    fn effective_grace_respects_aggressiveness_and_clamps_zero() {
+        let p = policy(4);
+        assert_eq!(effective_grace_secs(Some(2 * DAY), &p), 600);
+        assert_eq!(effective_grace_secs(Some(5 * DAY), &p), 150); // /4
+        assert_eq!(effective_grace_secs(Some(20 * DAY), &p), 37); // /16 (integer)
+
+        // aggressiveness 0 is clamped to 1 in `new` — no divide-by-zero, no reduction.
+        let flat = policy(0);
+        assert_eq!(flat.aggressiveness, 1);
+        assert_eq!(effective_grace_secs(Some(5 * DAY), &flat), 600);
+        assert_eq!(effective_grace_secs(Some(20 * DAY), &flat), 600);
+        assert_eq!(effective_grace_secs(Some(40 * DAY), &flat), 0);
     }
 }
 
