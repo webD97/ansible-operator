@@ -31,6 +31,7 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.meta.outputs.version }}
+      image: ${{ steps.image.outputs.name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,13 +66,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # OCI references must be all lowercase, but `github.repository` can be mixed-case — normalise it.
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       # `sshd-v10.4p1-1` -> image tags `10.4p1-1` (exact), `10.4p1` (floating, newest rev of that
       # OpenSSH version) and `latest`. `version` output (first tag) is the exact `10.4p1-1`.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=match,pattern=sshd-v(.+),group=1
             type=match,pattern=sshd-v(\d+\.\d+p\d+)-\d+,group=1
@@ -93,9 +99,10 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
 
-  # Open a PR that pins chart/values.yaml to the immutable digest just published. Kept as a PR (not a
-  # direct push) so a human reviews the bump; it touches only values.yaml, so it does not retrigger the
-  # sshd build. Requires the repo setting "Allow GitHub Actions to create and approve pull requests".
+  # Open a PR that pins the chart + example config to the immutable digest just published. Kept as a PR
+  # (not a direct push) so a human reviews the bump; it touches no Containerfile, so it does not
+  # retrigger the sshd build. Requires the repo setting "Allow GitHub Actions to create and approve
+  # pull requests".
   pin-chart:
     needs: build
     runs-on: ubuntu-latest
@@ -110,13 +117,17 @@ jobs:
 
       - name: Repin the proxy image to the released digest
         env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE: ${{ needs.build.outputs.image }} # already lowercased in the build job
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           set -euo pipefail
-          export REF="${IMAGE}@${DIGEST}"
-          # Chart: pin repository to the digest and clear the tag (yq is preinstalled on the runner).
-          yq -i '.managedSsh.proxyImage.repository = strenv(REF) | .managedSsh.proxyImage.tag = ""' \
+          REF="${IMAGE}@${DIGEST}"
+          # Line-targeted edits only — no yq / no reserialization — so surrounding whitespace, blank
+          # lines and comments are preserved. proxyImage.{repository,tag} are the only 4-space-indented
+          # such keys; the top-level image.{repository,tag} are 2-space and left untouched.
+          sed -i -E \
+            -e "s|^(    repository:).*|\1 ${REF}|" \
+            -e 's|^(    tag:).*|\1 ""|' \
             chart/values.yaml
           # Example config: proxy_image is required there too — keep it pinned to the same digest.
           sed -i -E "s|^proxy_image = .*|proxy_image = \"${REF}\"|" config.example.toml
@@ -129,7 +140,7 @@ jobs:
           commit-message: "chore: pin managed-ssh proxy image to ${{ needs.build.outputs.version }}"
           body: |
             Automated by `release-sshd.yml` after publishing
-            `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}`.
+            `${{ needs.build.outputs.image }}:${{ needs.build.outputs.version }}`.
 
             Pins the managed-ssh proxy image to the signed, immutable digest
             `${{ needs.build.outputs.digest }}` in both `chart/values.yaml` (`managedSsh.proxyImage`)
