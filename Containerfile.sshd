@@ -1,0 +1,65 @@
+# Minimal, statically-linked OpenSSH sshd for the managed-ssh proxy pods.
+#
+# The operator launches these node-root pods with `/usr/sbin/sshd -D -e -f <config>` (see
+# `managed_ssh::build_pod`) and mounts the host key, cert, CA, sshd_config and enter-host.sh from a
+# Secret. This image only needs to satisfy that runtime contract, nothing else:
+#   - /usr/sbin/sshd                — the listener
+#   - /usr/libexec/sshd-session     — per-connection worker sshd re-execs (OpenSSH >= 9.8 split)
+#   - /usr/libexec/sshd-auth        — pre-auth worker sshd-session re-execs (OpenSSH >= 10.0 split)
+#   - /bin/sh                       — enter-host.sh shebang AND root's login shell (ForceCommand)
+#   - nsenter                       — enter-host.sh joins the host namespaces with it
+#   - the `sshd` privsep user + /var/empty — mandatory for OpenSSH privilege separation
+# Everything a session actually runs happens after `nsenter`, i.e. on the *host* filesystem, so no
+# target-side tooling (sftp-server, etc.) belongs here.
+#
+# Built --without-openssl: the operator is ed25519-only (CA, host & client keys), so sshd needs no
+# OpenSSL. That restricts negotiation to chacha20-poly1305@openssh.com + curve25519/PQ KEX, which
+# every stock OpenSSH client offers by default.
+
+ARG ALPINE_VERSION=3.24
+FROM alpine:${ALPINE_VERSION} AS build
+
+RUN apk add --no-cache build-base linux-headers zlib-static zlib-dev curl tar busybox-static
+
+ARG OPENSSH_VERSION=10.4p1
+ARG OPENSSH_SHA256=ef6026dd2aea8d56059638d5d3262902c892ceba9f88395835e0d06d3fb63238
+RUN curl -fsSL "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz" -o openssh.tar.gz \
+ && echo "${OPENSSH_SHA256}  openssh.tar.gz" | sha256sum -c - \
+ && tar -xzf openssh.tar.gz \
+ && rm openssh.tar.gz
+
+WORKDIR /openssh-${OPENSSH_VERSION}
+
+# --prefix=/usr so the compiled-in worker paths are /usr/libexec/sshd-{session,auth}, where we place
+# them below. --without-pam matches the sshd_config (which deliberately omits UsePAM); pubkey/cert is
+# the only auth. Static musl build via LDFLAGS=-static.
+RUN ./configure \
+      --prefix=/usr \
+      --without-openssl \
+      --without-pam \
+      --without-selinux \
+      --with-privsep-user=sshd \
+      --with-privsep-path=/var/empty \
+      LDFLAGS="-static" \
+ && make -j"$(nproc)" sshd sshd-session sshd-auth
+
+RUN mkdir -p /rootfs/usr/sbin /rootfs/usr/libexec /rootfs/bin /rootfs/usr/bin \
+             /rootfs/etc /rootfs/var/empty /rootfs/root \
+ && cp sshd            /rootfs/usr/sbin/sshd \
+ && cp sshd-session    /rootfs/usr/libexec/sshd-session \
+ && cp sshd-auth       /rootfs/usr/libexec/sshd-auth \
+ && cp /bin/busybox.static /rootfs/bin/busybox \
+ && ln -s busybox      /rootfs/bin/sh \
+ && ln -s busybox      /rootfs/bin/chmod \
+ && ln -s busybox      /rootfs/bin/nsenter \
+ && ln -s /bin/busybox /rootfs/usr/bin/nsenter \
+ # root's shell MUST be /bin/sh: sshd runs the forced command as `root-login-shell -c <cmd>`.
+ && printf 'root:x:0:0:root:/root:/bin/sh\nsshd:x:74:74:sshd:/var/empty:/sbin/nologin\n' > /rootfs/etc/passwd \
+ && printf 'root:x:0:\nsshd:x:74:\n' > /rootfs/etc/group \
+ # privsep dir: root-owned, 0755, not group/world-writable, or sshd aborts at startup.
+ && chmod 0755 /rootfs/var/empty
+
+FROM scratch
+COPY --from=build /rootfs/ /
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

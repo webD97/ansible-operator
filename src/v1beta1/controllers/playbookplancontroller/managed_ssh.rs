@@ -36,8 +36,6 @@ use crate::{
     },
 };
 
-/// Default sshd image for managed-ssh proxy pods, overridable via the Helm chart's `values.yaml`.
-pub const DEFAULT_PROXY_IMAGE: &str = "testcontainers/sshd:latest";
 pub const PROXY_SSH_PORT: i32 = 22;
 
 const SSHD_CONFIG_MOUNT_PATH: &str = "/etc/ansible-operator-sshd";
@@ -286,8 +284,9 @@ fn render_sshd_config() -> String {
 /// host's (an ancestor); `build_pod` sets `hostPID: true` instead.
 ///
 /// Flags use the glued short-option form (`-m"$NS/mnt"`, no `=`) rather than `--mount=` — BusyBox's
-/// `nsenter` (the default proxy image, `testcontainers/sshd`) doesn't parse the long form at all
-/// and fails silently. The glued short form also works against genuine util-linux `nsenter`.
+/// `nsenter` (shipped by the first-party proxy image) doesn't parse the long form at all and fails
+/// silently. The glued short form also works against genuine util-linux `nsenter`, so a custom proxy
+/// image built with either flavour is fine.
 ///
 /// Special-cases sftp: `ForceCommand` overrides `Subsystem sftp` requests the same way it does
 /// shell/exec, setting `$SSH_ORIGINAL_COMMAND` to `SFTP_SUBSYSTEM_MARKER`. Since there's no
@@ -1095,8 +1094,19 @@ mod container_tests {
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{GenericImage, ImageExt};
 
-    const PROXY_IMAGE: &str = "docker.io/testcontainers/sshd";
-    const PROXY_TAG: &str = "latest";
+    /// Proxy image this test boots: the **first-party** minimal static sshd from `Containerfile.sshd`,
+    /// so this test is that image's conformance gate. A local `--ignored` run needs it built first:
+    ///   podman build -f Containerfile.sshd -t ghcr.io/webd97/ansible-operator-sshd:0.1.0 .
+    ///   cargo test managed_ssh::container_tests -- --ignored --nocapture
+    /// Override `MANAGED_SSH_TEST_IMAGE`/`MANAGED_SSH_TEST_TAG` to test a candidate build (e.g. an
+    /// OpenSSH-bump PR) — a local-only image is used as-is (testcontainers only pulls on a 404).
+    fn proxy_image() -> String {
+        std::env::var("MANAGED_SSH_TEST_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/webd97/ansible-operator-sshd".to_string())
+    }
+    fn proxy_tag() -> String {
+        std::env::var("MANAGED_SSH_TEST_TAG").unwrap_or_else(|_| "0.1.0".to_string())
+    }
     /// Node name the proxy's host cert is signed for; the client must dial it via `HostKeyAlias`
     /// (mirroring `inventory_renderer`) so the `@cert-authority *` known_hosts entry validates.
     const HOST_NAME: &str = "worker-1";
@@ -1190,7 +1200,7 @@ mod container_tests {
         let start_cmd = format!(
             "chmod 0500 {SSHD_CONFIG_MOUNT_PATH}/* && exec /usr/sbin/sshd -D -e -f {SSHD_CONFIG_MOUNT_PATH}/sshd_config"
         );
-        let mut request = GenericImage::new(PROXY_IMAGE, PROXY_TAG)
+        let mut request = GenericImage::new(proxy_image(), proxy_tag())
             .with_exposed_port((PROXY_SSH_PORT as u16).tcp())
             .with_wait_for(WaitFor::message_on_stderr("Server listening"))
             .with_cmd(vec!["sh".to_string(), "-c".to_string(), start_cmd]);

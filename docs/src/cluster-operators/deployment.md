@@ -1,8 +1,8 @@
 # Deployment
 
 The operator ships as a Helm chart under `chart/`. This page covers installing it, the namespace and
-Pod-Security requirements it imposes, the managed-SSH proxy image you must choose, and the two
-fail-closed knobs — namespace enrollment and node access — you have to open deliberately.
+Pod-Security requirements it imposes, the managed-SSH proxy image, and the two fail-closed knobs —
+namespace enrollment and node access — you have to open deliberately.
 
 ## Install
 
@@ -45,15 +45,18 @@ non-SELinux nodes, and needs no action from you.
 Cluster-node access needs a **real OpenSSH `sshd`** image for the proxy pods; the operator's own image
 is distroless and cannot serve this role. It is configured via the chart's `managedSsh.proxyImage`.
 
-**This is a node-root pod, so treat the image as node-root supply chain.** The chart default is a
-third-party `:latest` tag and is **not** digest-pinned — suitable for evaluation, not for production.
-In production, override it with an image from a registry you trust and **pin it to a digest**:
+The default is the first-party, minimal, statically-linked `sshd` image published alongside the
+operator (`ghcr.io/webd97/ansible-operator-sshd`). With `tag` left empty it tracks the chart
+appVersion, so it moves in lockstep with the operator on upgrade.
+
+**This is a node-root pod, so treat the image as node-root supply chain.** In production, pin it to a
+digest from a registry you trust — set `tag: ""` and put the digest in `repository`:
 
 ```yaml
 # values.yaml
 managedSsh:
   proxyImage:
-    repository: my-registry.example.com/sshd@sha256:<digest>
+    repository: my-registry.example.com/ansible-operator-sshd@sha256:<digest>
     tag: ""
 ```
 

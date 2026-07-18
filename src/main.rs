@@ -86,8 +86,6 @@ fn render_crds() -> String {
 async fn run(args: RunArgs) {
     setup_tracing();
 
-    let client = kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
-
     let operator_namespace = std::env::var("POD_NAMESPACE").expect("POD_NAMESPACE must be set");
 
     // Enrollment allowlist (R1 / T-INFO-1): the operator only reads/writes Secrets and creates Jobs
@@ -102,10 +100,14 @@ async fn run(args: RunArgs) {
         enrolled_namespaces
     );
 
-    // Managed-ssh proxy image (T-ESC-5): admin-overridable via the chart's `managedSsh.proxyImage`,
-    // surfaced here through the config file. `None` lets the reconciler fall back to the built-in
-    // default. Pin to a trusted digest in production.
-    let proxy_image = operator_config.proxy_image.clone();
+    // Managed-ssh proxy image (T-ESC-5): set via the chart's `managedSsh.proxyImage`, surfaced here
+    // through the config file. There is NO built-in default for this node-root image — it must be an
+    // explicit admin choice — so a missing/empty value is a fatal startup error. Pin to a trusted
+    // digest in production.
+    let proxy_image = operator_config
+        .require_proxy_image()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .to_string();
 
     // Adaptive readiness-grace policy for managed-ssh proxy pods on NotReady nodes, from the chart's
     // `managedSsh.readiness`. `ProxyGracePolicy::new` clamps `aggressiveness` and converts days→secs.
@@ -114,6 +116,10 @@ async fn run(args: RunArgs) {
         operator_config.managed_ssh.aggressiveness,
         operator_config.managed_ssh.threshold_days,
     );
+
+    // Connect to the cluster only after the static config has validated — fail fast on a bad/missing
+    // config (e.g. no proxy_image) before any network I/O.
+    let client = kube::client::Client::try_from(discover_kubernetes_config().await).unwrap();
 
     // Ephemeral, in-memory CA: a fresh keypair per operator process, never persisted to the
     // cluster. Restarting the operator rotates the CA and invalidates all outstanding certs.

@@ -1,0 +1,73 @@
+# Weekly check for a newer OpenSSH portable release. If the pinned OPENSSH_VERSION in Containerfile.sshd
+# is behind, this bumps it AND its OPENSSH_SHA256, build-validates the result (so the checksum gate and
+# the musl static build are proven before a human sees it), and opens a PR. Dependabot handles the other
+# moving parts (the Alpine base image via docker, and Actions), which it cannot do for the OpenSSH
+# tarball — see .github/dependabot.yml.
+#
+# The build happens HERE, not on the PR: PRs opened with GITHUB_TOKEN do not trigger other workflows
+# (so container-sshd.yml would not run on this PR), so validation is done inline instead.
+name: Bump OpenSSH
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest OpenSSH release and bump the pins if newer
+        id: bump
+        run: |
+          set -euo pipefail
+          current="$(grep -oP 'ARG OPENSSH_VERSION=\K\S+' Containerfile.sshd)"
+          # openssh-portable tags look like V_10_4_P1; map to the tarball version 10.4p1. Take the
+          # highest by version sort (the API doesn't guarantee order).
+          latest="$(curl -fsSL 'https://api.github.com/repos/openssh/openssh-portable/tags?per_page=100' \
+            | jq -r '.[].name | select(test("^V_[0-9]+_[0-9]+_P[0-9]+$"))' \
+            | sed -E 's/^V_([0-9]+)_([0-9]+)_P([0-9]+)$/\1.\2p\3/' \
+            | sort -V | tail -1)"
+          echo "current=$current latest=$latest"
+          if [ -z "$latest" ] || [ "$current" = "$latest" ]; then
+            echo "changed=false" >>"$GITHUB_OUTPUT"; exit 0
+          fi
+          url="https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${latest}.tar.gz"
+          sha="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+          sed -i -E "s/^ARG OPENSSH_VERSION=.*/ARG OPENSSH_VERSION=${latest}/" Containerfile.sshd
+          sed -i -E "s/^ARG OPENSSH_SHA256=.*/ARG OPENSSH_SHA256=${sha}/" Containerfile.sshd
+          echo "changed=true" >>"$GITHUB_OUTPUT"
+          echo "version=$latest" >>"$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        if: steps.bump.outputs.changed == 'true'
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      # Validate the bumped source builds (and the new checksum matches) before opening the PR.
+      - name: Build-validate the bump
+        if: steps.bump.outputs.changed == 'true'
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          file: Containerfile.sshd
+          context: .
+          push: false
+
+      - name: Open bump PR
+        if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/bump-openssh-${{ steps.bump.outputs.version }}
+          title: "chore: bump OpenSSH to ${{ steps.bump.outputs.version }}"
+          commit-message: "chore: bump OpenSSH to ${{ steps.bump.outputs.version }}"
+          body: |
+            Automated bump of the OpenSSH source pinned in `Containerfile.sshd`
+            (`OPENSSH_VERSION` + `OPENSSH_SHA256`) to **${{ steps.bump.outputs.version }}**.
+
+            Build-validated in this workflow (musl static build + checksum gate) before opening.
+            Cut an `sshd-v*` release tag after merge to publish the new image.
+          labels: dependencies

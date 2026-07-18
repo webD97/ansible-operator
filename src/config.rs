@@ -23,6 +23,11 @@ pub enum ConfigError {
         path: String,
         source: toml::de::Error,
     },
+    #[error(
+        "proxy_image is not set — the managed-ssh proxy image (chart `managedSsh.proxyImage`) is \
+         required and has no built-in default; set it in the operator config"
+    )]
+    MissingProxyImage,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,10 +41,11 @@ pub struct OperatorConfig {
     pub watch_namespaces: Vec<String>,
 
     /// Image for the managed-ssh proxy pods the operator schedules onto target nodes (the node-root
-    /// primitive — see THREAT_MODEL T-ESC-5). `None` (field absent) falls back to the built-in
-    /// `DEFAULT_PROXY_IMAGE`. Rendered by the Helm chart from `managedSsh.proxyImage` into the mounted
-    /// ConfigMap; a change rolls the operator pod (via `checksum/config`) rather than hot-reloading,
-    /// exactly like `watch_namespaces`. Accepts a digest-pinned reference (`repo@sha256:…`).
+    /// primitive — see THREAT_MODEL T-ESC-5). **Required — there is no built-in default**; the operator
+    /// refuses to start when it is unset (see [`Self::require_proxy_image`] / `main.rs`). Rendered by
+    /// the Helm chart from `managedSsh.proxyImage` into the mounted ConfigMap; a change rolls the
+    /// operator pod (via `checksum/config`) rather than hot-reloading, exactly like `watch_namespaces`.
+    /// Accepts a digest-pinned reference (`repo@sha256:…`), which is the recommended production form.
     #[serde(default)]
     pub proxy_image: Option<String>,
 
@@ -96,6 +102,16 @@ impl OperatorConfig {
         }
     }
 
+    /// The configured managed-ssh proxy image, or [`ConfigError::MissingProxyImage`] when it is absent
+    /// or empty. There is no built-in default (a node-root image must be an explicit admin choice —
+    /// THREAT_MODEL T-ESC-5), so `main.rs` treats an error here as fatal and refuses to start.
+    pub fn require_proxy_image(&self) -> Result<&str, ConfigError> {
+        match self.proxy_image.as_deref() {
+            Some(image) if !image.is_empty() => Ok(image),
+            _ => Err(ConfigError::MissingProxyImage),
+        }
+    }
+
     /// The effective enrolled namespace set = the operator's own namespace ∪ the configured tenant
     /// namespaces. The operator namespace is always included so its managed-ssh cert Secrets, Leases
     /// and proxy pods remain reachable even when `watch_namespaces` is empty.
@@ -136,17 +152,28 @@ mod tests {
     }
 
     #[test]
-    fn proxy_image_is_optional_and_overridable() {
-        // Absent -> None, so the caller falls back to DEFAULT_PROXY_IMAGE.
-        let default: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
-        assert!(default.proxy_image.is_none());
+    fn proxy_image_is_required_no_builtin_default() {
+        // Absent -> require_proxy_image errors, so the operator refuses to start (no built-in default).
+        let absent: OperatorConfig = toml::from_str("watch_namespaces = []").unwrap();
+        assert!(absent.proxy_image.is_none());
+        assert!(matches!(
+            absent.require_proxy_image(),
+            Err(ConfigError::MissingProxyImage)
+        ));
 
-        // A digest-pinned override round-trips verbatim (see THREAT_MODEL T-ESC-5 / R5).
-        let overridden: OperatorConfig =
+        // Empty string is treated the same as absent.
+        let empty: OperatorConfig = toml::from_str("proxy_image = \"\"").unwrap();
+        assert!(matches!(
+            empty.require_proxy_image(),
+            Err(ConfigError::MissingProxyImage)
+        ));
+
+        // A digest-pinned value round-trips verbatim (see THREAT_MODEL T-ESC-5 / R5).
+        let set: OperatorConfig =
             toml::from_str("proxy_image = \"registry.example.com/sshd@sha256:abc\"").unwrap();
         assert_eq!(
-            overridden.proxy_image.as_deref(),
-            Some("registry.example.com/sshd@sha256:abc")
+            set.require_proxy_image().unwrap(),
+            "registry.example.com/sshd@sha256:abc"
         );
     }
 

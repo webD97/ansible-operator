@@ -1,0 +1,109 @@
+# Release the managed-ssh proxy image on its OWN tag cadence (`sshd-v*`), independent of the operator's
+# `v*.*.*` releases — an operator release never publishes this image, and vice versa. On an `sshd-vX.Y.Z`
+# tag this builds + pushes + cosign-signs the image, then opens a PR that repins the chart default onto
+# the freshly-published `@sha256:` digest (THREAT_MODEL T-ESC-5 / R5).
+name: Release sshd proxy image
+
+on:
+  push:
+    tags: ["sshd-v*.*.*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-sshd
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signing via Fulcio
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        with:
+          cosign-release: "v2.2.4"
+
+      - uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Map the `sshd-vX.Y.Z` tag to image tags `X.Y.Z` + `latest`.
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=match,pattern=sshd-v(\d+\.\d+\.\d+),group=1
+            type=raw,value=latest
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
+        with:
+          file: Containerfile.sshd
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign the published image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+  # Open a PR that pins chart/values.yaml to the immutable digest just published. Kept as a PR (not a
+  # direct push) so a human reviews the bump; it touches only values.yaml, so it does not retrigger the
+  # sshd build. Requires the repo setting "Allow GitHub Actions to create and approve pull requests".
+  pin-chart:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Base the PR on main, not the pushed tag.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Repin the proxy image to the released digest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          export REF="${IMAGE}@${DIGEST}"
+          # Chart: pin repository to the digest and clear the tag (yq is preinstalled on the runner).
+          yq -i '.managedSsh.proxyImage.repository = strenv(REF) | .managedSsh.proxyImage.tag = ""' \
+            chart/values.yaml
+          # Example config: proxy_image is required there too — keep it pinned to the same digest.
+          sed -i -E "s|^proxy_image = .*|proxy_image = \"${REF}\"|" config.example.toml
+
+      - name: Open pin PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/pin-sshd-${{ needs.build.outputs.version }}
+          title: "chore: pin managed-ssh proxy image to ${{ needs.build.outputs.version }}"
+          commit-message: "chore: pin managed-ssh proxy image to ${{ needs.build.outputs.version }}"
+          body: |
+            Automated by `release-sshd.yml` after publishing
+            `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.version }}`.
+
+            Pins the managed-ssh proxy image to the signed, immutable digest
+            `${{ needs.build.outputs.digest }}` in both `chart/values.yaml` (`managedSsh.proxyImage`)
+            and `config.example.toml` (`proxy_image`).
+          labels: dependencies

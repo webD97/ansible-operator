@@ -346,15 +346,22 @@ filesystems, secrets mounted on that node, and reach the API server as the node.
 
 **T-ESC-5 — Supply-chain: proxy image compromise.**
 The proxy image is pulled into a **node-root** pod.
-- *Mitigation:* the image is admin-set via the chart's `managedSsh.proxyImage`, rendered into the
-  operator config (`proxy_image`) and consumed when building the proxy pod (`build_pod`); it accepts
-  a **digest-pinned** reference, so an operator can point it at a trusted, pinned image.
-- *Residual:* the shipped **default** is still `testcontainers/sshd:latest` (`DEFAULT_PROXY_IMAGE`) —
-  a mutable third-party tag with no digest pin and no signature verification. An operator who does not
-  override it runs that tag in a node-root context; a malicious/hijacked image = node-root on every
-  targeted node. Pinning is opt-in, not enforced.
-- *Severity:* **High** for the default deployment (unpinned `:latest`); reducible to Low by pinning
-  `managedSsh.proxyImage` to a trusted digest. See R5.
+- *Mitigation:* the image is a **first-party** one (`ghcr.io/webd97/ansible-operator-sshd`) — a minimal
+  `FROM scratch`, statically-linked OpenSSH `sshd` built from `Containerfile.sshd`, with only sshd, its
+  libexec workers, busybox (`sh`/`nsenter`) and the privsep user/dir. Built `--without-openssl`
+  (the operator is ed25519-only), so no OpenSSL/PAM in the node-root surface, from a
+  **checksum-pinned** OpenSSH tarball (`OPENSSH_SHA256`). It is built + **cosign-signed** in CI on its
+  own `sshd-v*` release tags (`release-sshd.yml`), and each release opens a PR that repins
+  `managedSsh.proxyImage` (chart) and `proxy_image` (example config) onto that release's **`@sha256:`
+  digest**. There is **no built-in default**: `proxy_image` is a required config value and the operator
+  refuses to start without it (`config::require_proxy_image`), so a node-root image is always an
+  explicit admin choice, never an implicit fallback.
+- *Residual:* signature verification is not *enforced* at admission, so an operator relies on the
+  digest pin (and their trust in this repo's release pipeline) rather than a cluster-side cosign policy.
+  The pre-first-release chart seed is tag-based, not digest — only relevant before the first `sshd-v*`
+  release repins it.
+- *Severity:* **Low** once digest-pinned (the default after the first release); the residual is the
+  absence of admission-enforced signature verification. See R5.
 
 **T-ESC-6 — Execution-hash collision affecting security-relevant naming/labels.**
 `ExecutionHash` (XxHash3_64, non-cryptographic) keys resource names, the NetworkPolicy
@@ -485,7 +492,7 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 | R2 | The CA is rotated only by an operator restart. Consider periodic restarts (or an in-process rotation timer) to bound the window in which a leaked/compromised CA (T-INFO-2) can mint certs. A leaked *client* cert is already bounded by proxy-pod lifetime — principal-scoped, and the pods plus the cert Secret are deleted on completion (`cleanup_proxy_infra`) — so a shorter `CERT_VALIDITY` or a CRL adds little. | T-INFO-2 | Low |
 | R3 | Bind the client-cert principal to specific *host(s)*, not just the run, for intra-run host scoping; document the CNI / defense-in-depth posture in the chart `NOTES.txt`. | T-INFO-3 | Low |
 | R4 | Ship a linter/validating admission example that rejects NodeAccessPolicies keyed on tenant-settable labels; recommend `kubernetes.io/metadata.name` in docs (already in type docs). | T-ESC-3 | Medium |
-| R5 | The proxy image is now admin-overridable and digest-pinnable via `managedSsh.proxyImage`. Still open: ship a **pinned default** (the shipped default is an unpinned `testcontainers/sshd:latest`) and document image-signature/admission verification. | T-ESC-5 | Medium |
+| R5 | The default proxy image is a first-party, minimal, statically-linked sshd (`ansible-operator-sshd`, from a checksum-pinned source in `Containerfile.sshd`), built + cosign-signed in CI on `sshd-v*` tags, with each release repinning the chart default onto its `@sha256:` digest. Still open: document/ship a cluster-side admission policy (e.g. cosign/policy-controller) that *enforces* the signature at pod-create, so the digest pin is backed by verification rather than trust alone. | T-ESC-5 | Low |
 | R6 | Persist/ship proxy sshd session logs and emit a structured audit event per node-root session for attribution. | T-REP-1 | Medium |
 | R7 | Add per-tenant ResourceQuota/LimitRange guidance and optionally a max-fan-out guard. | T-DOS-1 | Low |
 | R8 | Pin host identity: replace the `@cert-authority *` wildcard with per-host known_hosts entries so host certs are bound to the intended node. | T-SPOOF-2 | Low |

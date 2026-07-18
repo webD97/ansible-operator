@@ -19,8 +19,9 @@ data:
     {{- end }}
     ]
     {{- with .Values.managedSsh }}{{ with .proxyImage }}{{ if .repository }}
-    # Image for the node-root managed-ssh proxy pods (THREAT_MODEL T-ESC-5). Pin to a trusted digest
-    # in production; omit `tag` and put a `@sha256:...` digest in `repository` to do so.
+    # Image for the node-root managed-ssh proxy pods (THREAT_MODEL T-ESC-5). The sshd image is released
+    # on its own `sshd-v*` cadence, so pin it explicitly: a `tag`, or a `@sha256:` digest in
+    # `repository` with an empty `tag` (the production path the release workflow's PR converges onto).
     proxy_image = {{ printf "%s%s" .repository (ternary (printf ":%s" (.tag | toString)) "" (ne (.tag | toString) "")) | quote }}
     {{- end }}{{ end }}{{ end }}
     {{- with (.Values.managedSsh).readiness }}

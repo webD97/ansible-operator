@@ -10,7 +10,9 @@
 # POD_NAMESPACE is required separately (the operator's own namespace, normally injected via the
 # Downward API in-cluster) and is ALWAYS enrolled implicitly — you do not list it below.
 #
-# A missing config file is not an error: the operator then serves only POD_NAMESPACE (fail-closed).
+# `proxy_image` (below) is REQUIRED: there is no built-in default for the node-root proxy image, so
+# the operator refuses to start without it. `watch_namespaces` still defaults to empty (serve only
+# POD_NAMESPACE).
 
 # Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1): the only namespaces the operator may
 # read/write Secrets and create Jobs in, on top of POD_NAMESPACE. A PlaybookPlan created anywhere
@@ -22,6 +24,12 @@ watch_namespaces = [
   # "team-a",
   # "team-b",
 ]
+
+# Image for the managed-ssh proxy pods scheduled onto target nodes (the node-root primitive —
+# THREAT_MODEL T-ESC-5). REQUIRED — the operator will not start without it, and there is no built-in
+# default. Pin to a digest in production (repo@sha256:…); the release workflow keeps this line pinned
+# to the current signed image.
+proxy_image = "ghcr.io/webd97/ansible-operator-sshd:0.1.0"
 
 # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
 # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on

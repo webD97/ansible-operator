@@ -67,9 +67,10 @@ struct ReconciliationContext {
     /// Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
     /// affected plans via `mappers::node_access_policy_to_playbookplans`.
     node_access_policies: Arc<Store<NodeAccessPolicy>>,
-    /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5).
-    /// Admin-overridable via the chart's `managedSsh.proxyImage`; resolved in `new` to the configured
-    /// value or `managed_ssh::DEFAULT_PROXY_IMAGE` when unset.
+    /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5). Set by
+    /// the admin via the chart's `managedSsh.proxyImage` (rendered to `proxy_image`); there is **no
+    /// built-in default** — the operator refuses to start without it (see `config::require_proxy_image`
+    /// / `main.rs`), so by the time a reconcile runs this is always a real, admin-chosen image.
     proxy_image: String,
     /// How long to wait for a `NotReady` node's proxy pod to become Ready before treating the node as
     /// unreachable, scaled by the node's heartbeat age. From the chart's `managedSsh.readiness`.
@@ -97,7 +98,7 @@ pub fn new(
     operator_namespace: String,
     enrolled_namespaces: std::collections::BTreeSet<String>,
     ca: Arc<CertificateAuthority>,
-    proxy_image: Option<String>,
+    proxy_image: String,
     proxy_grace: managed_ssh::ProxyGracePolicy,
 ) -> impl Stream<
     Item = Result<
@@ -113,9 +114,6 @@ pub fn new(
     let node_access_policies_api: Api<NodeAccessPolicy> = Api::all(client.clone());
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
-
-    // Fall back to the built-in default when the chart didn't pin an image (T-ESC-5).
-    let proxy_image = proxy_image.unwrap_or_else(|| managed_ssh::DEFAULT_PROXY_IMAGE.to_string());
 
     let playbookplan_reflector_reader = {
         let playbookplan_reflector_writer = Writer::<v1beta1::PlaybookPlan>::default();
