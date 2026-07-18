@@ -133,7 +133,7 @@ jobs:
           sed -i -E "s|^proxy_image = .*|proxy_image = \"${REF}\"|" config.example.toml
 
       - name: Open pin PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/pin-sshd-${{ needs.build.outputs.version }}
           title: "chore: pin managed-ssh proxy image to ${{ needs.build.outputs.version }}"
