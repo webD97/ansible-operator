@@ -1,19 +1,16 @@
 # Default values for the ansible-operator chart.
 
 replicaCount: 1
-
 image:
   repository: ghcr.io/webd97/ansible-operator
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: ""
-
 managedSsh:
   proxyImage:
-    repository: ghcr.io/webd97/ansible-operator-sshd
+    repository: ghcr.io/webD97/ansible-operator-sshd@sha256:9197243fe1ab8b5f5248a613fcc2143b3133ce201afd8b73aede83396f705330
     # <openssh>-<revision>, e.g. 10.4p1-1; the release workflow repins this to a @sha256: digest.
-    tag: "10.4p1-1"
-
+    tag: ""
   # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
   # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on
   # the next run). The wait is only for pods stuck before Running; a pod that has reached Running is
@@ -25,11 +22,9 @@ managedSsh:
     graceSeconds: 600
     aggressiveness: 2
     thresholdDays: [3, 7, 30]
-
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
-
 # Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1). The operator may read/write Secrets and
 # create Jobs ONLY in these namespaces plus its own (.Release.Namespace, always enrolled). This is
 # the security boundary that replaces the old cluster-wide Secret/Job/Pod grants — an operator
@@ -45,7 +40,6 @@ fullnameOverride: ""
 #     - team-a
 #     - team-b
 watchNamespaces: []
-
 # IMPORTANT: install this chart into its own dedicated namespace, e.g.:
 #   helm install --create-namespace -n ansible-system ansible-operator ./chart
 # All namespaced resources in this chart (Deployment, ServiceAccount, Role/RoleBinding) use
@@ -53,31 +47,27 @@ watchNamespaces: []
 # pods/Secrets/NetworkPolicies live at runtime — never the namespace a PlaybookPlan happens to
 # be created in. (The operator's SSH CA is in-memory only) Keeping this separate means only this
 # one namespace needs privileged-pod exceptions (Pod Security Admission), not every tenant namespace.
-
 serviceAccount:
   create: true
   automount: true
   annotations: {}
   name: ""
-
 podAnnotations: {}
 podLabels: {}
-
 podSecurityContext: {}
-
 securityContext: {}
-  # The operator's own pod needs no special privilege — it never touches node filesystems
-  # itself, only the ephemeral managed-ssh proxy pods it creates do.
+# The operator's own pod needs no special privilege — it never touches node filesystems
+# itself, only the ephemeral managed-ssh proxy pods it creates do.
 
 resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user.
-  # limits:
-  #   cpu: 200m
-  #   memory: 128Mi
-  # requests:
-  #   cpu: 50m
-  #   memory: 64Mi
+# We usually recommend not to specify default resources and to leave this as a conscious
+# choice for the user.
+# limits:
+#   cpu: 200m
+#   memory: 128Mi
+# requests:
+#   cpu: 50m
+#   memory: 64Mi
 
 nodeSelector: {}
 tolerations: []

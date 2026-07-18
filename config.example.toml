@@ -29,7 +29,7 @@ watch_namespaces = [
 # THREAT_MODEL T-ESC-5). REQUIRED — the operator will not start without it, and there is no built-in
 # default. Tag is <openssh>-<revision> (e.g. 10.4p1-1). Pin to a digest in production (repo@sha256:…);
 # the release workflow keeps this line pinned to the current signed image.
-proxy_image = "ghcr.io/webd97/ansible-operator-sshd:10.4p1-1"
+proxy_image = "ghcr.io/webD97/ansible-operator-sshd@sha256:9197243fe1ab8b5f5248a613fcc2143b3133ce201afd8b73aede83396f705330"
 
 # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
 # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on
