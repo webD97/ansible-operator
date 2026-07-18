@@ -8,6 +8,9 @@ pub enum ReconcileError {
     #[error("Precondition failed: {0}")]
     PreconditionFailed(&'static str),
 
+    #[error("Inventory group {group:?} sets variable {key:?}, which the operator manages")]
+    ReservedInventoryVariable { group: String, key: String },
+
     #[error(transparent)]
     RenderError(#[from] ansible::RenderError),
 

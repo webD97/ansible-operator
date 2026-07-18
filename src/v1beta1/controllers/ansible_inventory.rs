@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v1beta1::{SshConfig, Toleration};
+use crate::v1beta1::{GenericMap, SshConfig, Toleration};
 
 pub trait AnsibleInventory {
     fn get_hosts(&self) -> Vec<ResolvedHosts>;
@@ -24,6 +24,9 @@ pub enum ResolvedInventoryGroup {
     ManagedSsh {
         hosts: ResolvedHosts,
         tolerations: Option<Vec<Toleration>>,
+        /// Author-supplied group variables from the owning `ClusterInventory`, rendered as
+        /// Ansible group `vars:`. `None` when the group set none.
+        variables: Option<GenericMap>,
     },
     Ssh {
         hosts: ResolvedHosts,
@@ -32,6 +35,9 @@ pub enum ResolvedInventoryGroup {
         /// credentials simultaneously.
         static_inventory_name: String,
         config: SshConfig,
+        /// Author-supplied group variables from the owning `StaticInventory`, rendered as
+        /// Ansible group `vars:`. `None` when the group set none.
+        variables: Option<GenericMap>,
     },
 }
 
@@ -40,6 +46,14 @@ impl ResolvedInventoryGroup {
         match self {
             ResolvedInventoryGroup::ManagedSsh { hosts, .. } => hosts,
             ResolvedInventoryGroup::Ssh { hosts, .. } => hosts,
+        }
+    }
+
+    /// Author-supplied group variables, if any, regardless of connection mechanism.
+    pub fn variables(&self) -> Option<&GenericMap> {
+        match self {
+            ResolvedInventoryGroup::ManagedSsh { variables, .. } => variables.as_ref(),
+            ResolvedInventoryGroup::Ssh { variables, .. } => variables.as_ref(),
         }
     }
 }

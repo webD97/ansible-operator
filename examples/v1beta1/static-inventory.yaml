@@ -9,6 +9,8 @@ spec:
         - server1.somedomain.example
         - server1.somedomain.example
         - 192.168.73.42
+      variables:
+        ansible_python_interpreter: /usr/bin/python3
   ssh:
     user: root
     secretRef:

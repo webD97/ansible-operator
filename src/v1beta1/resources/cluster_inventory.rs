@@ -4,7 +4,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::v1beta1::{AnsibleInventory, NodeSelectorTerm, ResolvedHosts};
+use crate::v1beta1::{AnsibleInventory, GenericMap, NodeSelectorTerm, ResolvedHosts};
 
 #[derive(CustomResource, Debug, Serialize, Deserialize, Default, Clone, JsonSchema)]
 #[kube(
@@ -72,6 +72,12 @@ pub struct InventoryHosts {
     pub match_labels: Option<NodeSelectorTerm>,
     #[serde(flatten)]
     pub match_expressions: Option<BTreeMap<String, serde_json::Value>>, // todo: placeholder
+
+    /// Group variables applied to every node this group resolves to, rendered as Ansible group
+    /// `vars:`. Use it to set node facts the playbook author should not have to know, e.g.
+    /// `ansible_python_interpreter`. Operator-managed connection variables (`ansible_host`,
+    /// `ansible_user`, `ansible_port`, `ansible_ssh_*`) are rejected — the operator owns those.
+    pub variables: Option<GenericMap>,
 }
 
 impl AnsibleInventory for ClusterInventory {

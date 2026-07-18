@@ -781,6 +781,7 @@ spec:
                 hosts: vec!["node-a".into(), "node-b".into()],
             },
             tolerations: None,
+            variables: None,
         }];
 
         let job = super::create_job_for_run(&hash, 1, &groups, &pp).unwrap();
@@ -866,6 +867,7 @@ spec:
                     name: "ssh-key".into(),
                 },
             },
+            variables: None,
         }];
 
         let job = super::create_job_for_run(&hash, 1, &groups, &pp).unwrap();

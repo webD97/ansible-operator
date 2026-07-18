@@ -22,6 +22,9 @@ spec:
             properties:
               hosts:
                 items:
+                  description: |-
+                    One named group of external hosts, optionally carrying group variables applied to every host
+                    in the group.
                   properties:
                     hosts:
                       items:
@@ -29,6 +32,14 @@ spec:
                       type: array
                     name:
                       type: string
+                    variables:
+                      description: |-
+                        Group variables applied to every host in this group, rendered as Ansible group `vars:`,
+                        e.g. `ansible_python_interpreter`. Operator-managed connection variables (`ansible_user`,
+                        `ansible_ssh_*`, `ansible_host`, `ansible_port`) are rejected — the operator owns those.
+                      nullable: true
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                   required:
                   - hosts
                   - name

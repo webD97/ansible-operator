@@ -72,6 +72,16 @@ in one is already inside that trust boundary — and by the fact that the author
 playbook code (node-root over managed SSH). Keep only ServiceAccounts you would trust a playbook to
 assume in an enrolled namespace.
 
+## Inventory group variables
+
+A `ClusterInventory` or `StaticInventory` group may set `variables`, rendered as Ansible group vars
+for its hosts. The operator **rejects** the connection variables it manages itself — `ansible_host`,
+`ansible_port`, `ansible_user`, `ansible_timeout`, and the `ansible_ssh_*` options — so an inventory
+author cannot use group vars to redirect a dial or weaken host-key checking; a plan that references
+such an inventory fails to reconcile until the variable is removed. Everything else an author sets is
+data the playbook they already control would receive anyway, so this adds no reach beyond authoring
+the playbook itself.
+
 ## Blast radius
 
 What a compromise of the operator (or of a tenant allowed to author a `ClusterInventory`) can and

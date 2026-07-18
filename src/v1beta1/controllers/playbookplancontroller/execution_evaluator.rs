@@ -24,6 +24,38 @@ impl std::ops::Deref for ExecutionHash {
     }
 }
 
+impl ExecutionHash {
+    /// Folds inventory-author group variables into an existing hash. Kept separate from
+    /// [`calculate_execution_hash`] so the many call sites that hash only playbook + secrets stay
+    /// unchanged — the reconciler chains this on with the run's resolved groups.
+    ///
+    /// Inventory variables are treated as *content*: changing one re-applies the playbook to
+    /// otherwise-current hosts. The fold is order-insensitive (groups resolve in arbitrary order),
+    /// and an empty input is a no-op, so an inventory that sets no variables hashes exactly as it
+    /// did before this field existed.
+    pub fn fold_inventory_variables<'a>(
+        self,
+        variables: impl IntoIterator<Item = (&'a str, &'a serde_json::Value)>,
+    ) -> ExecutionHash {
+        let extra = variables
+            .into_iter()
+            .map(|(group_name, vars)| {
+                let mut hasher = twox_hash::XxHash3_64::new();
+                group_name.hash(&mut hasher);
+                // serde_json's map is BTreeMap-backed (no `preserve_order` feature), so this
+                // serialization is canonical: equal variable sets hash equal regardless of the
+                // author's key order.
+                serde_json::to_string(vars)
+                    .unwrap_or_default()
+                    .hash(&mut hasher);
+                hasher.finish()
+            })
+            .fold(0u64, u64::wrapping_add);
+
+        ExecutionHash(self.0.wrapping_add(extra))
+    }
+}
+
 /// Returns an iterator over hosts where the PlaybookPlan needs to be (re)applied.
 pub fn find_outdated_hosts(
     status: &v1beta1::PlaybookPlanStatus,
@@ -217,6 +249,34 @@ mod tests {
         // Then
         assert_eq!(hashed_1, hashed_2);
         assert_eq!(hashed_2, hashed_3);
+    }
+
+    #[test]
+    pub fn test_fold_inventory_variables_changes_hash_and_is_order_insensitive() {
+        let base = calculate_execution_hash("playbook", std::iter::empty());
+
+        // No variables is a no-op, so pre-existing inventories keep their hash.
+        assert_eq!(base, base.fold_inventory_variables(std::iter::empty()));
+
+        let workers = serde_json::json!({ "ansible_python_interpreter": "/usr/bin/python3" });
+        let edge = serde_json::json!({ "ansible_python_interpreter": "/usr/bin/python2" });
+
+        let with_vars =
+            base.fold_inventory_variables([("workers", &workers), ("edge", &edge)]);
+        // Folding real variables changes the hash...
+        assert_ne!(base, with_vars);
+        // ...but the group order does not matter.
+        assert_eq!(
+            with_vars,
+            base.fold_inventory_variables([("edge", &edge), ("workers", &workers)])
+        );
+
+        // A changed value changes the hash.
+        let changed = serde_json::json!({ "ansible_python_interpreter": "/usr/bin/python3.11" });
+        assert_ne!(
+            with_vars,
+            base.fold_inventory_variables([("workers", &changed), ("edge", &edge)])
+        );
     }
 
     #[test]

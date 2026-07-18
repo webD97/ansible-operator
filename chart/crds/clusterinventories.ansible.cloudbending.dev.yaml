@@ -56,6 +56,15 @@ spec:
                       type: object
                     name:
                       type: string
+                    variables:
+                      description: |-
+                        Group variables applied to every node this group resolves to, rendered as Ansible group
+                        `vars:`. Use it to set node facts the playbook author should not have to know, e.g.
+                        `ansible_python_interpreter`. Operator-managed connection variables (`ansible_host`,
+                        `ansible_user`, `ansible_port`, `ansible_ssh_*`) are rejected — the operator owns those.
+                      nullable: true
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                   required:
                   - name
                   type: object

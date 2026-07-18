@@ -133,6 +133,7 @@ mod tests {
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
             },
             tolerations: None,
+            variables: None,
         }
     }
 
@@ -147,6 +148,7 @@ mod tests {
                 user: "root".into(),
                 secret_ref: SecretRef { name: "k".into() },
             },
+            variables: None,
         }
     }
 

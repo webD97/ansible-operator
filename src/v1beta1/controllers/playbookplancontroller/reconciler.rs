@@ -20,8 +20,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
-    AnsibleInventory, ClusterInventory, ExecutionMode, NodeAccessPolicy, Phase, PlaybookPlanStatus,
-    ResolvedInventoryGroup, StaticInventory, Toleration, ansible, flatten_hosts, labels,
+    AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy, Phase,
+    PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory, Toleration, ansible,
+    flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
@@ -269,11 +270,24 @@ async fn reconcile(
 
     resource_status.eligible_hosts = flatten_hosts(&target_groups);
 
+    // Inventory-author group variables are part of the execution hash (a change re-applies the
+    // playbook to otherwise-current hosts). Keyed by group name; groups without variables
+    // contribute nothing, so inventories that set none hash exactly as before.
+    let inventory_variables: Vec<(&str, &serde_json::Value)> = target_groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .variables()
+                .map(|vars| (group.hosts().name.as_str(), &vars.0))
+        })
+        .collect();
+
     let related_secrets = get_related_secrets(&object);
     let execution_hash = hash_playbook_inputs(
         &object.spec.template.playbook,
         &related_secrets,
         &secrets_api,
+        &inventory_variables,
     )
     .await;
 
@@ -808,20 +822,25 @@ fn filter_groups_to_hosts(
             filtered_hosts.hosts = filtered_hostnames;
 
             Some(match group {
-                ResolvedInventoryGroup::ManagedSsh { tolerations, .. } => {
-                    ResolvedInventoryGroup::ManagedSsh {
-                        hosts: filtered_hosts,
-                        tolerations: tolerations.clone(),
-                    }
-                }
+                ResolvedInventoryGroup::ManagedSsh {
+                    tolerations,
+                    variables,
+                    ..
+                } => ResolvedInventoryGroup::ManagedSsh {
+                    hosts: filtered_hosts,
+                    tolerations: tolerations.clone(),
+                    variables: variables.clone(),
+                },
                 ResolvedInventoryGroup::Ssh {
                     static_inventory_name,
                     config,
+                    variables,
                     ..
                 } => ResolvedInventoryGroup::Ssh {
                     hosts: filtered_hosts,
                     static_inventory_name: static_inventory_name.clone(),
                     config: config.clone(),
+                    variables: variables.clone(),
                 },
             })
         })
@@ -841,6 +860,7 @@ fn managed_ssh_hosts_and_tolerations(
         if let ResolvedInventoryGroup::ManagedSsh {
             hosts: h,
             tolerations: t,
+            ..
         } = group
         {
             hosts.extend(h.hosts.clone());
@@ -927,6 +947,7 @@ async fn hash_playbook_inputs(
     playbook: &str,
     secret_names: &[&String],
     secrets_api: &Api<Secret>,
+    inventory_variables: &[(&str, &serde_json::Value)],
 ) -> ExecutionHash {
     let secrets = futures::future::join_all(
         secret_names
@@ -942,6 +963,7 @@ async fn hash_playbook_inputs(
         .collect();
 
     execution_evaluator::calculate_execution_hash(playbook, variables_secrets.iter())
+        .fold_inventory_variables(inventory_variables.iter().copied())
 }
 
 /// Resolves every inventory this PlaybookPlan references into `ResolvedInventoryGroup`s,
@@ -1005,10 +1027,21 @@ async fn resolve_inventory(
 
     for ci in cluster_inventories.into_iter().map(Result::unwrap) {
         let tolerations = ci.spec.tolerations.clone();
+        // Group variables live on the spec's InventoryHosts, but get_hosts() returns the resolved
+        // node lists from status; re-join them by group name.
+        let variables_by_group: BTreeMap<&str, &GenericMap> = ci
+            .spec
+            .hosts
+            .iter()
+            .filter_map(|group| group.variables.as_ref().map(|v| (group.name.as_str(), v)))
+            .collect();
         for hosts in ci.get_hosts() {
+            let variables = variables_by_group.get(hosts.name.as_str()).copied().cloned();
+            reject_reserved_variables(&hosts.name, variables.as_ref())?;
             groups.push(ResolvedInventoryGroup::ManagedSsh {
                 hosts,
                 tolerations: tolerations.clone(),
+                variables,
             });
         }
     }
@@ -1016,16 +1049,40 @@ async fn resolve_inventory(
     for si in static_inventories.into_iter().map(Result::unwrap) {
         let static_inventory_name = si.name_any();
         let config = si.spec.ssh.clone();
-        for hosts in si.get_hosts() {
+        for group in &si.spec.hosts {
+            reject_reserved_variables(&group.name, group.variables.as_ref())?;
             groups.push(ResolvedInventoryGroup::Ssh {
-                hosts,
+                hosts: ResolvedHosts {
+                    name: group.name.clone(),
+                    hosts: group.hosts.clone(),
+                },
                 static_inventory_name: static_inventory_name.clone(),
                 config: config.clone(),
+                variables: group.variables.clone(),
             });
         }
     }
 
     Ok(groups)
+}
+
+/// Fails the reconcile if an inventory group sets a variable the operator manages for
+/// connection/isolation (see [`ansible::RESERVED_HOST_VARS`]). Runs at resolve time, before any
+/// proxy infra or hashing, so a bad inventory surfaces as a clear error rather than a silently
+/// ignored setting or broken connection.
+fn reject_reserved_variables(
+    group_name: &str,
+    variables: Option<&GenericMap>,
+) -> Result<(), ReconcileError> {
+    if let Some(variables) = variables
+        && let Some(key) = ansible::first_reserved_var(&variables.0)
+    {
+        return Err(ReconcileError::ReservedInventoryVariable {
+            group: group_name.to_string(),
+            key: key.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Builds an `OwnerReference` to this PlaybookPlan for the plan-namespace resources it owns (the
@@ -1209,6 +1266,7 @@ mod tests {
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
             },
             tolerations,
+            variables: None,
         }
     }
 
@@ -1229,6 +1287,7 @@ mod tests {
                     name: "ssh-key".into(),
                 },
             },
+            variables: None,
         }
     }
 

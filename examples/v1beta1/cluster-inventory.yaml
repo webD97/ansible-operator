@@ -8,6 +8,8 @@ spec:
       matchLabels:
         kubernetes.io/os: linux
         node-role.kubernetes.io/control-plane: "true"
+      variables:
+        ansible_python_interpreter: /usr/bin/python3
     - name: workers
       matchExpressions:
         - { key: kubernetes.io/os, operator: In, values: [linux] }

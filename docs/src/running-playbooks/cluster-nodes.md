@@ -42,6 +42,27 @@ The controller watches Nodes and keeps `.status.resolvedHosts` and `.status.host
 Nodes are labelled, added, or removed, so `kubectl get clusterinventory` shows how many Nodes
 currently match.
 
+## Group variables
+
+Each group may carry a `variables` map, rendered as Ansible **group vars** for every Node the group
+resolves to. Use it to pin node facts the playbook author should not need to know — most often
+`ansible_python_interpreter`, so playbooks don't emit interpreter-discovery warnings:
+
+```yaml
+spec:
+  hosts:
+    - name: controlplanes
+      matchLabels:
+        node-role.kubernetes.io/control-plane: "true"
+      variables:
+        ansible_python_interpreter: /usr/bin/python3
+```
+
+Group variables are part of a plan's execution hash, so changing one re-applies the playbook to the
+affected Nodes on the next run. The connection variables the operator manages itself — `ansible_host`,
+`ansible_port`, `ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
+managed SSH, and a plan that references an inventory setting one does not run until you remove it.
+
 ## Tolerations
 
 To reach a tainted Node such as a control-plane node, the managed-SSH proxy pod for that Node must

@@ -189,6 +189,23 @@ for the next scheduled reconcile.
   Accepted trade-off (documented in `node_access.rs`).
 - *Severity:* Low.
 
+**T-TAMP-4 — Inventory group variables override connection/isolation host vars.**
+`ClusterInventory`/`StaticInventory` groups may carry author-supplied `variables`, rendered as
+Ansible group vars. An author could try to set `ansible_ssh_common_args` (weakening host-key
+checking), `ansible_host`/`ansible_port` (redirecting the dial), or `ansible_user` to subvert the
+managed-SSH/SSH wiring.
+- *Mitigation:* the operator rejects the connection variables it renders itself
+  (`ansible::RESERVED_HOST_VARS` — `ansible_host`, `ansible_port`, `ansible_timeout`, `ansible_user`,
+  `ansible_ssh_private_key_file`, `ansible_ssh_common_args`) at inventory-resolve time
+  (`reject_reserved_variables`, before any proxy infra), failing the reconcile with
+  `ReservedInventoryVariable`. Independently, those vars are rendered per-**host**, which outranks
+  group vars in Ansible precedence, so an accepted group var can never shadow them. A test
+  (`reserved_vars_cover_every_rendered_host_var`) keeps the reserved list in step with what the
+  renderer emits.
+- *Residual:* the inventory author already runs arbitrary playbook code as root on their
+  already-authorized nodes (T-TAMP-2, T-ESC-4); group vars grant no reach beyond that.
+- *Severity:* Low.
+
 ### Repudiation
 
 **T-REP-1 — No attribution of which principal caused a given node-root session.**

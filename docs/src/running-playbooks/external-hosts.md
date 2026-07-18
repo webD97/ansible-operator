@@ -30,6 +30,27 @@ spec:
       name: ssh-key
 ```
 
+## Group variables
+
+Each group may carry a `variables` map, rendered as Ansible **group vars** for every host in the
+group. Use it to pin facts the playbook author should not need to know — for example
+`ansible_python_interpreter`, so playbooks don't have to guess where Python lives on your appliances:
+
+```yaml
+spec:
+  hosts:
+    - name: webservers
+      hosts:
+        - server1.example.com
+      variables:
+        ansible_python_interpreter: /usr/bin/python3
+```
+
+Group variables are part of a plan's execution hash, so changing one re-applies the playbook on the
+next run. The connection variables the operator manages — `ansible_user`, the `ansible_ssh_*`
+options, `ansible_host`, and `ansible_port` — are rejected: they come from the `ssh` block below, and
+a plan that references an inventory setting one does not run until you remove it.
+
 ## SSH credentials
 
 `spec.ssh` is mandatory — a `StaticInventory` with no way to reach its hosts is not usable:
