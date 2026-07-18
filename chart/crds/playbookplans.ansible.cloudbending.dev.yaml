@@ -178,6 +178,14 @@ spec:
                 format: int32
                 nullable: true
                 type: integer
+              verbosity:
+                description: |-
+                  Verbosity for `ansible-playbook`, mapped to `-v`…`-vvvv`. 0 (unset) adds no flag; values
+                  above 4 are clamped to 4. Affects log detail only — it is not part of the execution hash, so
+                  changing it does not re-run the playbook on already-current hosts.
+                minimum: 0.0
+                nullable: true
+                type: integer
             required:
             - image
             - inventoryRefs

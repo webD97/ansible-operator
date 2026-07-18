@@ -21,6 +21,7 @@ the CRD schema (`ansible-operator crds`) and the generated API reference.
 | `template.files` | no | Files made available at runtime — see [Variables and files](./variables-and-files.md). |
 | `template.requirements` | no | An Ansible `requirements.yml` (e.g. collections) installed before the run. |
 | `ttlSecondsAfterFinished` | no | How long a finished run's Job and pod are kept before Kubernetes reaps them. Values below 60s are raised to 60. |
+| `verbosity` | no (`0`) | `ansible-playbook` verbosity, `0`–`4`, mapped to `-v`…`-vvvv`. Affects log detail only. |
 
 ## Choosing the image
 
@@ -90,6 +91,13 @@ whatever RBAC you bind to this ServiceAccount.
 spec:
   serviceAccountName: deploy-bot
 ```
+
+## Log verbosity
+
+`verbosity` raises how much `ansible-playbook` logs, from `0` (no `-v` flag) up to `4` (`-vvvv`);
+higher values are clamped to `4`. Use it when you need to see task-level or connection detail while
+troubleshooting. It changes log output only — it is not part of the execution hash, so raising or
+lowering it never re-runs the playbook on hosts that are already current.
 
 ## One Job per run
 

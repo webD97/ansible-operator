@@ -58,6 +58,12 @@ pub struct PlaybookPlanSpec {
     /// all — create the ServiceAccount and its Role/RoleBinding yourself and name it here.
     pub service_account_name: Option<String>,
 
+    /// Verbosity for `ansible-playbook`, mapped to `-v`…`-vvvv`. 0 (unset) adds no flag; values
+    /// above 4 are clamped to 4. Affects log detail only — it is not part of the execution hash, so
+    /// changing it does not re-run the playbook on already-current hosts.
+    #[schemars(with = "Option<UnsignedInt>")]
+    pub verbosity: Option<u8>,
+
     /// Controls if a playbook is executed once or repeatedly
     #[schemars(default)]
     pub mode: ExecutionMode,
@@ -309,6 +315,7 @@ mod tests {
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
                 service_account_name: None,
+                verbosity: None,
                 mode: ExecutionMode::Recurring,
                 suspend: false,
                 schedule: Some("0 1 * * *".into()),

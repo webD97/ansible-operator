@@ -35,6 +35,11 @@ const DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 3600;
 /// quietly raised to it rather than rejected.
 const MIN_JOB_TTL_SECONDS_AFTER_FINISHED: i32 = 60;
 
+/// Ceiling for `spec.verbosity`. Ansible's practically useful maximum is `-vvvv` (connection +
+/// plugin debugging); higher values add nothing, so anything larger is silently clamped rather than
+/// rejected — the same forgiving style as `MIN_JOB_TTL_SECONDS_AFTER_FINISHED`.
+const MAX_VERBOSITY: u8 = 4;
+
 /// Resolves the effective Job TTL for a plan: its `spec.ttlSecondsAfterFinished` clamped up to
 /// `MIN_JOB_TTL_SECONDS_AFTER_FINISHED`, or the default when unset.
 fn effective_job_ttl(plan: &v1beta1::PlaybookPlan) -> i32 {
@@ -538,6 +543,11 @@ fn render_ansible_command(
 
     let mut ansible_command = vec!["ansible-playbook".into()];
 
+    if let Some(level) = plan.spec.verbosity.filter(|v| *v > 0) {
+        let level = level.min(MAX_VERBOSITY);
+        ansible_command.push(format!("-{}", "v".repeat(level as usize)));
+    }
+
     ansible_command.extend(
         static_vars_filenames
             .iter()
@@ -658,6 +668,35 @@ spec:
         assert!(!command.iter().any(|arg| arg == "--private-key"));
         assert!(command.iter().any(|arg| arg == "inventory.yml"));
         assert!(command.iter().any(|arg| arg == "playbook.yml"));
+        // No verbosity requested -> no -v flag at all.
+        assert!(!command.iter().any(|arg| arg.starts_with("-v")));
+    }
+
+    #[test]
+    fn render_ansible_command_maps_verbosity_to_v_flags() {
+        use crate::v1beta1::controllers::playbookplancontroller::job_builder::render_ansible_command;
+
+        let v_flags = |plan: &PlaybookPlan| -> Vec<String> {
+            render_ansible_command(plan, Vec::new())
+                .into_iter()
+                .filter(|arg| arg.starts_with("-v"))
+                .collect()
+        };
+
+        // Explicit 0 is treated the same as unset: no flag.
+        let mut zero = minimal_plan();
+        zero.spec.verbosity = Some(0);
+        assert!(v_flags(&zero).is_empty());
+
+        // A level renders as a single combined flag.
+        let mut two = minimal_plan();
+        two.spec.verbosity = Some(2);
+        assert_eq!(v_flags(&two), vec!["-vv".to_string()]);
+
+        // Above the ceiling is clamped to -vvvv, not rejected.
+        let mut huge = minimal_plan();
+        huge.spec.verbosity = Some(9);
+        assert_eq!(v_flags(&huge), vec!["-vvvv".to_string()]);
     }
 
     #[test]
