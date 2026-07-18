@@ -33,7 +33,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       image: ${{ steps.image.outputs.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The tag must reflect what the image actually builds: `sshd-v<openssh>-<rev>` where <openssh>
       # equals Containerfile.sshd's ARG OPENSSH_VERSION. Fail the release on a mismatch or bad shape.
@@ -111,7 +111,7 @@ jobs:
       pull-requests: write
     steps:
       # Base the PR on main, not the pushed tag.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
 
