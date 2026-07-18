@@ -1,12 +1,21 @@
-# Release the managed-ssh proxy image on its OWN tag cadence (`sshd-v*`), independent of the operator's
-# `v*.*.*` releases — an operator release never publishes this image, and vice versa. On an `sshd-vX.Y.Z`
-# tag this builds + pushes + cosign-signs the image, then opens a PR that repins the chart default onto
-# the freshly-published `@sha256:` digest (THREAT_MODEL T-ESC-5 / R5).
+# Release the managed-ssh proxy image on its OWN tag cadence, independent of the operator's `v*.*.*`
+# releases — an operator release never publishes this image, and vice versa.
+#
+# Tag scheme: `sshd-v<OPENSSH_VERSION>-<REVISION>`, e.g. `sshd-v10.4p1-1` — the image tag reflects the
+# OpenSSH version baked into Containerfile.sshd, plus an integer revision bumped when the image is
+# rebuilt WITHOUT an OpenSSH change (Alpine base bump, Containerfile fix). A "verify" step below fails
+# the release unless the tag's OpenSSH version matches the Containerfile's `ARG OPENSSH_VERSION`.
+#
+# On such a tag this builds + pushes + cosign-signs the image (tags `<ver>-<rev>`, floating `<ver>`,
+# `latest`), then opens a PR repinning the chart + example config onto the `@sha256:` digest
+# (THREAT_MODEL T-ESC-5 / R5).
 name: Release sshd proxy image
 
 on:
   push:
-    tags: ["sshd-v*.*.*"]
+    # Broad `sshd-v*` (not `sshd-v*.*.*`): the OpenSSH version isn't semver (`10.4p1`). The verify step
+    # enforces the real shape. Still disjoint from the operator's `v*.*.*` tags.
+    tags: ["sshd-v*"]
 
 env:
   REGISTRY: ghcr.io
@@ -25,6 +34,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The tag must reflect what the image actually builds: `sshd-v<openssh>-<rev>` where <openssh>
+      # equals Containerfile.sshd's ARG OPENSSH_VERSION. Fail the release on a mismatch or bad shape.
+      - name: Verify tag OpenSSH version matches the Containerfile
+        run: |
+          set -euo pipefail
+          built="$(grep -oP 'ARG OPENSSH_VERSION=\K\S+' Containerfile.sshd)"
+          rest="${GITHUB_REF_NAME#sshd-v}"        # e.g. 10.4p1-1
+          case "$rest" in
+            *-*) tag_ver="${rest%-*}"; rev="${rest##*-}" ;;
+            *)   echo "::error::tag '${GITHUB_REF_NAME}' must be sshd-v<openssh>-<revision>, e.g. sshd-v${built}-1"; exit 1 ;;
+          esac
+          case "$rev" in ''|*[!0-9]*) echo "::error::revision '$rev' must be an integer"; exit 1 ;; esac
+          if [ "$tag_ver" != "$built" ]; then
+            echo "::error::tag OpenSSH version '$tag_ver' != Containerfile ARG OPENSSH_VERSION '$built'"
+            exit 1
+          fi
+
       - name: Install cosign
         uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
         with:
@@ -39,14 +65,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Map the `sshd-vX.Y.Z` tag to image tags `X.Y.Z` + `latest`.
+      # `sshd-v10.4p1-1` -> image tags `10.4p1-1` (exact), `10.4p1` (floating, newest rev of that
+      # OpenSSH version) and `latest`. `version` output (first tag) is the exact `10.4p1-1`.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=match,pattern=sshd-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=sshd-v(.+),group=1
+            type=match,pattern=sshd-v(\d+\.\d+p\d+)-\d+,group=1
             type=raw,value=latest
 
       - name: Build and push

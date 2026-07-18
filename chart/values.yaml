@@ -11,7 +11,8 @@ image:
 managedSsh:
   proxyImage:
     repository: ghcr.io/webd97/ansible-operator-sshd
-    tag: "0.1.0"
+    # <openssh>-<revision>, e.g. 10.4p1-1; the release workflow repins this to a @sha256: digest.
+    tag: "10.4p1-1"
 
   # How long the operator waits for a NotReady node's managed-ssh proxy pod to become Ready before it
   # gives up on that node for the run (Ansible then reports the node unreachable, and it is retried on

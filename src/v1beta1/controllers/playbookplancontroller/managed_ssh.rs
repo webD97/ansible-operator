@@ -1096,7 +1096,7 @@ mod container_tests {
 
     /// Proxy image this test boots: the **first-party** minimal static sshd from `Containerfile.sshd`,
     /// so this test is that image's conformance gate. A local `--ignored` run needs it built first:
-    ///   podman build -f Containerfile.sshd -t ghcr.io/webd97/ansible-operator-sshd:0.1.0 .
+    ///   podman build -f Containerfile.sshd -t ghcr.io/webd97/ansible-operator-sshd:10.4p1-1 .
     ///   cargo test managed_ssh::container_tests -- --ignored --nocapture
     /// Override `MANAGED_SSH_TEST_IMAGE`/`MANAGED_SSH_TEST_TAG` to test a candidate build (e.g. an
     /// OpenSSH-bump PR) — a local-only image is used as-is (testcontainers only pulls on a 404).
@@ -1105,7 +1105,7 @@ mod container_tests {
             .unwrap_or_else(|_| "ghcr.io/webd97/ansible-operator-sshd".to_string())
     }
     fn proxy_tag() -> String {
-        std::env::var("MANAGED_SSH_TEST_TAG").unwrap_or_else(|_| "0.1.0".to_string())
+        std::env::var("MANAGED_SSH_TEST_TAG").unwrap_or_else(|_| "10.4p1-1".to_string())
     }
     /// Node name the proxy's host cert is signed for; the client must dial it via `HostKeyAlias`
     /// (mirroring `inventory_renderer`) so the `@cert-authority *` known_hosts entry validates.
