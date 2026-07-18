@@ -59,6 +59,19 @@ bind-mount, `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE`, and (on SELinux nodes) the `spc_
 image they run is the node-root supply-chain surface you must own — pin it to a trusted digest (see
 [Deployment → the proxy image](./deployment.md#the-managed-ssh-proxy-image)).
 
+## The playbook pod's Kubernetes access
+
+The pod that runs `ansible-playbook` carries **no** Kubernetes API token unless the plan sets
+`serviceAccountName` — the operator sets `automountServiceAccountToken: false` by default, so a
+playbook that never asked for cluster access cannot reach the API at all. When a plan does set
+`serviceAccountName`, the run acts with **that ServiceAccount's RBAC**. Because a plan author picks
+any ServiceAccount in the plan's namespace, this is a within-namespace escalation surface: an author
+who can create `PlaybookPlan`s can run a pod as any ServiceAccount there. It is bounded by the same
+enrollment fence — enrolled namespaces should be **dedicated to Ansible ops**, so every ServiceAccount
+in one is already inside that trust boundary — and by the fact that the author already runs arbitrary
+playbook code (node-root over managed SSH). Keep only ServiceAccounts you would trust a playbook to
+assume in an enrolled namespace.
+
 ## Blast radius
 
 What a compromise of the operator (or of a tenant allowed to author a `ClusterInventory`) can and

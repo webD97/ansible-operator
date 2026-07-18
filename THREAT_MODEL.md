@@ -349,6 +349,24 @@ podSelector label, and the client-cert principal.
   CA-trusted) but the hash is used in security-relevant scoping, not just caching.
 - *Severity:* Low (hard to weaponize today), but note it is **not** a security boundary.
 
+**T-ESC-7 — Playbook runs as an in-namespace ServiceAccount via `spec.serviceAccountName`.**
+A `PlaybookPlan` may name any ServiceAccount in the plan namespace; the Job pod then runs as it and
+mounts its token (`job_builder` sets `service_account_name` + `automount_service_account_token`). An
+author who can only create `PlaybookPlan`s (not pods directly) thereby gains the ability to act with
+any of that namespace's ServiceAccounts' API RBAC.
+- *Mitigation:* **fail-closed by default** — when `serviceAccountName` is unset the operator sets
+  `automountServiceAccountToken: false`, so a playbook that never asked for cluster access carries no
+  API token at all (this also tightens the prior behaviour, where the namespace `default` SA token was
+  always auto-mounted). Access is opt-in and scoped to the plan namespace. The enrollment fence (R1)
+  already requires enrolled namespaces to be **dedicated to Ansible ops**, so every ServiceAccount in
+  one is inside the Ansible trust boundary; and the author already runs arbitrary node-root playbook
+  code, so this is not new capability against managed-ssh targets.
+- *Residual:* a tenant able to author plans in an enrolled namespace can assume any ServiceAccount
+  there — keep only ServiceAccounts you would trust a playbook to run as in enrolled namespaces, and
+  do not co-locate privileged ServiceAccounts with playbook authoring rights.
+- *Severity:* Medium — within-namespace, opt-in, and bounded by the enrollment fence; scales with how
+  privileged the namespace's ServiceAccounts are.
+
 ---
 
 ## 6. Deployment assumptions & required controls

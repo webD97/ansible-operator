@@ -10,6 +10,7 @@ the CRD schema (`ansible-operator crds`) and the generated API reference.
 | Field | Required | Meaning |
 |---|---|---|
 | `image` | yes | An OCI image that has `ansible-playbook` and every collection your playbook uses. The Job runs this image. |
+| `serviceAccountName` | no | ServiceAccount the run's pod uses, so tasks can reach the Kubernetes API. Unset means no API token is mounted — see [Managing Kubernetes resources](#managing-kubernetes-resources). |
 | `inventoryRefs` | yes | Which inventories to target — one entry per referenced `ClusterInventory` or `StaticInventory`. |
 | `template.playbook` | yes | The playbook text itself (see below). |
 | `mode` | no (`OneShot`) | `OneShot` or `Recurring` — see [Scheduling and execution modes](./scheduling-and-modes.md). |
@@ -71,6 +72,24 @@ inventoryRefs:
 Inventories are resolved from the **same namespace** as the plan. The groups they define become
 Ansible groups in the rendered inventory, so a playbook can target `hosts: workers` or
 `hosts: edge-appliances` as well as `hosts: all`.
+
+## Managing Kubernetes resources
+
+By default the run's pod carries **no** Kubernetes API token, so a playbook cannot talk to the
+cluster's API. To let tasks manage Kubernetes resources (via `kubernetes.core` or `kubectl`), set
+`serviceAccountName` to a ServiceAccount in the plan's namespace. The operator then runs the pod as
+that ServiceAccount and mounts its token; Ansible's `kubernetes.core` modules pick it up through
+in-cluster configuration automatically, so you do not supply a kubeconfig.
+
+You own the identity and its permissions: create the ServiceAccount and a `Role`/`RoleBinding` (or
+`ClusterRoleBinding`) granting exactly what the playbook needs, and make sure your `image` includes
+the `kubernetes.core` collection. Grant the least privilege that works — the playbook runs with
+whatever RBAC you bind to this ServiceAccount.
+
+```yaml
+spec:
+  serviceAccountName: deploy-bot
+```
 
 ## One Job per run
 

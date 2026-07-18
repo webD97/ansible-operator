@@ -48,7 +48,8 @@ use crate::{
     utils,
     v1beta1::{
         self, FilesSource, PlaybookPlan, PlaybookVariableSource, ResolvedInventoryGroup, SshConfig,
-        controllers::reconcile_error::ReconcileError, labels,
+        controllers::reconcile_error::ReconcileError,
+        labels,
         playbookplancontroller::{execution_evaluator::ExecutionHash, managed_ssh, paths},
     },
 };
@@ -187,7 +188,11 @@ fn create_job_skeleton(
 
         volume_mounts.push(kcore::v1::VolumeMount {
             name: volume.name.clone(),
-            mount_path: format!("{}/files/{}", paths::WORKSPACE_MOUNT_PATH, volume.name.clone()),
+            mount_path: format!(
+                "{}/files/{}",
+                paths::WORKSPACE_MOUNT_PATH,
+                volume.name.clone()
+            ),
             ..Default::default()
         });
     }
@@ -243,6 +248,8 @@ fn create_job_skeleton(
         metadata: None,
         spec: Some(kcore::v1::PodSpec {
             restart_policy: Some("Never".into()), // todo: maybe configurable
+            service_account_name: plan.spec.service_account_name.clone(),
+            automount_service_account_token: Some(plan.spec.service_account_name.is_some()),
             volumes: Some(volumes),
             containers: vec![main_container],
             init_containers: Some(init_containers),
@@ -507,7 +514,10 @@ fn extract_file_volumes(
 /// Builds the `ansible-playbook` invocation. Connection details no longer appear here at all —
 /// each host's connection mechanism is expressed as inventory vars in the rendered
 /// `inventory.yml` instead, so there's no more per-strategy `-c`/`-l`/`--private-key` branching.
-fn render_ansible_command(plan: &v1beta1::PlaybookPlan, extra_vars_filepaths: Vec<&String>) -> Vec<String> {
+fn render_ansible_command(
+    plan: &v1beta1::PlaybookPlan,
+    extra_vars_filepaths: Vec<&String>,
+) -> Vec<String> {
     let static_vars_filenames: Vec<String> = plan
         .spec
         .template
@@ -537,7 +547,10 @@ fn render_ansible_command(plan: &v1beta1::PlaybookPlan, extra_vars_filepaths: Ve
     ansible_command.extend(extra_vars_filepaths.iter().flat_map(|path| {
         [
             "--extra-vars".into(),
-            format!("@{}/vars/{path}/variables.yaml", paths::WORKSPACE_MOUNT_PATH),
+            format!(
+                "@{}/vars/{path}/variables.yaml",
+                paths::WORKSPACE_MOUNT_PATH
+            ),
         ]
     }));
 
@@ -744,9 +757,11 @@ spec:
             .unwrap();
 
         // Soft only — a run targeting every node must still schedule, so this is never `required`.
-        assert!(node_affinity
-            .required_during_scheduling_ignored_during_execution
-            .is_none());
+        assert!(
+            node_affinity
+                .required_during_scheduling_ignored_during_execution
+                .is_none()
+        );
 
         let term = &node_affinity
             .preferred_during_scheduling_ignored_during_execution
@@ -819,5 +834,46 @@ spec:
             job.spec.unwrap().template.spec.unwrap().affinity.is_none(),
             "StaticInventory hosts aren't cluster nodes, so nothing constrains placement"
         );
+    }
+
+    #[test]
+    fn no_service_account_means_no_token_is_mounted() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let pp = minimal_plan();
+        assert!(pp.spec.service_account_name.is_none());
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let pod_spec = super::create_job_for_run(&hash, 1, &[], &pp)
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        assert_eq!(pod_spec.service_account_name, None);
+        // Fail-closed: without a ServiceAccount named, the pod carries no API token.
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn service_account_is_set_and_its_token_is_mounted() {
+        use crate::v1beta1::controllers::playbookplancontroller::execution_evaluator::calculate_execution_hash;
+
+        let mut pp = minimal_plan();
+        pp.spec.service_account_name = Some("playbook-sa".into());
+        let hash = calculate_execution_hash("- hosts: all", std::iter::empty());
+
+        let pod_spec = super::create_job_for_run(&hash, 1, &[], &pp)
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        assert_eq!(pod_spec.service_account_name, Some("playbook-sa".into()));
+        assert_eq!(pod_spec.automount_service_account_token, Some(true));
     }
 }

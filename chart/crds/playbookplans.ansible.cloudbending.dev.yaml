@@ -88,6 +88,14 @@ spec:
                 description: 5-part cron expression that tells at which time the playbook may execute
                 nullable: true
                 type: string
+              serviceAccountName:
+                description: |-
+                  ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that
+                  identity's RBAC. When set, the SA's token is auto-mounted (Ansible's `kubernetes.core`
+                  modules pick it up via in-cluster config). When unset, the pod runs with no API token at
+                  all — create the ServiceAccount and its Role/RoleBinding yourself and name it here.
+                nullable: true
+                type: string
               startingDeadlineSeconds:
                 description: |-
                   Grace window, in seconds, after a scheduled tick during which a run may still start. The

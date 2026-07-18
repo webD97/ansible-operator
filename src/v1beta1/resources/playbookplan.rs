@@ -52,6 +52,12 @@ pub struct PlaybookPlanSpec {
     /// An OCI image with Ansible and all required collections
     pub image: String,
 
+    /// ServiceAccount the playbook pod runs as, letting tasks reach the Kubernetes API with that
+    /// identity's RBAC. When set, the SA's token is auto-mounted (Ansible's `kubernetes.core`
+    /// modules pick it up via in-cluster config). When unset, the pod runs with no API token at
+    /// all — create the ServiceAccount and its Role/RoleBinding yourself and name it here.
+    pub service_account_name: Option<String>,
+
     /// Controls if a playbook is executed once or repeatedly
     #[schemars(default)]
     pub mode: ExecutionMode,
@@ -302,6 +308,7 @@ mod tests {
             "blubb",
             PlaybookPlanSpec {
                 image: "registry.tld/ansible:1.0.0".to_string(),
+                service_account_name: None,
                 mode: ExecutionMode::Recurring,
                 suspend: false,
                 schedule: Some("0 1 * * *".into()),
