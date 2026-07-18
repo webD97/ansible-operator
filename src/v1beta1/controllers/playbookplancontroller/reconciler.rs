@@ -21,8 +21,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::v1beta1::{
     AnsibleInventory, ClusterInventory, ExecutionMode, GenericMap, NodeAccessPolicy, Phase,
-    PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory, Toleration, ansible,
-    flatten_hosts, labels,
+    PlaybookPlanStatus, ResolvedHosts, ResolvedInventoryGroup, StaticInventory, Toleration,
+    ansible, flatten_hosts, labels,
     playbookplancontroller::{
         execution_evaluator::{ExecutionHash, find_all_hosts},
         locking, managed_ssh,
@@ -1036,7 +1036,10 @@ async fn resolve_inventory(
             .filter_map(|group| group.variables.as_ref().map(|v| (group.name.as_str(), v)))
             .collect();
         for hosts in ci.get_hosts() {
-            let variables = variables_by_group.get(hosts.name.as_str()).copied().cloned();
+            let variables = variables_by_group
+                .get(hosts.name.as_str())
+                .copied()
+                .cloned();
             reject_reserved_variables(&hosts.name, variables.as_ref())?;
             groups.push(ResolvedInventoryGroup::ManagedSsh {
                 hosts,

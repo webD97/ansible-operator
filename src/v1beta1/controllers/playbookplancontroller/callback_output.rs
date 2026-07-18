@@ -24,7 +24,15 @@ impl From<[u32; 7]> for HostStats {
     /// a *shape*-compatible edit that would silently misread an in-flight message, so don't
     /// reorder: only ever add/remove positions (which changes the length and fails to parse).
     fn from([ok, changed, unreachable, failed, skipped, rescued, ignored]: [u32; 7]) -> Self {
-        Self { ok, changed, unreachable, failed, skipped, rescued, ignored }
+        Self {
+            ok,
+            changed,
+            unreachable,
+            failed,
+            skipped,
+            rescued,
+            ignored,
+        }
     }
 }
 
@@ -108,6 +116,9 @@ mod tests {
 
         assert!(failed.is_failure());
         assert!(unreachable.is_failure());
-        assert!(!ok.is_failure(), "a rescued host with no failed/unreachable counts is a success");
+        assert!(
+            !ok.is_failure(),
+            "a rescued host with no failed/unreachable counts is a success"
+        );
     }
 }

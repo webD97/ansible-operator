@@ -4,8 +4,7 @@ use k8s_openapi::{api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::Owne
 use kube::runtime::reflector::Lookup;
 
 use crate::v1beta1::{
-    PlaybookPlan, ResolvedInventoryGroup, ansible,
-    controllers::reconcile_error::ReconcileError,
+    PlaybookPlan, ResolvedInventoryGroup, ansible, controllers::reconcile_error::ReconcileError,
     playbookplancontroller::paths,
 };
 

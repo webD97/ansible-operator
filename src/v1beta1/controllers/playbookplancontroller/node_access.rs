@@ -124,7 +124,7 @@ fn clamp_managed_ssh_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v1beta1::{ResolvedHosts, SshConfig, SecretRef};
+    use crate::v1beta1::{ResolvedHosts, SecretRef, SshConfig};
 
     fn managed(name: &str, hosts: &[&str]) -> ResolvedInventoryGroup {
         ResolvedInventoryGroup::ManagedSsh {
@@ -165,7 +165,10 @@ mod tests {
         let ResolvedInventoryGroup::ManagedSsh { hosts, .. } = &groups[0] else {
             panic!("expected managed-ssh group to survive");
         };
-        assert_eq!(hosts.hosts, vec!["node-a".to_string(), "node-c".to_string()]);
+        assert_eq!(
+            hosts.hosts,
+            vec!["node-a".to_string(), "node-c".to_string()]
+        );
     }
 
     #[test]
@@ -186,7 +189,10 @@ mod tests {
 
         assert!(dropped.is_empty());
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].hosts().hosts, vec!["host.example.com".to_string()]);
+        assert_eq!(
+            groups[0].hosts().hosts,
+            vec!["host.example.com".to_string()]
+        );
     }
 
     #[test]
@@ -198,6 +204,10 @@ mod tests {
         let dropped = clamp_managed_ssh_groups(&mut groups, &allowed(&["node-a"]));
 
         assert_eq!(dropped, vec!["node-b".to_string()]);
-        assert_eq!(groups.len(), 2, "the ssh group survives alongside the clamped managed one");
+        assert_eq!(
+            groups.len(),
+            2,
+            "the ssh group survives alongside the clamped managed one"
+        );
     }
 }

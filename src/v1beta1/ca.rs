@@ -44,7 +44,11 @@ impl CertificateAuthority {
         subject_public_key: &PublicKey,
         principal: &str,
     ) -> Result<String, CaError> {
-        self.sign(subject_public_key, &[principal], certificate::CertType::Host)
+        self.sign(
+            subject_public_key,
+            &[principal],
+            certificate::CertType::Host,
+        )
     }
 
     /// Signs a fresh client certificate valid for every principal in `principals`, for
@@ -74,8 +78,12 @@ impl CertificateAuthority {
             .as_secs();
         let valid_before = now + CERT_VALIDITY.as_secs();
 
-        let mut builder =
-            certificate::Builder::new_with_random_nonce(&mut OsRng, subject_public_key, now, valid_before)?;
+        let mut builder = certificate::Builder::new_with_random_nonce(
+            &mut OsRng,
+            subject_public_key,
+            now,
+            valid_before,
+        )?;
         builder.cert_type(cert_type)?;
         for principal in principals {
             builder.valid_principal(*principal)?;

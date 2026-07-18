@@ -463,7 +463,9 @@ mod tests {
 
     use super::{selector_matches, selector_matches_fail_closed};
 
-    fn labels(pairs: impl IntoIterator<Item = (&'static str, &'static str)>) -> BTreeMap<String, String> {
+    fn labels(
+        pairs: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> BTreeMap<String, String> {
         pairs
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -490,7 +492,10 @@ mod tests {
             match_labels: Some(label_selector([])),
             match_expressions: Some(vec![]),
         };
-        assert!(!selector_matches_fail_closed(&labels([("a", "1")]), &empty_map));
+        assert!(!selector_matches_fail_closed(
+            &labels([("a", "1")]),
+            &empty_map
+        ));
     }
 
     #[test]
@@ -499,8 +504,14 @@ mod tests {
             match_labels: Some(label_selector([("node-pool", "business")])),
             match_expressions: None,
         };
-        assert!(selector_matches_fail_closed(&labels([("node-pool", "business")]), &sel));
-        assert!(!selector_matches_fail_closed(&labels([("node-pool", "platform")]), &sel));
+        assert!(selector_matches_fail_closed(
+            &labels([("node-pool", "business")]),
+            &sel
+        ));
+        assert!(!selector_matches_fail_closed(
+            &labels([("node-pool", "platform")]),
+            &sel
+        ));
 
         // "Allow all" must be expressed explicitly, e.g. Exists on a ubiquitous label.
         let all = NodeSelectorTerm {
@@ -511,7 +522,13 @@ mod tests {
                 values: None,
             }]),
         };
-        assert!(selector_matches_fail_closed(&labels([("kubernetes.io/hostname", "n1")]), &all));
-        assert!(!selector_matches_fail_closed(&labels([("other", "x")]), &all));
+        assert!(selector_matches_fail_closed(
+            &labels([("kubernetes.io/hostname", "n1")]),
+            &all
+        ));
+        assert!(!selector_matches_fail_closed(
+            &labels([("other", "x")]),
+            &all
+        ));
     }
 }

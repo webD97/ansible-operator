@@ -15,7 +15,8 @@ use kube::{
 use tracing::error;
 
 use crate::v1beta1::{
-    self, ClusterInventory, ClusterInventoryStatus, clusterinventorycontroller::mappers,
+    self, ClusterInventory, ClusterInventoryStatus,
+    clusterinventorycontroller::mappers,
     controllers::{nodeselector::node_matches, reconcile_error::ReconcileError},
 };
 

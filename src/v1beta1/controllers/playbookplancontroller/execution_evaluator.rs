@@ -261,8 +261,7 @@ mod tests {
         let workers = serde_json::json!({ "ansible_python_interpreter": "/usr/bin/python3" });
         let edge = serde_json::json!({ "ansible_python_interpreter": "/usr/bin/python2" });
 
-        let with_vars =
-            base.fold_inventory_variables([("workers", &workers), ("edge", &edge)]);
+        let with_vars = base.fold_inventory_variables([("workers", &workers), ("edge", &edge)]);
         // Folding real variables changes the hash...
         assert_ne!(base, with_vars);
         // ...but the group order does not matter.

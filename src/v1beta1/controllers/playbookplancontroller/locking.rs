@@ -237,7 +237,10 @@ pub fn renewal_decision(existing: Option<&Lease>, holder_identity: &str) -> Rene
         };
     };
 
-    let holder = lease.spec.as_ref().and_then(|s| s.holder_identity.as_deref());
+    let holder = lease
+        .spec
+        .as_ref()
+        .and_then(|s| s.holder_identity.as_deref());
     match holder {
         Some(other) if other != holder_identity => RenewalAction::Lost {
             holder: other.to_string(),
@@ -279,7 +282,10 @@ pub async fn renew_locks(
                 lease.metadata.resource_version = resource_version.clone();
 
                 let result = match resource_version {
-                    Some(_) => api.replace(&name, &PostParams::default(), &lease).await.map(drop),
+                    Some(_) => api
+                        .replace(&name, &PostParams::default(), &lease)
+                        .await
+                        .map(drop),
                     None => api.create(&PostParams::default(), &lease).await.map(drop),
                 };
 
