@@ -123,13 +123,15 @@ out of date because it has no recorded hash of its own.
 - When you edit the playbook or change a referenced variables/files Secret, the hash changes **at
   once**: the operator watches the plan and the Secrets it names, so the desired hash, run numbering
   and [consumed schedule slot](#one-tick-one-run-per-revision) update on the spot.
-- Changing an inventory's group variables changes the hash too, but **not at once**. The operator
-  does not watch `ClusterInventory` or `StaticInventory` resources, so the plan picks such a change
-  up at its next reconcile — which is seconds away for a plan with a run in flight, the next
-  scheduled tick for a `Recurring` plan (when it would re-apply anyway), and up to an hour for an
-  idle `OneShot` plan that has settled. The same delay applies to the hosts a group resolves to, for
-  the same reason. If you need the change applied now, touch the plan itself: any edit to it, an
-  annotation included, wakes it immediately.
+- Changing an inventory's group variables changes the hash at once too, and for the same reason —
+  the operator watches the `ClusterInventory` and `StaticInventory` resources a plan names. The same
+  goes for the hosts a group resolves to: a Node joining, leaving or being relabelled updates the
+  `ClusterInventory`'s `.status.resolvedHosts` within seconds, and that update reaches every plan
+  built on it immediately.
+- Being woken is not the same as running. What updates on the spot is the plan's *view* — its
+  desired hash, `.status.eligibleHosts` and summary. Whether a run then starts is still the
+  schedule's decision: an unscheduled `OneShot` plan starts one right away, while a scheduled plan
+  of either mode waits for its next tick.
 - An in-flight run keeps its own hash, target inventory, run number, and schedule slot in an
   immutable `Play`, so none of these edits disturb it — see [Editing a plan while a run is in
   flight](#editing-a-plan-while-a-run-is-in-flight).
@@ -137,6 +139,64 @@ out of date because it has no recorded hash of its own.
 This is what makes `OneShot` idempotent and cheap: editing an unrelated field does not re-run
 everything, but a real change to the playbook or its inputs does. The current hash is visible as
 `.status.currentHash` and in the `Current hash` printer column.
+
+### What wakes a plan
+
+A plan is re-evaluated whenever one of the things it is built from changes, and otherwise on a
+timer. The watched inputs are:
+
+| Change | Reaches the plan |
+|---|---|
+| The `PlaybookPlan` itself | at once |
+| A Secret it names in `variables` or `files` | at once |
+| A `ClusterInventory` or `StaticInventory` it names — including the Nodes a `ClusterInventory` resolves to | at once |
+| A `NodeAccessPolicy` (which may change [which Nodes the namespace may target](../cluster-operators/node-access-policies.md)) | at once |
+| A Node it is still waiting on becoming `Ready` | at once, for a `OneShot` plan |
+| A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
+| The run's Job finishing | at once |
+| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan |
+
+"Still waiting on" is narrower than "not current". For a host whose `lastAppliedHash` differs from
+the current hash, a Node turning `Ready` wakes a plan if it has never run against that host, left it
+[unreachable](./cluster-nodes.md#holding-instead-of-starting), could not read its recap, or last
+succeeded on an older revision. It does **not** wake a plan for a host left `Failed`, `NotReached`,
+or `Incomplete`: none of those outcomes says that host's own Node returning to `Ready` can unblock
+the plan. See the [per-host outcome table](./results-and-troubleshooting.md#per-host-outcomes) for
+their distinct causes.
+
+It also asks whether the *plan* could act on the wake-up at all, which is a separate question from
+what its hosts need. Three answers say it could not, and none of them is something a Node supplies:
+
+- a **suspended** plan is waiting on you, not on a machine, so no Node wakes it however outdated its
+  hosts are — resuming it is what starts the run.
+- a `OneShot` plan that has spent its [attempts](#retries) may not start another run, so a Node
+  turning `Ready` under it changes nothing until the budget comes back — which an edit, a
+  `StaticInventory` SSH key rotation or a successful run does, and each of those has its own row in
+  the table above.
+- a **`Recurring`** plan is started by its schedule and by nothing else, so a Node is never what it
+  is waiting for: it runs at its next tick against whatever it can reach then, and it is never
+  [held](./cluster-nodes.md#holding-instead-of-starting) in the meantime. A Node returning early
+  brings its tick no closer.
+
+The SSH key row is deliberately one-sided. Rotating a key changes how the operator connects, not what
+it applies, so it must never re-apply the playbook to hosts that are already current — which is why
+the key is not part of the execution hash, and the hash is what decides which hosts are outdated. A
+plan that succeeded therefore ignores the rotation entirely.
+
+A plan whose last run **failed** is the opposite case: the old key may well be why it failed, so
+rotating it is a fix. Because that plan has usually spent its [attempts](#retries) by then — a
+`StaticInventory` host has no proxy wait in front of it, so the tries burn in seconds — waking it
+alone would achieve nothing, and the rotation restores the plan's attempt budget as well. The run
+that follows still only targets the hosts that are not up to date, since `lastAppliedHash` is
+untouched.
+
+Two details worth knowing:
+
+- **The first key a plan ever sees is not a rotation.** A plan created before this behaviour existed,
+  or one reaching a `StaticInventory` for the first time, records the key it finds without acting on
+  it. Only a *change* from a key the plan already recorded counts.
+- **A rotation during a run waits for it.** The run in flight finishes against the key it started
+  with, and the rotation is acted on once its result is in.
 
 ## Editing a plan while a run is in flight
 
@@ -225,7 +285,10 @@ What the budget covers depends on the mode, because what counts as "the same pie
   out of date precisely *because* the runs failed, so nothing else would stop it. Editing the
   playbook or a referenced Secret changes the execution hash and hands it a fresh budget; so does
   raising `maxAttempts`. A successful run also closes that execution and resets the budget, so hosts
-  added to the inventory later can run without an unrelated plan edit. A `schedule` does not reset a
+  added to the inventory later can run without an unrelated plan edit — and so does a run whose only
+  non-successes were hosts on Nodes that were already `NotReady` when it launched, since every host
+  it could reach did succeed (see [Unreachable Nodes and the attempt
+  budget](./cluster-nodes.md#unreachable-nodes-and-the-attempt-budget)). A `schedule` does not reset a
   failed execution: it says when a `OneShot` plan may run, not how often it may fail.
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried

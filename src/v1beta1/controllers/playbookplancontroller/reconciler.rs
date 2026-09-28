@@ -3,7 +3,7 @@ use futures_util::{Stream, StreamExt as _};
 use k8s_openapi::api::{
     batch::v1::Job,
     coordination::v1::Lease,
-    core::v1::{Pod, Secret},
+    core::v1::{Node, Pod, Secret},
     networking::v1::NetworkPolicyEgressRule,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -11,7 +11,7 @@ use kube::{
     Api,
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions},
     runtime::{
-        Controller,
+        Controller, WatchStreamExt as _,
         controller::Action,
         reflector::{ObjectRef, Store, store::Writer},
         watcher,
@@ -36,11 +36,14 @@ use crate::{
     v1beta1::{
         self, PlaybookPlan,
         ca::CertificateAuthority,
-        controllers::reconcile_error::{ReconcileError, is_conflict, is_not_found},
+        controllers::{
+            reconcile_error::{ReconcileError, is_conflict, is_not_found},
+            watch_backoff::WatchBackoff,
+        },
         playbookplancontroller::{
             callback_output,
             execution_evaluator::{self, find_outdated_hosts},
-            job_builder, mappers, node_access, play_history, status,
+            job_builder, mappers, node_access, node_readiness, play_history, status,
         },
     },
 };
@@ -56,6 +59,38 @@ const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 /// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
 /// the remainder of its tick's `startingDeadlineSeconds` window to start in.
 const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long [`new`] waits for the Node cache's initial LIST before taking the process down with it.
+///
+/// Deliberately generous, because the two ways of getting it wrong are not symmetric: too short
+/// crash-loops an operator that would have synced a moment later, taking down a working install,
+/// while too long only prolongs a state that is already broken. It has to sit comfortably above a
+/// *healthy* sync and nothing more — that is one unpaginated Node LIST at roughly 10 KB per Node, so
+/// single-digit seconds even at a thousand of them.
+///
+/// Two minutes is the value controller-runtime uses for the same question (its `CacheSyncTimeout`),
+/// and it composes with Kubernetes' crash-loop backoff rather than fighting it: a transient cause —
+/// the chart's ClusterRole landing after the Deployment, an apiserver rolling — clears itself on a
+/// later restart with nobody involved, while a permanent one shows as `CrashLoopBackOff` within a
+/// couple of minutes with the reason in the log. A knob here would only invite tuning a number whose
+/// single job is to be far above any healthy sync.
+const NODE_CACHE_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How many consecutive Node watch failures stop looking like a blip, after which the log says what
+/// the failure *costs* rather than only that it happened.
+///
+/// The watcher backs off exponentially, so this is reached in tens of seconds rather than
+/// immediately, which is what keeps an apiserver rolling upgrade from tripping it. It changes no
+/// behaviour — see [`await_node_cache`] for why the operator does not act on this the way it acts on
+/// a cache that never synced at all.
+const NODE_WATCH_FAILURES_BEFORE_ESCALATING: u32 = 5;
+
+/// How often the detailed Node watch line is repeated while the watch stays broken.
+///
+/// Once its delay has grown the watcher fails every 30–60 s, so the detailed line on every failure
+/// would be the same few hundred characters twice a minute for as long as the outage lasts. Logged
+/// only once, it scrolls out of whatever window an admin reads with `kubectl logs --since`, leaving
+/// bare watch errors that do not say what they cost.
+const NODE_WATCH_ESCALATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 pub struct WorkloadEgressPolicies {
     pub playbook: Option<Vec<NetworkPolicyEgressRule>>,
@@ -81,6 +116,12 @@ struct ReconciliationContext {
     /// Populated + kept fresh by the reflector spawned in `new`; policy edits also re-trigger
     /// affected plans via `mappers::node_access_policy_to_playbookplans`.
     node_access_policies: Arc<Store<NodeAccessPolicy>>,
+    /// Reflector-backed cache of cluster Nodes, backing the Node watch that wakes a plan when a
+    /// host it is waiting on becomes `Ready`. Read only for *readiness*
+    /// (`node_readiness::unready_nodes`), never for authorization: `node_access::enforce` keeps its
+    /// own live read, because the allow-set is a security gate and must not be served from a cache
+    /// (INV-5).
+    nodes: Arc<Store<Node>>,
     /// Image for the managed-ssh proxy pods (the node-root primitive — THREAT_MODEL T-ESC-5). Set by
     /// the admin via the chart's `managedSsh.proxyImage` (rendered to `proxy_image`); there is **no
     /// built-in default** — the operator refuses to start without it (see `config::require_proxy_image`
@@ -118,7 +159,13 @@ struct SchedulingConfiguration {
     schedule: Option<Schedule>,
 }
 
-pub fn new(
+/// Builds the PlaybookPlan controller's event stream.
+///
+/// Async because it does not hand back a controller until its Node cache has completed its initial
+/// LIST — see the wait below for why the first reconcile must not run without it. Nothing else here
+/// blocks, and the caller drives this as a future of its own so the wait does not hold up the other
+/// controllers.
+pub async fn new(
     client: kube::Client,
     operator_namespace: String,
     enrolled_namespaces: std::collections::BTreeSet<String>,
@@ -138,6 +185,14 @@ pub fn new(
     let playbookplans_api: Api<v1beta1::PlaybookPlan> = Api::all(client.clone());
     // NodeAccessPolicy is cluster-scoped (admin-authored via cluster RBAC); cache/watch all of them.
     let node_access_policies_api: Api<NodeAccessPolicy> = Api::all(client.clone());
+    // Both inventory kinds are namespaced but watched cluster-wide for the same reason plans are:
+    // CRD reads stay cluster-wide (R1), and an inventory in a non-enrolled namespace can only ever
+    // map to a plan there, which the enrollment guard refuses anyway.
+    let cluster_inventories_api: Api<ClusterInventory> = Api::all(client.clone());
+    let static_inventories_api: Api<StaticInventory> = Api::all(client.clone());
+    // Nodes are cluster-scoped, and the operator already reads them for inventory resolution and
+    // policy enforcement.
+    let nodes_api: Api<Node> = Api::all(client.clone());
 
     let enrolled_namespaces = Arc::new(enrolled_namespaces);
 
@@ -147,7 +202,13 @@ pub fn new(
 
         let playbookplan_reflector = kube::runtime::reflector(
             playbookplan_reflector_writer,
-            watcher(playbookplans_api.clone(), watcher::Config::default()),
+            // Every reflector in this function needs the backoff, and nothing else supplies one: a
+            // bare `watcher` re-lists on the very next poll after an error, `Controller::run` backs
+            // off only its own trigger streams, and these run in tasks of their own. Without it a
+            // persistent failure — a revoked grant, an apiserver refusing the watch — re-LISTs the
+            // whole collection as fast as the requests come back, and logs a line each time.
+            watcher(playbookplans_api.clone(), watcher::Config::default())
+                .backoff(WatchBackoff::default()),
         );
 
         tokio::spawn(async move {
@@ -170,7 +231,8 @@ pub fn new(
 
         let reflector = kube::runtime::reflector(
             writer,
-            watcher(node_access_policies_api.clone(), watcher::Config::default()),
+            watcher(node_access_policies_api.clone(), watcher::Config::default())
+                .backoff(WatchBackoff::default()),
         );
 
         tokio::spawn(async move {
@@ -186,22 +248,124 @@ pub fn new(
         reader
     };
 
+    // Needed only by `mappers::ssh_secret_to_playbookplans`, which has to walk Secret ->
+    // StaticInventory -> plan and so cannot answer from the plan store alone. Cheap where the Node
+    // reflector is not: StaticInventories are few, small, and edited by hand.
+    let static_inventory_reflector_reader = {
+        let writer = Writer::<StaticInventory>::default();
+        let reader = Arc::new(writer.as_reader());
+
+        let reflector = kube::runtime::reflector(
+            writer,
+            watcher(static_inventories_api.clone(), watcher::Config::default())
+                .backoff(WatchBackoff::default()),
+        );
+
+        tokio::spawn(async move {
+            reflector
+                .for_each(|event| async {
+                    if let Err(e) = event {
+                        error!("StaticInventory reflector error: {e:?}");
+                    }
+                })
+                .await;
+        });
+
+        reader
+    };
+
+    // One reflector serves both jobs the Node watch has: deciding which plans an event concerns
+    // (`mappers::node_to_playbookplans`, which reads the watched object itself) and answering
+    // "is this host reachable at all?" while a tick decides whether to start a run.
+    let node_reflector_reader = {
+        let writer = Writer::<Node>::default();
+        let reader = Arc::new(writer.as_reader());
+
+        let reflector = kube::runtime::reflector(
+            writer,
+            watcher(nodes_api.clone(), watcher::Config::default()).backoff(WatchBackoff::default()),
+        );
+
+        tokio::spawn(async move {
+            // Unlike the three reflectors above, this one's failures are worth counting: those feed
+            // triggers, where a failed watch delays a reconcile, while this one feeds a *decision*
+            // that is taken from the cache whether or not it is still being updated. A `Store` keeps
+            // serving its last contents for the life of the process, so a watch that stays broken
+            // is invisible from the reading side — and the one line per attempt that a
+            // backed-off watcher produces reads the same whether it recovers a second later or
+            // never recovers at all.
+            let mut failures = NodeWatchFailures::default();
+            reflector
+                .for_each(|event| {
+                    match failures.observe(event, std::time::Instant::now()) {
+                        NodeWatchLog::Nothing => {}
+                        NodeWatchLog::Failure(error) => error!("Node reflector error: {error:?}"),
+                        NodeWatchLog::Escalation {
+                            consecutive_failures,
+                            error,
+                        } => error!(
+                            "Node watch has failed {consecutive_failures} times running: {error:?}. The Node cache is no longer being updated, so the OneShot readiness gate is answering from whatever it last saw — a Node that goes down from here on will read Ready, and a plan held for one that comes back will not be released until its hourly requeue. Check that the operator's ClusterRole still grants list/watch on nodes, and that the apiserver is reachable"
+                        ),
+                        NodeWatchLog::Recovery {
+                            consecutive_failures,
+                        } => info!(
+                            "Node watch recovered after {consecutive_failures} consecutive failures; the Node cache is being updated again"
+                        ),
+                    }
+                    std::future::ready(())
+                })
+                .await;
+        });
+
+        reader
+    };
+
+    // The only thing this constructor waits for.
+    await_node_cache(&node_reflector_reader).await;
+
     let context = Arc::new(ReconciliationContext {
         client: client.clone(),
         operator_namespace,
         enrolled_namespaces: Arc::clone(&enrolled_namespaces),
         ca,
         node_access_policies: Arc::clone(&node_access_policy_reflector_reader),
+        nodes: Arc::clone(&node_reflector_reader),
         proxy_image,
         proxy_grace,
         workload_egress_policies,
     });
 
-    let mut controller = Controller::new(playbookplans_api, watcher::Config::default()).watches(
-        node_access_policies_api,
-        watcher::Config::default(),
-        mappers::node_access_policy_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
-    );
+    // The inventory watches close the gap between what a tick *reads* and what starts one:
+    // `resolve_inventory` reads both kinds live on every tick, so their contents were always fresh
+    // whenever a reconcile happened — but nothing made one happen. A `ClusterInventory` that gained
+    // a Node therefore reached its plans only on their next requeue (an hour for an idle `OneShot`
+    // plan, the next slot for a scheduled one), and a `StaticInventory` edit had no path at all.
+    let mut controller = Controller::new(playbookplans_api, watcher::Config::default())
+        .watches(
+            node_access_policies_api,
+            watcher::Config::default(),
+            mappers::node_access_policy_to_playbookplans(Arc::clone(
+                &playbookplan_reflector_reader,
+            )),
+        )
+        .watches(
+            cluster_inventories_api,
+            watcher::Config::default(),
+            mappers::cluster_inventory_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
+        .watches(
+            static_inventories_api,
+            watcher::Config::default(),
+            mappers::static_inventory_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        )
+        // The Node watch is what releases a plan held by `hold_for_unready_nodes`. Its mapper is
+        // narrow on purpose — see `mappers::node_to_playbookplans` for why a converged cluster must
+        // not pay for every kubelet's periodic status repost.
+        .watches(
+            nodes_api,
+            watcher::Config::default(),
+            mappers::node_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+        );
 
     // Owned-Job and referenced-Secret watches are set up per enrolled namespace instead of once
     // cluster-wide: the operator holds `jobs`/`secrets` RBAC only in these namespaces (R1), so a
@@ -216,7 +380,10 @@ pub fn new(
             .watches(
                 secrets_api,
                 watcher::Config::default(),
-                mappers::secret_to_playbookplans(Arc::clone(&playbookplan_reflector_reader)),
+                mappers::secret_to_affected_playbookplans(
+                    Arc::clone(&playbookplan_reflector_reader),
+                    Arc::clone(&static_inventory_reflector_reader),
+                ),
             );
     }
 
@@ -225,6 +392,128 @@ pub fn new(
         |_, _, _| Action::requeue(std::time::Duration::from_secs(15)),
         Arc::clone(&context),
     )
+}
+
+/// Blocks until the Node reflector has served its initial LIST, and **panics** if it never does.
+///
+/// The wait itself is what `node_readiness` depends on: an unsynced cache reports every node
+/// `Ready`, because [`node_readiness::unready_nodes`] reads a miss as "no such Node". That is
+/// precisely the answer that starts the runs a held plan exists to hold back — each one taking its
+/// hosts' Leases, creating a node-root proxy pod per host, waiting out the full grace window
+/// (default 600s) while blocking every other plan on those hosts, and then reporting them all
+/// unreachable. Without this wait that is what an operator restart costs every held plan.
+///
+/// **Failing to sync is fatal, not degraded, and that is the whole reason for the panic.**
+/// `Store::wait_until_ready` resolves on exactly two events — the cache is populated, or the writer
+/// is dropped — and a `watcher` retries a failing watch forever, so an apiserver that never answers
+/// leaves this pending for the life of the process. Since `main` builds this controller inside its
+/// own future, the other two would carry on and the operator would look healthy while every plan in
+/// the cluster silently stopped moving, with only the reflector task's own log line to say why.
+/// Crashing is louder, and it recovers on its own if the cause was transient.
+///
+/// A dropped writer is fatal for the same reason and not merely a warning: the writer lives in the
+/// reflector task, so losing it means the cache will never populate *and* never update again.
+///
+/// **This bounds the first sync only, and the same failure after it is not covered.** A watch that
+/// breaks once the cache is populated leaves the `Store` serving its last contents indefinitely, so
+/// the gate keeps answering — from a snapshot. The effect is the pre-gate behaviour the branch was
+/// written to remove, arriving quietly: a Node that goes down afterwards still reads `Ready`, so a
+/// run starts against it, takes its hosts' Leases, waits out the grace window and reports everything
+/// unreachable; and a held plan is released by nothing but its hourly requeue.
+///
+/// It is deliberately not treated the same way, because the two failures are not alike. Here there
+/// is no answer at all and never has been, so refusing to start is strictly better than guessing.
+/// There, the operator is running with an answer that was true a moment ago and degrades from there,
+/// and every way of acting on that trades one failure for another: crashing turns a self-healing
+/// apiserver blip into a restart loop, and holding every run instead would stop a fleet on the
+/// strength of a watch error. Which trade is right is a decision nobody has had to make yet, so the
+/// reflector task escalates its log after [`NODE_WATCH_FAILURES_BEFORE_ESCALATING`], repeats it
+/// every [`NODE_WATCH_ESCALATION_INTERVAL`] and says when the watch recovers, and nothing more —
+/// making the state loud, which is the half that was missing, without picking a trade on a
+/// cluster's behalf.
+async fn await_node_cache(nodes: &Store<Node>) {
+    match tokio::time::timeout(NODE_CACHE_SYNC_TIMEOUT, nodes.wait_until_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!(
+            "the Node reflector stopped before its initial sync ({error}); the PlaybookPlan \
+             controller cannot judge node readiness without it"
+        ),
+        Err(_elapsed) => panic!(
+            "timed out after {}s waiting for the initial Node list; the PlaybookPlan controller \
+             cannot judge node readiness without it. Check that the operator's ClusterRole still \
+             grants list/watch on nodes, and that the apiserver is reachable",
+            NODE_CACHE_SYNC_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// The Node reflector task's view of its own watch: how many failures have run together since the
+/// cache was last updated, and when the detailed line about them was last logged.
+#[derive(Default)]
+struct NodeWatchFailures {
+    consecutive: u32,
+    /// `Some` for as long as the current run of failures has been escalated.
+    last_escalated: Option<std::time::Instant>,
+}
+
+/// What the Node reflector task logs for one watch event.
+enum NodeWatchLog {
+    Nothing,
+    /// The bare watch error: a failure that still looks like a blip, or one that falls between two
+    /// detailed lines.
+    Failure(watcher::Error),
+    /// The detailed line: the cache has stopped updating, and what that costs.
+    Escalation {
+        consecutive_failures: u32,
+        error: watcher::Error,
+    },
+    /// The cache is being updated again after an escalated run of failures. Reported on the first
+    /// event that updates it, which after a resumed watch is the next Node change, so it can trail
+    /// the reconnect by up to a kubelet's status report interval.
+    Recovery {
+        consecutive_failures: u32,
+    },
+}
+
+impl NodeWatchFailures {
+    fn observe(
+        &mut self,
+        event: Result<watcher::Event<Node>, watcher::Error>,
+        now: std::time::Instant,
+    ) -> NodeWatchLog {
+        match event {
+            // Neither proves the cache is being updated: a watcher whose re-LIST keeps failing
+            // yields `Init` before every attempt, and `InitApply` only fills the buffer that
+            // `InitDone` swaps in.
+            Ok(watcher::Event::Init | watcher::Event::InitApply(_)) => NodeWatchLog::Nothing,
+            Ok(_) => {
+                let consecutive_failures = std::mem::take(&mut self.consecutive);
+                if self.last_escalated.take().is_some() {
+                    NodeWatchLog::Recovery {
+                        consecutive_failures,
+                    }
+                } else {
+                    NodeWatchLog::Nothing
+                }
+            }
+            Err(error) => {
+                self.consecutive += 1;
+                let due = self.consecutive >= NODE_WATCH_FAILURES_BEFORE_ESCALATING
+                    && self
+                        .last_escalated
+                        .is_none_or(|at| now.duration_since(at) >= NODE_WATCH_ESCALATION_INTERVAL);
+                if due {
+                    self.last_escalated = Some(now);
+                    NodeWatchLog::Escalation {
+                        consecutive_failures: self.consecutive,
+                        error,
+                    }
+                } else {
+                    NodeWatchLog::Failure(error)
+                }
+            }
+        }
+    }
 }
 
 /// Reconciles one PlaybookPlan. Level-triggered/idempotent "ensure" style — every step re-derives
@@ -361,6 +650,12 @@ async fn reconcile(
                 status,
                 surviving,
             } => {
+                // A recovered result has only its `Play` to speak from, so the overflow half of
+                // `RunDiagnostic` is not reconstructible here — the raw termination message that
+                // carried it is long gone, and an overflowed recap is recorded exactly like a
+                // crashed one. Such a run reports the plain unreadable-recap outcome.
+                let diagnostic = RunDiagnostic::from_play_status(&status);
+                diagnostic.warn(namespace, name, &finished.mirror.job_name);
                 status::apply_terminal_play_status(
                     &finished.execution_hash,
                     &status,
@@ -382,7 +677,9 @@ async fn reconcile(
                     record: TerminalRecord::Present,
                 });
                 finished_active_run = Some(FinishedRun {
-                    outcome: status.phase,
+                    failure: classify_run_failure(&status),
+                    verdict: phase_for_finished_run(&status),
+                    diagnostic,
                     run: finished,
                 });
                 surviving_run = surviving;
@@ -462,7 +759,9 @@ async fn reconcile(
             }
             ActiveRunProgress::Finished {
                 run: finished,
-                outcome,
+                verdict,
+                failure,
+                diagnostic,
                 record,
             } => {
                 resource_status.summary =
@@ -474,7 +773,9 @@ async fn reconcile(
                 });
                 finished_active_run = Some(FinishedRun {
                     run: finished,
-                    outcome,
+                    verdict,
+                    failure,
+                    diagnostic,
                 });
                 // This *was* the run a drained result was still waiting behind, and it has now
                 // finished too, so the plan may be classified on its own terms after all.
@@ -624,7 +925,7 @@ async fn reconcile(
             &execution_hash,
             &object.spec.mode,
             &finished.run,
-            &finished.outcome,
+            &finished.failure,
             surviving_run.as_deref(),
         );
     } else {
@@ -632,6 +933,33 @@ async fn reconcile(
     }
     if resource_status.active_run.is_some() {
         resource_status.phase = Phase::Applying;
+    }
+
+    // Read alongside the execution hash but deliberately kept out of it — see
+    // `PlaybookPlanStatus::observed_ssh_key_revision`. Placed before the start gate so a rotation
+    // that hands the budget back takes effect on this tick rather than the next one, which is what
+    // makes rotating a key an actual fix for a plan its hosts locked out.
+    //
+    // Skipped entirely while a run is in flight, because `sync_ssh_key_revision` would discard the
+    // answer anyway: it neither resets the budget nor records the revision mid-run, precisely so the
+    // rotation is still there to be noticed once the run drains. Reading it regardless cost a Secret
+    // GET per Secret per tick, and a run waiting on its proxy pods ticks every 5s for up to the
+    // whole grace window. `active_run` already carries this tick's post-drain value, so the tick a
+    // run finishes on still observes.
+    let observed_ssh_key_revision = if resource_status.active_run.is_none() {
+        observe_ssh_key_revision(&target_groups, &secrets_api).await
+    } else {
+        None
+    };
+    if sync_ssh_key_revision(
+        &mut resource_status,
+        &object.spec.mode,
+        observed_ssh_key_revision.as_deref(),
+    ) {
+        info!(
+            "PlaybookPlan {namespace}/{name}: the SSH key its StaticInventory hosts are reached \
+             with has changed and its last run did not succeed — restoring its attempt budget"
+        );
     }
 
     // Step 1: compute outdated hosts and evaluate the schedule.
@@ -693,6 +1021,30 @@ async fn reconcile(
     // Filter the resolved inventory to this run's hosts once, preserving the user's groups, so the
     // Job/proxy/render path and the Play history record share one grouped view.
     let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
+
+    // Which of this run's cluster nodes are down, and whether that leaves it nothing to do. Both are
+    // computed here, before the start gate, because the *nodes* are what a held plan reports waiting
+    // on and what its Node watch will wake it for. A `Recurring` plan is deliberately not held: its
+    // contract is to re-apply at each tick against whatever exists then, so a tick that can only
+    // reach some of its hosts still reaches them and reports the rest unreachable.
+    let unready_nodes = node_readiness::unready_nodes(&context.nodes, &run_groups);
+    let hold_for_unready_nodes =
+        held_back_by_unready_nodes(&timing, &object.spec.mode, &run_groups, &unready_nodes);
+    if !hold_for_unready_nodes && status::held_for_unready_nodes(&resource_status) {
+        // Retires a hold this plan is no longer under, whatever ended it — the nodes came back, the
+        // inventory moved on, its schedule window closed. Written here rather than only where a hold
+        // is released, because every one of those paths leaves the tick somewhere different, and a
+        // `WaitingForNodes` left standing over a plan that is running would be read as the reason it
+        // is not.
+        //
+        // Only ever *this* hold, which is what the second half asks: the condition is shared with
+        // the proxy-pod wait that a run later in this tick may re-assert, and clearing that one here
+        // would restamp its `lastTransitionTime` on every tick of the wait — see
+        // `status::held_for_unready_nodes`. Nothing else needs the unconditional clear; the paths
+        // that end a proxy wait (`ensure_infra_and_launch`, `clear_run_conditions`) each clear it
+        // themselves.
+        release_node_readiness_hold(&mut resource_status, outdated_hosts.len());
+    }
 
     // Plain `?`, unlike the desired-input reads above: this hashes two already-deserialized values,
     // so it has no cluster state to fail against and nothing to hold a recovered run open for.
@@ -865,7 +1217,7 @@ async fn reconcile(
         ) {
             // The result stands even though the next run is already due: it is what the plan last
             // did, and `nextRun` is what says another one is coming.
-            resource_status.phase = phase_for_finished_run(&finished.outcome);
+            resource_status.phase = finished.verdict.clone();
             resource_status.next_run = match timing {
                 Timing::Now(start) => start.map(|start| start.fixed_offset()),
                 Timing::Delayed(_) => unreachable!("the guard only accepts Timing::Now"),
@@ -889,12 +1241,8 @@ async fn reconcile(
             let outcome = decide_terminal(
                 &object.spec.mode,
                 scheduling_configuration.schedule.as_ref(),
-                &finished.outcome,
-                retry_due(
-                    &phase_for_finished_run(&finished.outcome),
-                    resource_status.retry_count,
-                    max_attempts,
-                ),
+                &finished.verdict,
+                retry_due(&finished.verdict, resource_status.retry_count, max_attempts),
                 outdated_hosts.len(),
                 total_count,
                 now(),
@@ -924,6 +1272,13 @@ async fn reconcile(
                 requeue_after = duration_until(&until, now());
                 resource_status.phase = phase_while_waiting_for_schedule(&resource_status.phase);
                 resource_status.next_run = Some(until.fixed_offset());
+            }
+            // Every host this run would reach is on a node that is down, so there is nothing for it
+            // to do but wait — see `node_readiness::holds_for_unready_nodes`. Held before the slot
+            // bookkeeping below, so the window is left unconsumed and the run this plan owes can
+            // still start once the nodes report `Ready` and the watch wakes it.
+            Timing::Now(_) if hold_for_unready_nodes => {
+                hold_plan_for_unready_nodes(&mut resource_status, &unready_nodes);
             }
             Timing::Now(start) => {
                 let this_slot = start.map(|s| s.fixed_offset());
@@ -1015,6 +1370,13 @@ async fn reconcile(
     ) {
         requeue_after = requeue_after.min(until_next_run);
     }
+
+    apply_run_diagnostic(
+        &mut resource_status,
+        finished_active_run
+            .as_ref()
+            .map_or(RunDiagnostic::None, |finished| finished.diagnostic),
+    );
 
     finish_reconcile_tick(
         &context,
@@ -1235,6 +1597,12 @@ async fn schedule_window_already_taken(
 /// the status lags: the records are written before anything a run creates. The caller's
 /// `retryCountSlot`-scoped counter remains authoritative after those records are pruned, so retention
 /// cannot hand back tries the status says this slot already spent.
+///
+/// Only a failure that actually spent a try is counted, by the same [`returns_its_attempt`] the
+/// budget is reset by. A `OneShot` run that missed nothing but Nodes already down at its launch is
+/// `Failed` on its record, yet the budget handed its attempt back; counting it here anyway took
+/// back what the refund gave, so with `maxAttempts: 1` the Node's return inside the window found it
+/// closed and waited for the next tick.
 fn window_taken_by_a_record(
     plays: &[Play],
     plan: &PlaybookPlan,
@@ -1248,17 +1616,25 @@ fn window_taken_by_a_record(
         return false;
     };
     let mut failures = 0;
-    for play in plays.iter().filter(|play| {
-        play_history::play_belongs_to_plan(play, plan_name, uid)
-            && play.spec.triggered_slot == Some(slot)
-            && play.spec.execution_hash == desired_hash.to_string()
-    }) {
-        match play.status.as_ref().map(|status| &status.phase) {
+    for status in plays
+        .iter()
+        .filter(|play| {
+            play_history::play_belongs_to_plan(play, plan_name, uid)
+                && play.spec.triggered_slot == Some(slot)
+                && play.spec.execution_hash == desired_hash.to_string()
+        })
+        .filter_map(|play| play.status.as_ref())
+    {
+        match status.phase {
             // Still going, or done and done well: either way the window is not a retry's to take.
-            Some(v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded) => return true,
+            v1beta1::PlayPhase::Running | v1beta1::PlayPhase::Succeeded => return true,
             // `Unknown` counts as a failure here for the same reason it does everywhere else: a
             // recap that could not be read is not evidence the hosts were reached.
-            Some(v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown) => failures += 1,
+            v1beta1::PlayPhase::Failed | v1beta1::PlayPhase::Unknown
+                if !returns_its_attempt(&plan.spec.mode, &classify_run_failure(status)) =>
+            {
+                failures += 1;
+            }
             _ => {}
         }
     }
@@ -1380,7 +1756,7 @@ fn may_start_new_run(suspend: bool, has_work_to_start: bool, budget_available: b
 /// that silently stopped. A `Recurring` plan is going to re-apply the same playbook at the next
 /// tick anyway, so retrying inside the current one buys nothing by default and only makes a
 /// systematically failing playbook hammer its hosts.
-fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
+pub(super) fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
     configured
         .unwrap_or(match mode {
             ExecutionMode::OneShot => DEFAULT_ONESHOT_ATTEMPTS,
@@ -1404,7 +1780,19 @@ fn max_attempts(mode: &ExecutionMode, configured: Option<u32>) -> u32 {
 /// one schedule tick, and the gate that knows about ticks is the window gate below: a plan whose
 /// current tick is exhausted must still be free to start the next one, which is a run this gate
 /// cannot tell apart from a retry.
-fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts: u32) -> bool {
+///
+/// Shared with `mappers::plan_awaits_node`, for the same reason `status::may_need_another_run` is
+/// shared between the SSH-key mapper and its budget reset: a Node watch that woke plans this gate
+/// then turned away would be paying a full reconcile to learn what the cached object already said,
+/// and a second copy of the rule in the mapper is how the two would come to disagree. The
+/// `Recurring` arm is what makes it answerable there at all — the slot-scoped half of that mode's
+/// budget lives in the window gate, so nothing outside this function needs `retryCountSlot` to ask
+/// this question.
+pub(super) fn attempt_budget_available(
+    mode: &ExecutionMode,
+    tries_spent: u32,
+    max_attempts: u32,
+) -> bool {
     match mode {
         ExecutionMode::OneShot => tries_spent < max_attempts,
         ExecutionMode::Recurring => true,
@@ -1422,7 +1810,7 @@ fn attempt_budget_available(mode: &ExecutionMode, tries_spent: u32, max_attempts
 /// (`phase_for_finished_run`), so it says what the last run did rather than what the plan's drift
 /// state implies — which for a `Recurring` failure is nothing at all.
 fn retry_due(phase: &Phase, tries_spent: u32, max_attempts: u32) -> bool {
-    phase == &Phase::Failed && tries_spent < max_attempts
+    is_failure_verdict(phase) && tries_spent < max_attempts
 }
 
 /// Whether the persisted attempt budget proves that the current schedule window has no run left to
@@ -1437,6 +1825,25 @@ fn retry_budget_closes_window(
     tries_spent > 0
         && slot_already_triggered(current_slot, budget_slot)
         && !retry_due(phase, tries_spent, max_attempts)
+}
+
+/// Whether a finished run hands its attempt back instead of spending it.
+///
+/// Only `OneShot` ever does, in two cases:
+///
+///   - it succeeded. The execution is complete, and resetting its budget is what lets inventory
+///     growth trigger a new run for hosts that were not present in it.
+///   - nothing the operator could reach failed either ([`RunFailure::OnlyUnreachableNodes`]), so it
+///     made all the progress there was to make. The plan does not immediately retry on that budget:
+///     with every remaining outdated host on a Node that is down, the start gate holds it until the
+///     Node watch says one is back. Without that gate this would loop.
+///
+/// One predicate for both places that count attempts — the budget reset after a run
+/// ([`sync_desired_hash_after_finished_run`]) and the schedule window's count of its records
+/// ([`window_taken_by_a_record`]) — because a refund only one of them honours is not a refund.
+fn returns_its_attempt(mode: &ExecutionMode, failure: &RunFailure) -> bool {
+    matches!(mode, ExecutionMode::OneShot)
+        && matches!(failure, RunFailure::None | RunFailure::OnlyUnreachableNodes)
 }
 
 /// Which try a run about to start is, from the budget the plan has already spent.
@@ -1475,10 +1882,10 @@ fn next_attempt(
 /// it is cleared with the revision it belongs to (`update_desired_hash`): an edited plan is waiting
 /// for its first run again, whatever the previous revision achieved.
 fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
-    match current {
-        Phase::Succeeded | Phase::Failed => current.clone(),
-        _ => Phase::Delayed,
+    if current == &Phase::Succeeded || is_failure_verdict(current) {
+        return current.clone();
     }
+    Phase::Delayed
 }
 
 fn duration_until<Tz: TimeZone>(until: &DateTime<Tz>, now: DateTime<Tz>) -> std::time::Duration {
@@ -1529,25 +1936,48 @@ fn update_idle_recurring_status<Tz: TimeZone>(
     (next - now).to_std().ok()
 }
 
-/// The other half of the suspension contract: while suspended, the plan advertises no next run. The
-/// start gate blocks the run itself, so a `nextRun` pointing at a slot that will not fire says the
+/// The other half of the suspension contract: while suspended, the plan advertises no run it is
+/// about to start. The start gate blocks the run itself, so anything still announcing one says the
 /// plan is about to do something it will not do — to an operator reading it, and to any client
 /// scheduling around it.
+///
+/// Two things announce one, and both are retracted here:
+///
+/// - `nextRun`, pointing at a slot that will not fire;
+/// - the `WaitingForNodes`/`NodesNotReady` hold, which says a run is queued behind a Node coming
+///   back. Suspension is why no run is starting now, not the Node, and the hold's summary names the
+///   Node as the reason — so the summary is replaced along with the condition. Only ever *this*
+///   hold: the condition is shared with the proxy-pod wait, which belongs to a run that is already
+///   under way and that suspension deliberately lets finish. The hold's `Ready` overlay goes with it
+///   and is restated from the per-host results, so `Ready` does not keep naming the Node either.
 ///
 /// Held where the status is *written* rather than at the end of the pipeline, because a tick has
 /// more than one way to write one and only one way to reach the end. A tick that finalizes a run, or
 /// that reports an unreadable inventory and gives up, writes the status too — and those writes were
-/// carrying whatever `nextRun` the plan already advertised straight back onto it, so a plan
-/// suspended while waiting on its schedule could keep advertising its old slot until some later tick happened to
+/// carrying whatever the plan already advertised straight back onto it, so a plan suspended while
+/// waiting on its schedule could keep advertising its old slot until some later tick happened to
 /// run the whole pipeline through. Every write now settles it, so the first one after the suspend
 /// takes effect regardless of how the tick ends.
 ///
-/// A run in progress is untouched (it has no `nextRun` anyway) and is left to finish; the phase
-/// keeps reflecting the plan's real state, with the `Suspended` printer column (from `.spec.suspend`)
-/// signalling the pause. The schedule path recomputes `nextRun` once the plan resumes.
-fn suspended_advertises_no_next_run(suspend: bool, status: &mut PlaybookPlanStatus) {
-    if suspend {
-        status.next_run = None;
+/// Nothing re-asserts either one while the plan stays suspended: both are written on paths behind
+/// the start gate, which `spec.suspend` closes. A run in progress is untouched and is left to
+/// finish; the phase keeps reflecting the plan's real state, with the `Suspended` printer column
+/// (from `.spec.suspend`) signalling the pause. The schedule path recomputes `nextRun`, and the
+/// readiness gate re-asserts the hold, once the plan resumes.
+fn suspended_advertises_no_pending_run(suspend: bool, status: &mut PlaybookPlanStatus) {
+    if !suspend {
+        return;
+    }
+    status.next_run = None;
+    if status::held_for_unready_nodes(status) {
+        status::set_waiting_for_nodes_condition(status, None);
+        // An unparseable hash is treated as every host outdated: it can only understate `Ready`.
+        let outdated_count = ExecutionHash::from_hex(&status.current_hash).map_or_else(
+            || distinct_host_count(&status.eligible_hosts),
+            |hash| find_outdated_hosts(status, &hash).len(),
+        );
+        status::clear_nodes_not_ready_condition(status, outdated_count);
+        status.summary = Some("suspended; no new run will start".to_string());
     }
 }
 
@@ -2138,7 +2568,10 @@ async fn ensure_infra_and_launch(
     let (ready, unreachable) = match proxy_readiness {
         managed_ssh::ProxyReadiness::Pending { waiting } => {
             debug!("Waiting for managed-ssh proxy pods to become Ready on {waiting:?}");
-            status::set_waiting_for_nodes_condition(resource_status, Some(&waiting));
+            status::set_waiting_for_nodes_condition(
+                resource_status,
+                Some(status::WaitingForNodes::ProxyPods(&waiting)),
+            );
             return Ok(Some(std::time::Duration::from_secs(5)));
         }
         managed_ssh::ProxyReadiness::Ready { ready, unreachable } => {
@@ -2148,9 +2581,45 @@ async fn ensure_infra_and_launch(
     };
 
     if !unreachable.is_empty() {
+        let hosts: Vec<&str> = unreachable.iter().map(|host| host.host.as_str()).collect();
         warn!(
-            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {unreachable:?} — their managed-ssh proxy pods never became Ready within the grace window; Ansible will report them unreachable, and they'll be retried on the next run",
+            "PlaybookPlan {namespace}/{name}: proceeding without node(s) {hosts:?} — their managed-ssh proxy pods never became Ready within the grace window; they stay in the inventory but are excluded from the run, are reported unreachable, and will be retried on the next run",
         );
+    }
+
+    // Nothing left for a Job to do, so none is created. `ansible-playbook` would refuse a run whose
+    // `--limit` leaves no host to target and exit without writing a recap at all, which would report
+    // this as `Unknown` — "the operator could not read the result" — when the result is in fact
+    // fully known. The record is committed and finished here instead, and the next tick drains it
+    // through the same path as any finished run, so the verdict, the per-host outcomes and the
+    // attempt budget are all decided in one place.
+    //
+    // The start gate covers the common case a tick earlier and more cheaply; this is the case it
+    // cannot see, where every proxy pod fails *after* the gate has already passed.
+    if nothing_left_to_reach(&run.mirror.hosts, &unreachable) {
+        warn!(
+            "PlaybookPlan {namespace}/{name}: not launching run {} — no host it targets can be reached",
+            run.mirror.job_name
+        );
+        let play = play_history::commit_launching(
+            &context.client,
+            namespace,
+            &run.mirror.job_name,
+            &run.mirror.play_uid,
+            &unreachable,
+        )
+        .await?;
+        release_run_infrastructure(context, object, run).await?;
+        let plays_api = Api::<Play>::namespaced(context.client.clone(), namespace);
+        play_history::record_finished(
+            &plays_api,
+            play,
+            &run.mirror.play_uid,
+            &run.mirror.hosts,
+            None,
+        )
+        .await?;
+        return Ok(Some(std::time::Duration::from_secs(1)));
     }
 
     // Proxy pod IPs are fresh every time a run's infrastructure is (re)built, so this is rendered
@@ -2164,7 +2633,7 @@ async fn ensure_infra_and_launch(
         render_secret(
             object,
             run_groups,
-            &managed_ssh_host_map(ready, unreachable),
+            &managed_ssh_host_map(ready, &unreachable),
         )?,
     )
     .await?;
@@ -2183,11 +2652,24 @@ async fn ensure_infra_and_launch(
         .await?;
     }
 
+    // Recorded on the run before its Job exists, because it is only answerable here: a Node that is
+    // down now may be back by the time the recap is read, and the recap says nothing at all about a
+    // host the run excluded from execution.
+    //
+    // The same `unreachable` the workspace Secret was just rendered from, and that pairing is the
+    // point: the Secret's `--limit` file says which hosts the run skips, the record says which hosts
+    // it skipped, and `record_finished` reads the record long after this tick. On a resumed run this
+    // is a *re-statement* — the phase is already `Launching` and the proxy pods have moved since —
+    // so the commit rewrites the set rather than leaving the first tick's answer standing over a
+    // file that no longer matches it (see `play_history::decide_transition`). Rendering and
+    // committing from one variable is what keeps the two from drifting; splitting them, or hoisting
+    // either above `ensure_proxy_infra`, reintroduces the drift.
     play_history::commit_launching(
         &context.client,
         namespace,
         &run.mirror.job_name,
         &run.mirror.play_uid,
+        &unreachable,
     )
     .await?;
     let jobs_api = Api::<Job>::namespaced(context.client.clone(), namespace);
@@ -2204,36 +2686,42 @@ async fn ensure_infra_and_launch(
     Ok(None)
 }
 
+/// Whether the run has no host left it could act on.
+///
+/// Asked over the run's own recorded host list, not over the managed-ssh hosts alone: a run that
+/// also targets `StaticInventory` hosts still has work to do however many of its Nodes are down,
+/// because those hosts are reached over plain SSH and never had a proxy pod to fail.
+fn nothing_left_to_reach(hosts: &[String], unreachable: &[v1beta1::UnreachableHost]) -> bool {
+    !hosts.is_empty()
+        && hosts
+            .iter()
+            .all(|host| unreachable.iter().any(|entry| entry.host == *host))
+}
+
 /// The Ansible-facing view of this run's proxy pods: the Ready ones at their live pod IP, plus the
-/// ones whose proxy never came up pointed at the unroutable sentinel (with a short connect timeout,
-/// see `inventory_renderer`) so Ansible records them unreachable instead of hanging.
+/// ones with no proxy to reach, which are rendered without an address and excluded from the run.
+///
+/// Why a host has no proxy makes no difference here — the distinction only matters to the plan's
+/// attempt budget, which reads it off the run's own record.
 fn managed_ssh_host_map(
     ready: Vec<managed_ssh::ProxyPodInfo>,
-    unreachable: Vec<String>,
+    unreachable: &[v1beta1::UnreachableHost],
 ) -> BTreeMap<String, ansible::ManagedSshHostInfo> {
     let mut hosts: BTreeMap<String, ansible::ManagedSshHostInfo> = ready
         .into_iter()
         .map(|proxy| {
             (
                 proxy.host,
-                ansible::ManagedSshHostInfo {
+                ansible::ManagedSshHostInfo::Proxy {
                     pod_ip: proxy.pod_ip,
                     port: proxy.port,
-                    unreachable: false,
                 },
             )
         })
         .collect();
 
     for host in unreachable {
-        hosts.insert(
-            host,
-            ansible::ManagedSshHostInfo {
-                pod_ip: managed_ssh::UNREACHABLE_SENTINEL_IP.to_string(),
-                port: managed_ssh::PROXY_SSH_PORT,
-                unreachable: true,
-            },
-        );
+        hosts.insert(host.host.clone(), ansible::ManagedSshHostInfo::Unreachable);
     }
 
     hosts
@@ -2248,10 +2736,18 @@ enum ActiveRunProgress {
     Running(std::time::Duration),
     Finished {
         run: RecordedRun,
-        /// The verdict the run's record carried, which is what the plan's own phase is decided
-        /// from. A run finalized without its record reads `Unknown` here, and that is a failure
-        /// like any other: nothing proves its hosts were reached.
-        outcome: v1beta1::PlayPhase,
+        /// The plan-level verdict the run resolved to, decided here rather than carried as the
+        /// run's own phase because [`phase_for_finished_run`] needs the per-host results and this is
+        /// the last place they are in hand. A run finalized without its record resolves to `Failed`:
+        /// nothing proves its hosts were reached, so it is not a success and its hosts were not
+        /// established to be unreachable either.
+        verdict: Phase,
+        /// What that verdict says about the plan's attempt budget — classified here, where the
+        /// run's terminal status is still in hand. See [`classify_run_failure`].
+        failure: RunFailure,
+        /// Something about this run that a human has to see and that changes no verdict. See
+        /// [`RunDiagnostic`].
+        diagnostic: RunDiagnostic,
         record: TerminalRecord,
     },
     /// The cached plan status named a run that the apiserver's copy no longer has — an earlier tick
@@ -2312,8 +2808,9 @@ fn mirrors_run(status: &PlaybookPlanStatus, run: &RecordedRun) -> bool {
 /// A run spends its attempt while it is prepared so recovery cannot offer the same budget twice
 /// while it waits for locks or proxy pods. If it is abandoned before its Job exists, that attempt
 /// was never made and is returned here. The revision, attempt and mirror guards make replay a no-op
-/// and prevent an old aborted record from returning a newer run's budget. Returning a retry restores
-/// the preceding `Failed` verdict, which is what keeps the remaining budget available; a first try
+/// and prevent an old aborted record from returning a newer run's budget. Returning a later retry
+/// preserves a preceding failure verdict; if the in-flight lifecycle had already replaced it, the
+/// fallback is `Failed`. Either failure verdict keeps the remaining budget available. A first try
 /// has no preceding verdict and returns to `Pending`.
 fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun) {
     if !mirrors_run(status, run) {
@@ -2342,7 +2839,11 @@ fn apply_abandoned_run_status(status: &mut PlaybookPlanStatus, run: &RecordedRun
     }
     if refund_due || already_refunded {
         status.phase = if remaining_attempts > 0 {
-            Phase::Failed
+            if is_failure_verdict(&status.phase) {
+                status.phase.clone()
+            } else {
+                Phase::Failed
+            }
         } else {
             Phase::Pending
         };
@@ -2483,7 +2984,7 @@ async fn advance_active_run(
     // a reaped run from wedging in `Applying` forever. The recap comes from the container's
     // termination message (what the callback wrote to /dev/termination-log), not logs — a dedicated
     // channel that isn't interleaved with playbook output and needs no `pods/log` access.
-    let parsed = match (&job, job_is_trusted) {
+    let termination_message = match (&job, job_is_trusted) {
         (Some(job), true) => {
             let pods_api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
             let pods = pods_api
@@ -2498,11 +2999,12 @@ async fn advance_active_run(
                     && pod_belongs_to_job(pod, job)
             });
             latest_termination_message(pods)
-                .as_deref()
-                .and_then(callback_output::parse_callback_output)
         }
         _ => None,
     };
+    let parsed = termination_message
+        .as_deref()
+        .and_then(callback_output::parse_callback_output);
 
     release_run_infrastructure(context, object, run).await?;
 
@@ -2523,12 +3025,28 @@ async fn advance_active_run(
             .ok_or(ReconcileError::PreconditionFailed(
                 "finished Play has no status",
             ))?;
-    let outcome = finished_status.phase.clone();
+    let verdict = phase_for_finished_run(finished_status);
+    let failure = classify_run_failure(finished_status);
+    // The overflow marker is asked of the raw message and only here, because this is the last place
+    // it exists: `record_finished` maps an unreadable recap of either kind to the same `Unknown`
+    // hosts, so nothing downstream — including a later tick recovering this same run — can tell an
+    // overflow from a crash. It takes precedence over the record-derived half because the two cannot
+    // both hold: a message that overflowed carries no counters to be empty.
+    let diagnostic = termination_message
+        .as_deref()
+        .and_then(callback_output::recap_overflowed_host_count)
+        .map_or_else(
+            || RunDiagnostic::from_play_status(finished_status),
+            |hosts| RunDiagnostic::RecapOverflowed { hosts },
+        );
+    diagnostic.warn(namespace, name, &run.mirror.job_name);
     status::apply_terminal_play_status(&run.execution_hash, finished_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
-        outcome,
+        verdict,
+        failure,
+        diagnostic,
         record: TerminalRecord::Present,
     })
 }
@@ -2594,12 +3112,15 @@ async fn finalize_lost_run(
     release_run_infrastructure(context, object, run).await?;
 
     let lost_status = play_history::lost_run_status(&run.mirror.job_name, &run.mirror.hosts);
-    let outcome = lost_status.phase.clone();
+    let verdict = phase_for_finished_run(&lost_status);
+    let failure = classify_run_failure(&lost_status);
     status::apply_terminal_play_status(&run.execution_hash, &lost_status, resource_status);
     resource_status.active_run = None;
     Ok(ActiveRunProgress::Finished {
         run: run.clone(),
-        outcome,
+        verdict,
+        failure,
+        diagnostic: RunDiagnostic::None,
         record: TerminalRecord::Lost,
     })
 }
@@ -3015,6 +3536,18 @@ fn record_input_failure(status: &mut PlaybookPlanStatus, summary: String) {
     if status.active_run.is_none() {
         status.phase = phase_under_readiness_overlay(&status.phase);
         status.next_run = None;
+        // The third way a hold ends, and the one the retire in `reconcile` cannot reach: that retire
+        // is computed from the resolved groups, so a tick that never resolves them returns before
+        // it. A held plan whose inventory is then deleted would otherwise keep `WaitingForNodes`
+        // naming a Node beside the `Ready=False` this just wrote — pointing a reader at a machine
+        // when the plan is no longer waiting on one, and would not start a run if it came back.
+        //
+        // Only ever this hold, for the same reason as there: the condition is shared with the
+        // proxy-pod wait, which belongs to a run in flight — and the guard above has already
+        // established there is none.
+        if status::held_for_unready_nodes(status) {
+            status::set_waiting_for_nodes_condition(status, None);
+        }
     }
 }
 
@@ -3770,10 +4303,10 @@ fn restore_summary_after_overlay(
     outdated_count: usize,
     clear: impl FnOnce(&mut PlaybookPlanStatus, usize) -> bool,
 ) {
-    let failed = status.phase == Phase::Failed;
+    let verdict = status.phase.clone();
     if clear(status, outdated_count) && status.active_run.is_none() {
         let total_count = distinct_host_count(&status.eligible_hosts);
-        status.summary = Some(plan_summary(outdated_count, total_count, failed));
+        status.summary = Some(plan_summary(outdated_count, total_count, &verdict));
     }
 }
 
@@ -3788,17 +4321,82 @@ fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usi
     status.phase = Phase::Succeeded;
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
-    status.summary = Some(plan_summary(0, total_count, false));
+    status.summary = Some(plan_summary(0, total_count, &Phase::Succeeded));
+}
+
+/// Reports a `OneShot` plan holding back a run because every node it would reach is not `Ready`.
+///
+/// Deliberately writes no `requeue`: nothing here is worth polling for. The plan is released by the
+/// controller's Node watch, which fires the moment one of these nodes reports `Ready` again
+/// (`mappers::node_to_playbookplans`), and the tick's ordinary idle requeue remains as the backstop.
+///
+/// The verdict survives ([`phase_under_readiness_overlay`]) because a node going down does not undo
+/// what the plan last did — the summary is what says why nothing is happening now. A plan can sit
+/// here indefinitely, and that is the intended end state for a node that is never coming back: the
+/// condition names it, and removing it from the inventory or from the cluster is an operator's call,
+/// not the operator's.
+///
+/// `next_run` is left alone for the same reason. This arm is only reached with a `Timing::Now`, so a
+/// *scheduled* plan is being held inside the starting-deadline window of a slot it still owes a run
+/// for, and that forecast is exactly what a reader needs while the hold lasts. An unscheduled plan
+/// has no forecast to keep.
+///
+/// `Ready` is the one part of the verdict that does not survive. The phase says what the last run
+/// did; `Ready` is read as whether the plan is converged, and a held plan has by definition hosts it
+/// has not applied the current revision to.
+fn hold_plan_for_unready_nodes(status: &mut PlaybookPlanStatus, unready: &[String]) {
+    status.phase = phase_under_readiness_overlay(&status.phase);
+    let summary = format!("waiting for node(s) {} to become Ready", unready.join(", "));
+    status::set_nodes_not_ready_condition(status, &summary);
+    status.summary = Some(summary);
+    status::set_waiting_for_nodes_condition(
+        status,
+        Some(status::WaitingForNodes::NodesNotReady(unready)),
+    );
+}
+
+/// Retires a hold this plan is no longer under, restating `Ready` and the summary from its per-host
+/// results the way an input outage's retirement does. Without the restate, a plan whose down host
+/// left the inventory would keep `Ready=False` and a summary naming that Node indefinitely: nothing
+/// else rewrites either for an idle `OneShot` plan with no outdated hosts.
+fn release_node_readiness_hold(status: &mut PlaybookPlanStatus, outdated_count: usize) {
+    status::set_waiting_for_nodes_condition(status, None);
+    restore_summary_after_overlay(
+        status,
+        outdated_count,
+        status::clear_nodes_not_ready_condition,
+    );
+}
+
+/// Whether the plan is being held back by the readiness gate *right now*, which is a narrower
+/// question than [`node_readiness::holds_for_unready_nodes`] answers on its own.
+///
+/// That predicate says "a run started now would be pointless", and its inputs are only the mode, the
+/// groups and the down Nodes. A plan whose schedule window is closed is not held by it, however far
+/// down its Nodes are — it is waiting on the clock, and the schedule arm reports that for itself.
+///
+/// Composed here rather than at either call site because both the arm that *asserts* the hold and
+/// the retire that clears it have to agree on the answer. They ask from different places, and a
+/// retire that is even slightly wider than the assert leaves `WaitingForNodes` standing over a plan
+/// that is not waiting for a Node — which reads as the reason it is not running.
+fn held_back_by_unready_nodes<Tz: chrono::TimeZone>(
+    timing: &Timing<Tz>,
+    mode: &ExecutionMode,
+    groups: &[ResolvedInventoryGroup],
+    unready: &[String],
+) -> bool {
+    matches!(timing, Timing::Now(_))
+        && node_readiness::holds_for_unready_nodes(mode, groups, unready)
 }
 
 /// The phase an idle plan keeps while a readiness overlay explains why it is not running. A real
 /// run verdict survives — it says what the plan last did, which an outage does not undo — while a
 /// lifecycle state resets to `Pending`.
 fn phase_under_readiness_overlay(current: &Phase) -> Phase {
-    match current {
-        Phase::Succeeded | Phase::Failed => current.clone(),
-        _ => Phase::Pending,
+    if current == &Phase::Succeeded || is_failure_verdict(current) {
+        return current.clone();
     }
+    Phase::Pending
 }
 
 /// Puts a recovered run back onto the plan's status: the run itself, the `Applying` phase it
@@ -3880,7 +4478,86 @@ impl RecordedRun {
 /// failed `Recurring` run leaves no drift behind to read it back out of.
 struct FinishedRun {
     run: RecordedRun,
-    outcome: v1beta1::PlayPhase,
+    /// The plan-level verdict this run resolved to, decided once where its per-host results were
+    /// still in hand — see [`phase_for_finished_run`], which needs them and not just the run's own
+    /// phase.
+    verdict: Phase,
+    failure: RunFailure,
+    diagnostic: RunDiagnostic,
+}
+
+/// What a finished run's result says about the plan's attempt budget — the one question the verdict
+/// alone cannot answer.
+#[derive(Clone, Debug, PartialEq)]
+enum RunFailure {
+    /// Every host the run targeted succeeded.
+    None,
+    /// The run failed, and every host that did not succeed sat on a Node the operator had already
+    /// recorded as not `Ready` when the run launched, **and** the run applied the playbook to at
+    /// least one host. The reachable part of the inventory is fully applied, so nothing about this
+    /// execution is worth retrying until one of those Nodes returns.
+    OnlyUnreachableNodes,
+    /// Something the operator did reach did not succeed — or the recap could not be read at all,
+    /// which proves nothing either way.
+    Real,
+}
+
+/// Classifies a terminal `PlayStatus` for the attempt budget.
+///
+/// "Every non-succeeded host was a recorded not-ready Node" and "every host the operator could
+/// reach succeeded" are the same statement, and this is where it is decided — once, while the
+/// run's own status is in hand, because neither half survives the tick: the recap says nothing
+/// about a host the run excluded, and re-reading the Node answers the wrong question, since it may
+/// have recovered since.
+///
+/// Two failures deliberately stay `Real`, both because no Node event will ever resolve them:
+/// a Node that was `Ready` at launch and went down *during* the run — the operator reached it, and
+/// the start gate is what keeps the follow-up attempt from being wasted — and a `Ready` Node whose
+/// proxy pod never came up anyway (an untolerated taint, a failing image pull). The second is why
+/// the test is `node_not_ready` on the run's record and not mere membership in it: both are
+/// excluded from the run identically, and only the record tells them apart.
+///
+/// The third is a run that succeeded on *nothing*, and it is what bounds the whole mechanism. A
+/// refund is credit for progress, so a run with no progress to its name buys nothing back however
+/// good its excuse — otherwise a Node that alternates faster than a plan converges refunds every
+/// attempt it costs, and the plan runs forever: the start gate reads the Node at tick time and
+/// `node_not_ready` is read a grace window later, so a Node that is `Ready` for the first and down
+/// by the second passes the gate and then earns the refund, once per grace window, unbounded. The
+/// budget is the only thing that can bound that, and it can only do so if something spends it.
+fn classify_run_failure(status: &v1beta1::PlayStatus) -> RunFailure {
+    match status.phase {
+        v1beta1::PlayPhase::Succeeded => RunFailure::None,
+        v1beta1::PlayPhase::Failed => {
+            let unsucceeded: Vec<&String> = status
+                .hosts
+                .iter()
+                .filter(|(_, result)| result.outcome != v1beta1::HostOutcome::Succeeded)
+                .map(|(host, _)| host)
+                .collect();
+            let applied_to_someone = unsucceeded.len() < status.hosts.len();
+            if applied_to_someone
+                && !unsucceeded.is_empty()
+                && unsucceeded.iter().all(|host| {
+                    status
+                        .unreachable_hosts
+                        .iter()
+                        .any(|entry| entry.node_not_ready && entry.host == **host)
+                })
+            {
+                RunFailure::OnlyUnreachableNodes
+            } else {
+                RunFailure::Real
+            }
+        }
+        // `Unknown` is a run whose recap was never read: nothing proves any of its hosts was
+        // reached, so it can never buy the budget back.
+        v1beta1::PlayPhase::Unknown
+        | v1beta1::PlayPhase::Prepared
+        | v1beta1::PlayPhase::Starting
+        | v1beta1::PlayPhase::Launching
+        | v1beta1::PlayPhase::Running
+        | v1beta1::PlayPhase::Aborted => RunFailure::Real,
+    }
 }
 
 struct FinishedRecord {
@@ -3920,16 +4597,16 @@ fn stage_finished_run(finished: &RecordedRun, resource_status: &mut PlaybookPlan
 ///
 /// The run number is claimed either way, because it answers a different question: it reserves a
 /// name against every later run, and a finished run holds its number whatever else is in flight.
-/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, and a successful
-/// `OneShot` execution is complete, so the current-revision surviving run is authoritative when
-/// present, and the finished run is authoritative otherwise. Its slot travels with it so a pruned
-/// record cannot leave an unscoped count behind.
+/// The attempt is not a high-water mark: a new `Recurring` slot restarts it, and a `OneShot`
+/// execution that made all the progress there was to make is complete, so the current-revision
+/// surviving run is authoritative when present, and the finished run is authoritative otherwise.
+/// Its slot travels with it so a pruned record cannot leave an unscoped count behind.
 fn sync_desired_hash_after_finished_run(
     status: &mut PlaybookPlanStatus,
     desired_hash: &ExecutionHash,
     mode: &ExecutionMode,
     finished: &RecordedRun,
-    finished_outcome: &v1beta1::PlayPhase,
+    finished_failure: &RunFailure,
     surviving: Option<&SurvivingRun>,
 ) {
     // Clears the schedule bookkeeping when the desired revision has moved on, so the replacement can
@@ -3962,11 +4639,7 @@ fn sync_desired_hash_after_finished_run(
     if let Some((attempt, slot)) = surviving_attempt {
         record_retry_budget(status, attempt, slot);
     } else if finished.execution_hash == *desired_hash {
-        if matches!(mode, ExecutionMode::OneShot)
-            && phase_for_finished_run(finished_outcome) == Phase::Succeeded
-        {
-            // A successful OneShot execution is complete. Reset its budget so inventory growth can
-            // trigger a new run for hosts that were not present in the completed execution.
+        if returns_its_attempt(mode, finished_failure) {
             record_retry_budget(status, 0, None);
         } else {
             record_retry_budget(
@@ -3976,6 +4649,111 @@ fn sync_desired_hash_after_finished_run(
             );
         }
     }
+}
+
+/// The Secrets holding the SSH key material this run's `StaticInventory` groups are reached with,
+/// deduplicated: several groups may come from one inventory, and several inventories may share a key.
+fn ssh_key_secret_names(groups: &[ResolvedInventoryGroup]) -> Vec<String> {
+    let mut names: Vec<String> = groups
+        .iter()
+        .filter_map(|group| match group {
+            ResolvedInventoryGroup::Ssh { config, .. } => Some(config.secret_ref.name.clone()),
+            ResolvedInventoryGroup::ManagedSsh { .. } => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Reads and fingerprints this plan's SSH key material.
+///
+/// `None` means "nothing to decide from this tick", which covers both a plan that reaches no
+/// `StaticInventory` hosts and one whose Secrets could not be read. The two are folded together on
+/// purpose: neither is evidence that a key changed, and a failed read must never be mistaken for a
+/// rotation — that would hand the attempt budget back on every apiserver hiccup.
+///
+/// A read failure is not propagated. This is a side observation, not one of the desired inputs: a
+/// tick that cannot answer it can still do everything else, and the next tick asks again.
+async fn observe_ssh_key_revision(
+    groups: &[ResolvedInventoryGroup],
+    secrets_api: &Api<Secret>,
+) -> Option<String> {
+    let names = ssh_key_secret_names(groups);
+    if names.is_empty() {
+        return None;
+    }
+
+    let reads = futures::future::join_all(
+        names
+            .iter()
+            .map(|name| async move { (name.clone(), secrets_api.get(name).await) }),
+    )
+    .await;
+
+    match collect_secret_data(reads) {
+        Ok(data) => Some(execution_evaluator::hash_secret_data(data.iter())),
+        Err(error) => {
+            debug!(
+                "Could not read the SSH key material for this plan, so a rotation cannot be \
+                 detected this tick: {error:?}"
+            );
+            None
+        }
+    }
+}
+
+/// Folds an observed SSH key revision into the status, returning whether it gave the attempt budget
+/// back.
+///
+/// The budget reset is the whole point. Simply waking the plan would achieve nothing: a plan that
+/// failed because its hosts rejected the old key has, by then, spent every attempt it had — there is
+/// no proxy grace window in front of a `StaticInventory` host, so the tries burn in seconds — and
+/// `attempt_budget_available` refuses to start another run. Rotating the key is a fix the plan can
+/// only act on if it is also given a try to act with.
+///
+/// Three cases deliberately do not reset it:
+///
+/// - **the first observation.** A plan upgraded into this field has not rotated anything, and a plan
+///   that never had one has no budget to give back. Recording it without acting is what keeps the
+///   upgrade from handing every failed plan in the cluster a free retry at once.
+/// - **a `Succeeded` plan.** Its hosts are converged and the key it connected with worked; a
+///   rotation is not a reason to touch them again. This is the same rule the mapper applies, from
+///   [`status::may_need_another_run`], so a plan can never be woken for a rotation it would then
+///   decline to act on.
+/// - **a run in flight.** Its outcome is not known yet, and resetting mid-run would talk over the
+///   attempt it is currently spending. Nothing is recorded either, so the rotation is still there to
+///   be noticed once the run drains. The caller skips the Secret read on the same condition rather
+///   than paying for an answer this would discard; the check stays here so the rule lives with the
+///   reasoning for it and does not depend on a caller remembering it.
+fn sync_ssh_key_revision(
+    status: &mut PlaybookPlanStatus,
+    mode: &ExecutionMode,
+    observed: Option<&str>,
+) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    if status.active_run.is_some() || status.observed_ssh_key_revision.as_deref() == Some(observed)
+    {
+        return false;
+    }
+
+    let first_observation = status.observed_ssh_key_revision.is_none();
+    status.observed_ssh_key_revision = Some(observed.to_string());
+
+    // `Recurring` is left out because its budget already restarts at every schedule tick, so there
+    // is nothing here to give back — and `record_retry_budget` would clear the slot the current
+    // tick's budget belongs to.
+    if first_observation
+        || !matches!(mode, ExecutionMode::OneShot)
+        || !status::may_need_another_run(status)
+    {
+        return false;
+    }
+
+    record_retry_budget(status, 0, None);
+    true
 }
 
 fn record_retry_budget(
@@ -4528,14 +5306,14 @@ struct TerminalOutcome {
 fn decide_terminal<Tz: TimeZone>(
     mode: &ExecutionMode,
     schedule: Option<&Schedule>,
-    outcome: &v1beta1::PlayPhase,
+    verdict: &Phase,
     retry_due: bool,
     outdated_count: usize,
     total_count: usize,
     now: DateTime<Tz>,
 ) -> TerminalOutcome {
-    let phase = phase_for_finished_run(outcome);
-    let summary = plan_summary(outdated_count, total_count, phase == Phase::Failed);
+    let summary = plan_summary(outdated_count, total_count, verdict);
+    let phase = verdict.clone();
 
     // A try that is still owed is the next thing the plan does, so it is what the plan waits for:
     // the wait is short because a scheduled retry has only the rest of the tick's grace window to
@@ -4598,23 +5376,149 @@ fn decide_terminal<Tz: TimeZone>(
 /// say which. `Ready`'s restated message (`status::clear_inputs_unavailable_condition`) already
 /// counts the other way round; this brings the summary into line with it.
 ///
-/// `failed` is what stops the line reassuring a reader about a plan that just failed. A `Recurring`
-/// run that fails on a host which succeeded at this revision yesterday leaves *no* drift behind —
-/// the host still carries the current hash — so the honest drift statement is `5/5 up-to-date`,
-/// sitting beside a `Failed` phase. True, and exactly what someone scanning a summary column reads
-/// as "nothing to see here".
-fn plan_summary(outdated_count: usize, total_count: usize, failed: bool) -> String {
+/// The verdict is what stops the line reassuring a reader about a plan that just failed. A
+/// `Recurring` run that fails on a host which succeeded at this revision yesterday leaves *no* drift
+/// behind — the host still carries the current hash — so the honest drift statement is
+/// `5/5 up-to-date`, sitting beside a `Failed` phase. True, and exactly what someone scanning a
+/// summary column reads as "nothing to see here".
+///
+/// It also distinguishes the two failures, because this column sits directly beside the phase and
+/// would otherwise call a plan waiting for a machine to come back "failed" while the phase said
+/// [`Phase::HostsUnreachable`] — undoing at one column's distance exactly what that phase is for.
+fn plan_summary(outdated_count: usize, total_count: usize, verdict: &Phase) -> String {
     let current = total_count.saturating_sub(outdated_count);
     let mut summary = format!("{current}/{total_count} up-to-date");
 
-    match (outdated_count, failed) {
-        (0, false) => {}
-        (0, true) => summary.push_str(" (last run failed)"),
-        (outdated, false) => summary.push_str(&format!(" ({outdated} outdated)")),
-        (outdated, true) => summary.push_str(&format!(" ({outdated} outdated, last run failed)")),
+    let reason = match verdict {
+        Phase::HostsUnreachable => Some("could not reach every host"),
+        _ if is_failure_verdict(verdict) => Some("last run failed"),
+        _ => None,
+    };
+
+    match (outdated_count, reason) {
+        (0, None) => {}
+        (0, Some(reason)) => summary.push_str(&format!(" ({reason})")),
+        (outdated, None) => summary.push_str(&format!(" ({outdated} outdated)")),
+        (outdated, Some(reason)) => summary.push_str(&format!(" ({outdated} outdated, {reason})")),
     }
 
     summary
+}
+
+/// Something a finished run needs a human to see, which changes no verdict and no per-host outcome.
+///
+/// One channel rather than a flag per reason, because they arrive at the same place, are appended to
+/// the same summary, and are mutually exclusive in fact: `NoPlaybookActivity` requires a readable
+/// recap and `RecapOverflowed` means there was none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RunDiagnostic {
+    #[default]
+    None,
+    /// The run completed every target, and `hosts` of its `of` hosts came out of it having run
+    /// nothing at all. Diagnostic rather than a different verdict because an inventory deliberately
+    /// broader than its playbook has the same observable result as a host-pattern typo.
+    NoPlaybookActivity { hosts: u32, of: u32 },
+    /// The run's recap did not fit the kubelet's termination-message cap even compressed, so its
+    /// hosts fall to `Unknown` for a reason that is nothing to do with the playbook or the fleet's
+    /// health. Without this the plan reports only "the recap could not be read", which is what a
+    /// crashed container reports too, and the operator has no way to tell them apart.
+    RecapOverflowed { hosts: u32 },
+}
+
+impl RunDiagnostic {
+    /// What a finished run's own record still says, once the raw termination message is gone.
+    fn from_play_status(status: &v1beta1::PlayStatus) -> Self {
+        match hosts_without_recap_activity(status) {
+            Some((hosts, of)) => Self::NoPlaybookActivity { hosts, of },
+            None => Self::None,
+        }
+    }
+
+    fn warn(self, namespace: &str, name: &str, job_name: &str) {
+        match self {
+            Self::None => {}
+            Self::NoPlaybookActivity { hosts, of } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} finished successfully, but the playbook ran no task at all on {hosts} of its {of} host(s), which are now recorded up to date. Verify its host patterns reach them, or confirm the playbook leaves them alone on purpose (outside every play, a run_once task, a meta: end_host guard)"
+            ),
+            Self::RecapOverflowed { hosts } => warn!(
+                "PlaybookPlan {namespace}/{name}: run {job_name} reported {hosts} hosts, whose recap does not fit the kubelet's {} byte termination-message limit even compressed; every host is reported Unknown. Split the plan across smaller inventories",
+                callback_output::TERMINATION_MESSAGE_MAX_BYTES
+            ),
+        }
+    }
+
+    /// The clause appended to `.status.summary`, which is a printer column — so it states the fact
+    /// and stops. What to do about it belongs in [`Self::warn`], where there is room for it and
+    /// where somebody is already looking into the run.
+    fn summary_clause(self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::NoPlaybookActivity { hosts, of } => Some(format!(
+                " (the playbook ran no task on {hosts} of {of} hosts)"
+            )),
+            Self::RecapOverflowed { hosts } => Some(format!(
+                " (the recap for {hosts} hosts does not fit the kubelet's termination-message limit, so no per-host result could be read; split the plan across smaller inventories)"
+            )),
+        }
+    }
+}
+
+fn apply_run_diagnostic(status: &mut PlaybookPlanStatus, diagnostic: RunDiagnostic) {
+    let Some(clause) = diagnostic.summary_clause() else {
+        return;
+    };
+
+    let summary = status
+        .summary
+        .get_or_insert_with(|| "previous run finished".to_string());
+    summary.push_str(&clause);
+}
+
+/// How many of a successful run's hosts the playbook ran nothing on, out of how many it had.
+/// `None` when every host ran something, or when the run is not a clean success to ask it of.
+///
+/// **Asked per host, not over `status.recap`.** The run-level total is the sum over everything
+/// Ansible processed, so a single counter anywhere hides this: one working play beside a typo'd
+/// one, or — since `play_history::sum_recap` deliberately counts hosts outside the plan's inventory
+/// — a single `hosts: localhost` play, which is enough to mask a playbook that reached no inventory
+/// host at all. The condition being detected has always been per host; only the question was not.
+///
+/// The completion marker targets `all`, so a host no play of the author's touched still reaches the
+/// recap, with every counter zero and `completed` set. A host some play *did* touch usually cannot
+/// look like that — `gather_facts` gives it an `ok`, and a task filtered out by `when:` gives it a
+/// `skipped` — but a playbook can leave hosts untouched on purpose and produce the same signature:
+/// with `gather_facts: false`, a `run_once` task runs, and is counted, on one host only, and a
+/// `meta: end_host` guard ends a host without a counter. `Succeeded` is part of the test rather than
+/// implied by the phase, because a host the run excluded or that a `serial` batch stopped short of
+/// also carries an empty recap and must not be counted here.
+///
+/// This changes no verdict, and deliberately so: `play_history::outcome_from_stats` calls such a
+/// host `Succeeded` on the grounds that applying this playbook to it is vacuous, which is what keeps
+/// a plan whose inventory is broader than its playbook from retrying it forever. That reading is
+/// right and stays. What was missing is that nobody was told, because the host is then stamped with
+/// the current hash and a `OneShot` plan never looks at it again — so a group renamed in the
+/// inventory but not in the playbook reads as a clean, converged rollout.
+///
+/// The cost is that none of those cases is distinguishable from a mistake and never can be, so a
+/// plan whose inventory is intentionally wider than its playbook, or whose playbook skips hosts as
+/// above, carries this note on every run. That is the same trade the run-level version already made
+/// for an intentionally taskless playbook, which is why the warning offers every reading rather than
+/// asserting the mistake.
+fn hosts_without_recap_activity(status: &v1beta1::PlayStatus) -> Option<(u32, u32)> {
+    if status.phase != v1beta1::PlayPhase::Succeeded || status.hosts.is_empty() {
+        return None;
+    }
+
+    let untouched = status
+        .hosts
+        .values()
+        .filter(|result| {
+            result.outcome == v1beta1::HostOutcome::Succeeded
+                && result.recap == v1beta1::PlayRecap::default()
+        })
+        .count() as u32;
+
+    (untouched != 0).then_some((untouched, status.hosts.len() as u32))
 }
 
 /// The plan phase a finished run resolves to, in either mode.
@@ -4625,13 +5529,55 @@ fn plan_summary(outdated_count: usize, total_count: usize, failed: bool) -> Stri
 /// report the failed run as a success. Anything short of `Succeeded` is a failure, `Unknown`
 /// included — a recap that could not be read is not evidence that the hosts were reached.
 ///
+/// [`Phase::HostsUnreachable`] splits that failure in two, which is why the per-host results are
+/// needed and not just the run's own phase. A run that applied the playbook everywhere it could and
+/// was left only with hosts nothing could connect to is failed, but not *broken*: it is waiting for
+/// a machine, and a plan parked on one that never returns would otherwise read `Failed` forever,
+/// indistinguishable at a glance from one whose playbook does not work.
+///
 /// The non-terminal phases cannot arrive here: `apply_terminal_play_status` refuses them, and both
 /// paths that produce an outcome have already been through it.
-fn phase_for_finished_run(outcome: &v1beta1::PlayPhase) -> Phase {
-    match outcome {
-        v1beta1::PlayPhase::Succeeded => Phase::Succeeded,
-        _ => Phase::Failed,
+fn phase_for_finished_run(status: &v1beta1::PlayStatus) -> Phase {
+    if status.phase == v1beta1::PlayPhase::Succeeded {
+        return Phase::Succeeded;
     }
+    if only_unreachable_hosts_are_outstanding(status) {
+        return Phase::HostsUnreachable;
+    }
+    Phase::Failed
+}
+
+/// Whether every host this run did not apply the playbook to was one nothing could connect to.
+///
+/// "Every", with at least one such host: a single host that ran a task and failed, that the play
+/// stopped short of, or whose recap could not be read makes the unreachable ones no longer the whole
+/// story, and the plan has something to fix rather than something to wait for.
+///
+/// A host excluded because its proxy pod never came up on a Node that was *already* `Ready` is one
+/// of those, by way of the `NotReached` it now carries. Deliberately: `HostsUnreachable` says the
+/// plan is waiting for a machine and there is nothing to fix, and an untolerated taint is somebody
+/// to fix. The phase now agrees with [`classify_run_failure`], which has always called that case
+/// `Real` and spent an attempt on it.
+fn only_unreachable_hosts_are_outstanding(status: &v1beta1::PlayStatus) -> bool {
+    let mut unreachable = false;
+    for result in status.hosts.values() {
+        match result.outcome {
+            v1beta1::HostOutcome::Succeeded => {}
+            v1beta1::HostOutcome::Unreachable => unreachable = true,
+            _ => return false,
+        }
+    }
+    unreachable
+}
+
+/// Whether a phase is a finished run's verdict that something is not applied.
+///
+/// [`Phase::HostsUnreachable`] is a failure everywhere the mechanics ask — it owes a retry, it keeps
+/// its schedule window open, and its summary reads as a failure — and differs from [`Phase::Failed`]
+/// only in what it tells a human. Asked as one predicate so that adding a verdict cannot quietly
+/// change any of that: a phase left out here stops being retried at all.
+fn is_failure_verdict(phase: &Phase) -> bool {
+    matches!(phase, Phase::Failed | Phase::HostsUnreachable)
 }
 
 /// The `ansible-playbook` container's termination message — the recap the callback wrote to
@@ -4903,8 +5849,8 @@ fn validate_workspace_not_referenced(plan: &PlaybookPlan) -> Result<(), Reconcil
 /// write to the same object routinely lands first and would reject a version-checked PUT with a
 /// 409. A merge patch carries no such precondition.
 ///
-/// Every write goes through [`suspended_advertises_no_next_run`] on the way out — see there for why
-/// the suspension contract is held at this boundary rather than at the end of the pipeline.
+/// Every write goes through [`suspended_advertises_no_pending_run`] on the way out — see there for
+/// why the suspension contract is held at this boundary rather than at the end of the pipeline.
 ///
 /// Returns the plan as the apiserver now holds it. Almost every caller discards that, but a tick
 /// that has to make a *version-checked* write afterwards cannot: this write invalidated the
@@ -4919,7 +5865,7 @@ async fn patch_status(
 ) -> Result<PlaybookPlan, ReconcileError> {
     use kube::runtime::reflector::Lookup as _;
 
-    suspended_advertises_no_next_run(target.spec.suspend, &mut status);
+    suspended_advertises_no_pending_run(target.spec.suspend, &mut status);
 
     let name = target
         .name()
@@ -5297,7 +6243,7 @@ fn record_invalid_scheduling_configuration(
             || phase_under_readiness_overlay(&status.phase),
             |finished| {
                 if finished.run.mirror.execution_hash == status.current_hash {
-                    phase_for_finished_run(&finished.outcome)
+                    finished.verdict.clone()
                 } else {
                     Phase::Pending
                 }
@@ -5602,6 +6548,119 @@ mod tests {
         PlaySpec, PlaybookPlanSpec, ResolvedHosts, SecretRef, SshConfig, Toleration,
     };
 
+    /// A dropped writer means the reflector task is gone, so the Node cache will never populate and
+    /// never update again — and a cache that answers nothing is a cache that answers "every node is
+    /// Ready". Carrying on from there is the failure [`await_node_cache`] exists to prevent,
+    /// arriving through the door that used to be a `warn`.
+    ///
+    /// Pinned because "log it and continue" is what this was, and so is the shape a later reader is
+    /// most likely to restore. The timeout arm is left to the type checker: exercising it would need
+    /// a paused clock, which is a tokio feature the crate does not otherwise want.
+    #[tokio::test]
+    #[should_panic(expected = "stopped before its initial sync")]
+    async fn a_node_cache_that_can_never_sync_takes_the_operator_down() {
+        let writer = Writer::<Node>::default();
+        let reader = writer.as_reader();
+        drop(writer);
+
+        await_node_cache(&reader).await;
+    }
+
+    fn node_watch_failed(
+        failures: &mut NodeWatchFailures,
+        now: std::time::Instant,
+    ) -> NodeWatchLog {
+        failures.observe(Err(watcher::Error::NoResourceVersion), now)
+    }
+
+    #[test]
+    fn a_node_watch_escalates_once_its_failures_stop_looking_like_a_blip() {
+        let mut failures = NodeWatchFailures::default();
+        let now = std::time::Instant::now();
+
+        for _ in 1..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            assert!(matches!(
+                node_watch_failed(&mut failures, now),
+                NodeWatchLog::Failure(_)
+            ));
+        }
+        assert!(matches!(
+            node_watch_failed(&mut failures, now),
+            NodeWatchLog::Escalation {
+                consecutive_failures: NODE_WATCH_FAILURES_BEFORE_ESCALATING,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_node_watch_that_stays_broken_repeats_the_detailed_line_once_per_interval() {
+        let mut failures = NodeWatchFailures::default();
+        let escalated_at = std::time::Instant::now();
+        for _ in 0..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            node_watch_failed(&mut failures, escalated_at);
+        }
+
+        let just_before =
+            escalated_at + NODE_WATCH_ESCALATION_INTERVAL - std::time::Duration::from_secs(1);
+        assert!(matches!(
+            node_watch_failed(&mut failures, just_before),
+            NodeWatchLog::Failure(_)
+        ));
+        assert!(matches!(
+            node_watch_failed(&mut failures, escalated_at + NODE_WATCH_ESCALATION_INTERVAL),
+            NodeWatchLog::Escalation { .. }
+        ));
+    }
+
+    /// A watcher whose re-LIST keeps failing yields `Init` before every attempt. Counting that as
+    /// the cache updating reset the count on each retry, so a LIST refused forever never escalated.
+    #[test]
+    fn a_failing_relist_does_not_count_as_the_node_cache_updating() {
+        let mut failures = NodeWatchFailures::default();
+        let now = std::time::Instant::now();
+
+        let mut last = NodeWatchLog::Nothing;
+        for _ in 0..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            assert!(matches!(
+                failures.observe(Ok(watcher::Event::Init), now),
+                NodeWatchLog::Nothing
+            ));
+            last = node_watch_failed(&mut failures, now);
+        }
+        assert!(matches!(last, NodeWatchLog::Escalation { .. }));
+    }
+
+    #[test]
+    fn a_node_watch_reports_recovering_only_from_an_escalation_and_only_once() {
+        let mut failures = NodeWatchFailures::default();
+        let now = std::time::Instant::now();
+
+        node_watch_failed(&mut failures, now);
+        assert!(matches!(
+            failures.observe(Ok(watcher::Event::Apply(Node::default())), now),
+            NodeWatchLog::Nothing
+        ));
+
+        for _ in 0..NODE_WATCH_FAILURES_BEFORE_ESCALATING {
+            node_watch_failed(&mut failures, now);
+        }
+        assert!(matches!(
+            failures.observe(Ok(watcher::Event::InitDone), now),
+            NodeWatchLog::Recovery {
+                consecutive_failures: NODE_WATCH_FAILURES_BEFORE_ESCALATING
+            }
+        ));
+        assert!(matches!(
+            failures.observe(Ok(watcher::Event::Apply(Node::default())), now),
+            NodeWatchLog::Nothing
+        ));
+        assert!(matches!(
+            node_watch_failed(&mut failures, now),
+            NodeWatchLog::Failure(_)
+        ));
+    }
+
     fn managed_ssh_group(
         name: &str,
         hosts: &[&str],
@@ -5622,6 +6681,15 @@ mod tests {
         hosts: &[&str],
         static_inventory_name: &str,
     ) -> ResolvedInventoryGroup {
+        ssh_group_with_key(name, hosts, static_inventory_name, "ssh-key")
+    }
+
+    fn ssh_group_with_key(
+        name: &str,
+        hosts: &[&str],
+        static_inventory_name: &str,
+        secret_name: &str,
+    ) -> ResolvedInventoryGroup {
         ResolvedInventoryGroup::Ssh {
             hosts: ResolvedHosts {
                 name: name.into(),
@@ -5631,7 +6699,7 @@ mod tests {
             config: SshConfig {
                 user: "root".into(),
                 secret_ref: SecretRef {
-                    name: "ssh-key".into(),
+                    name: secret_name.into(),
                 },
             },
             variables: None,
@@ -5676,6 +6744,50 @@ mod tests {
             panic!("expected a ManagedSsh group");
         };
         assert_eq!(t, &tolerations);
+    }
+
+    /// Readiness gates a run; it never *filters* one. A run that can reach some of its hosts starts
+    /// and carries the `NotReady` ones along, so they are reported unreachable in the play result
+    /// rather than quietly dropped from it — which is also what keeps them outdated afterwards, and
+    /// so what makes them retried at all.
+    ///
+    /// Composed from the same three steps the reconcile runs in the same order (`reconcile`, at the
+    /// `hosts_to_trigger`/`run_groups`/`unready_nodes` block), because the property lives in that
+    /// composition: what a run targets is decided by drift alone, and readiness is only ever asked
+    /// afterwards, as a yes/no on the whole run. A future "just skip the down ones" would have to
+    /// reach into one of these steps, and this says why it must not.
+    #[test]
+    fn the_readiness_gate_never_drops_a_not_ready_host_from_a_run_that_starts() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let target_groups = vec![managed_ssh_group("workers", &["node-a", "node-b"], None)];
+        let status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            eligible_hosts: flatten_hosts(&target_groups),
+            ..Default::default()
+        };
+
+        let hosts_to_trigger = find_outdated_hosts(&status, &hash);
+        let run_groups = filter_groups_to_hosts(&target_groups, &hosts_to_trigger);
+        let unready = vec!["node-b".to_string()];
+
+        assert!(
+            !node_readiness::holds_for_unready_nodes(
+                &ExecutionMode::OneShot,
+                &run_groups,
+                &unready
+            ),
+            "node-a is reachable, so the run has work to do and must start"
+        );
+
+        let targeted: Vec<&String> = run_groups
+            .iter()
+            .flat_map(|group| group.hosts().hosts.iter())
+            .collect();
+        assert_eq!(
+            targeted,
+            vec!["node-a", "node-b"],
+            "the NotReady node stays in the run so Ansible reports it unreachable"
+        );
     }
 
     #[test]
@@ -6382,6 +7494,37 @@ mod tests {
         assert_eq!(first_status.phase, Phase::Pending);
     }
 
+    #[test]
+    fn abandoning_a_later_attempt_preserves_the_hosts_unreachable_verdict() {
+        let run = RecordedRun {
+            execution_hash: ExecutionHash::from_hex("1").unwrap(),
+            mirror: ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-abandoned".into(),
+                job_name: "apply-web-abandoned".into(),
+                play_uid: "abandoned".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 8,
+                attempt: 2,
+                triggered_slot: None,
+            },
+        };
+        let mut status = PlaybookPlanStatus {
+            current_hash: "1".into(),
+            // The run record reached `Aborted`, but its active-run mirror never landed. The plan
+            // therefore still carries the preceding verdict and already-refunded attempt count.
+            retry_count: 1,
+            phase: Phase::HostsUnreachable,
+            ..Default::default()
+        };
+
+        apply_abandoned_run_status(&mut status, &run);
+
+        assert_eq!(status.retry_count, 1);
+        assert_eq!(status.phase, Phase::HostsUnreachable);
+        assert!(status.active_run.is_none());
+    }
+
     /// The finalizer edits must be surgical: the list they rewrite also holds Kubernetes' own
     /// `foregroundDeletion` entry and anything another controller put there, and the merge patch
     /// that writes it replaces the array wholesale — so dropping a stranger's entry here would
@@ -7038,6 +8181,133 @@ mod tests {
         assert!(taken(&[failed("run-1"), running], 3));
     }
 
+    /// The refund and the window must agree. A scheduled `OneShot` run that reached every host it
+    /// could and missed only Nodes already down at its launch hands its attempt back, so its
+    /// `Failed` record must not close the window as a spent try — with `maxAttempts: 1` it did, and
+    /// a Node returning inside the window waited for the next tick instead of starting the run the
+    /// refund was for.
+    #[test]
+    fn a_refunded_oneshot_run_leaves_its_window_open() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1a").unwrap();
+
+        let plan_in = |mode| {
+            let mut plan = PlaybookPlan::new(
+                "plan",
+                PlaybookPlanSpec {
+                    mode,
+                    ..Default::default()
+                },
+            );
+            plan.metadata.uid = Some("plan-uid".into());
+            plan
+        };
+        let failed_record = |hosts: &[(&str, v1beta1::HostOutcome)],
+                             unreachable: &[(&str, bool)]| {
+            let mut play = Play::new(
+                "run-1",
+                v1beta1::PlaySpec {
+                    playbook_plan: "plan".into(),
+                    playbook_plan_uid: "plan-uid".into(),
+                    execution_hash: "1a".into(),
+                    run_id: "run-1".into(),
+                    preparation_fingerprint: "fp".into(),
+                    run_number: 1,
+                    attempt: 1,
+                    inventory: Vec::new(),
+                    triggered_slot: Some(slot),
+                },
+            );
+            play.metadata.owner_references = Some(vec![OwnerReference {
+                uid: "plan-uid".into(),
+                name: "plan".into(),
+                ..Default::default()
+            }]);
+            play.status = Some(terminal_play_status(
+                v1beta1::PlayPhase::Failed,
+                hosts,
+                unreachable,
+            ));
+            play
+        };
+
+        let oneshot = plan_in(ExecutionMode::OneShot);
+        let missed_a_down_node = failed_record(
+            &[
+                ("node-a", v1beta1::HostOutcome::Succeeded),
+                ("node-b", v1beta1::HostOutcome::Unreachable),
+            ],
+            &[("node-b", true)],
+        );
+
+        // Both halves of the start gate, after the refund this run earned.
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 1,
+            retry_count_slot: Some(slot),
+            ..Default::default()
+        };
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 1, 1, slot),
+            &classify_run_failure(missed_a_down_node.status.as_ref().unwrap()),
+            None,
+        );
+        assert!(!retry_budget_closes_window(
+            &Phase::HostsUnreachable,
+            status.retry_count,
+            status.retry_count_slot,
+            Some(slot),
+            1,
+        ));
+        assert!(!window_taken_by_a_record(
+            std::slice::from_ref(&missed_a_down_node),
+            &oneshot,
+            slot,
+            &hash,
+            1,
+        ));
+
+        // A run the refund turns down still spent its try, and still closes the window.
+        let reached_nobody = failed_record(
+            &[("node-b", v1beta1::HostOutcome::Unreachable)],
+            &[("node-b", true)],
+        );
+        let proxy_never_came_up = failed_record(
+            &[
+                ("node-a", v1beta1::HostOutcome::Succeeded),
+                ("node-b", v1beta1::HostOutcome::NotReached),
+            ],
+            &[("node-b", false)],
+        );
+        for (what, play) in [
+            ("a run that reached nobody", &reached_nobody),
+            (
+                "a Ready Node whose proxy never came up",
+                &proxy_never_came_up,
+            ),
+        ] {
+            assert!(
+                window_taken_by_a_record(std::slice::from_ref(play), &oneshot, slot, &hash, 1),
+                "{what}"
+            );
+        }
+
+        // `Recurring` is never refunded, and a second run in its slot is what the records exist to
+        // prevent.
+        assert!(window_taken_by_a_record(
+            std::slice::from_ref(&missed_a_down_node),
+            &plan_in(ExecutionMode::Recurring),
+            slot,
+            &hash,
+            1,
+        ));
+    }
+
     #[test]
     fn namespace_and_name_requires_both() {
         let mut pp = PlaybookPlan::new("placeholder", PlaybookPlanSpec::default());
@@ -7307,7 +8577,9 @@ mod tests {
                     },
                     execution_hash: hash,
                 },
-                outcome: v1beta1::PlayPhase::Failed,
+                verdict: Phase::Failed,
+                failure: RunFailure::Real,
+                diagnostic: RunDiagnostic::None,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -7331,7 +8603,9 @@ mod tests {
                     },
                     execution_hash: hash,
                 },
-                outcome: v1beta1::PlayPhase::Unknown,
+                verdict: Phase::Failed,
+                failure: RunFailure::Real,
+                diagnostic: RunDiagnostic::None,
             }),
             "spec.timeZone is invalid".into(),
         );
@@ -7757,6 +9031,88 @@ spec:
     }
 
     #[test]
+    fn a_no_activity_diagnostic_survives_the_empty_recurring_inventory_summary() {
+        let now = "2025-08-12T20:00:10Z".parse::<DateTime<Utc>>().unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Succeeded,
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        update_idle_recurring_status(
+            &ExecutionMode::Recurring,
+            Some(&Schedule::parse("0 20 * * *").unwrap()),
+            false,
+            false,
+            now,
+            &mut status,
+        );
+        apply_run_diagnostic(
+            &mut status,
+            RunDiagnostic::NoPlaybookActivity { hosts: 3, of: 3 },
+        );
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("plan currently resolves to no hosts (the playbook ran no task on 3 of 3 hosts)")
+        );
+    }
+
+    /// The point of the overflow variant: without it the plan's only account of itself is "the
+    /// recap could not be read", which a crashed container produces too. The number is what tells a
+    /// reader it is a size problem and not a broken playbook or a down fleet.
+    #[test]
+    fn an_overflowed_recap_says_so_and_names_the_host_count() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Failed,
+            summary: Some("run failed".into()),
+            ..Default::default()
+        };
+
+        apply_run_diagnostic(&mut status, RunDiagnostic::RecapOverflowed { hosts: 900 });
+
+        let summary = status.summary.as_deref().unwrap();
+        assert!(summary.starts_with("run failed"), "{summary}");
+        assert!(summary.contains("900 hosts"), "{summary}");
+        assert!(
+            summary.contains("termination-message limit"),
+            "the reason has to be nameable by someone who has never read this code: {summary}"
+        );
+    }
+
+    /// A run with nothing to report leaves the summary exactly as the rest of the tick wrote it.
+    #[test]
+    fn no_diagnostic_leaves_the_summary_untouched() {
+        let mut status = PlaybookPlanStatus {
+            summary: Some("3/3 up-to-date".into()),
+            ..Default::default()
+        };
+
+        apply_run_diagnostic(&mut status, RunDiagnostic::None);
+
+        assert_eq!(status.summary.as_deref(), Some("3/3 up-to-date"));
+    }
+
+    /// The two reasons cannot both hold — `NoPlaybookActivity` is read off recap counters and an
+    /// overflowed recap has none — so a record whose counters are empty because there *was* no
+    /// recap must not be reported as an empty playbook.
+    #[test]
+    fn an_unreadable_recap_is_not_mistaken_for_an_empty_playbook() {
+        let unreadable = v1beta1::PlayStatus {
+            phase: v1beta1::PlayPhase::Unknown,
+            host_count: 900,
+            recap: v1beta1::PlayRecap::default(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            RunDiagnostic::from_play_status(&unreadable),
+            RunDiagnostic::None
+        );
+    }
+
+    #[test]
     fn a_schedule_deadline_crossed_during_reconcile_requeues_immediately() {
         let until = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let now = "2025-08-12T20:00:01Z".parse::<DateTime<Utc>>().unwrap();
@@ -7878,15 +9234,118 @@ spec:
         };
 
         let mut suspended = forecast();
-        suspended_advertises_no_next_run(true, &mut suspended);
+        suspended_advertises_no_pending_run(true, &mut suspended);
         assert_eq!(suspended.next_run, None);
         // Only the forecast: the phase keeps saying what the plan's underlying state is, and the
         // `Suspended` printer column is what says it is paused.
         assert_eq!(suspended.phase, Phase::Delayed);
 
         let mut running = forecast();
-        suspended_advertises_no_next_run(false, &mut running);
+        suspended_advertises_no_pending_run(false, &mut running);
         assert_eq!(running.next_run, forecast().next_run);
+    }
+
+    /// The gate answers "would a run started now be pointless", so a plan whose schedule window is
+    /// shut is not held by it — it is waiting on the clock, and the `Delayed` arm says so with a
+    /// phase and a `nextRun`. Without the timing half, a scheduled `OneShot` held during its window
+    /// would keep `NodesNotReady` standing after the window closed, naming a Node as the reason
+    /// while the status beside it named the clock.
+    #[test]
+    fn a_plan_outside_its_schedule_window_is_not_held_by_its_nodes() {
+        let groups = vec![ResolvedInventoryGroup::ManagedSsh {
+            hosts: v1beta1::ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".to_string()],
+            },
+            tolerations: None,
+            variables: None,
+        }];
+        let unready = ["worker-1".to_string()];
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+
+        assert!(held_back_by_unready_nodes(
+            &Timing::Now(Some(slot)),
+            &ExecutionMode::OneShot,
+            &groups,
+            &unready
+        ));
+        assert!(
+            !held_back_by_unready_nodes(
+                &Timing::Delayed(slot),
+                &ExecutionMode::OneShot,
+                &groups,
+                &unready
+            ),
+            "a shut window is why nothing is running, not the Node"
+        );
+        // The gate's own half still decides the rest: `Recurring` never holds.
+        assert!(!held_back_by_unready_nodes(
+            &Timing::Now(Some(slot)),
+            &ExecutionMode::Recurring,
+            &groups,
+            &unready
+        ));
+    }
+
+    /// A plan suspended while the readiness gate holds it. The hold is a queued run, so suspension
+    /// retracts it exactly as it retracts a forecast: the gate's own predicate reads only the mode,
+    /// the groups and the down Nodes, so it stays true and would leave `NodesNotReady` standing —
+    /// with a summary naming a Node — over a plan that is not waiting for any Node.
+    #[test]
+    fn a_suspended_plan_retires_the_hold_that_was_waiting_for_its_nodes() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Pending,
+            ..Default::default()
+        };
+        hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
+        assert!(status::held_for_unready_nodes(&status));
+
+        suspended_advertises_no_pending_run(true, &mut status);
+
+        assert!(!status::held_for_unready_nodes(&status));
+        let summary = status.summary.as_deref().unwrap();
+        assert!(
+            !summary.contains("worker-1"),
+            "the Node is not why nothing is running any more: {summary}"
+        );
+        assert!(summary.contains("suspended"), "{summary}");
+        assert!(
+            status
+                .conditions
+                .iter()
+                .all(|condition| condition.type_ != "Ready"),
+            "a plan that never ran had no Ready before the hold, and gets none back"
+        );
+    }
+
+    /// The proxy-pod wait shares the condition but belongs to a run that is already under way, and
+    /// suspension lets such a run finish. Retiring it here would blank the only status saying why
+    /// that run is sitting still.
+    #[test]
+    fn suspending_a_plan_leaves_a_running_plans_proxy_wait_alone() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Applying,
+            summary: Some("applying run 3".to_string()),
+            ..Default::default()
+        };
+        let hosts = ["worker-1".to_string()];
+        status::set_waiting_for_nodes_condition(
+            &mut status,
+            Some(status::WaitingForNodes::ProxyPods(&hosts)),
+        );
+
+        suspended_advertises_no_pending_run(true, &mut status);
+
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "WaitingForNodes")
+            .expect("the proxy wait must survive");
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("ProxyPodsNotReady"));
+        assert_eq!(status.summary.as_deref(), Some("applying run 3"));
     }
 
     /// The suspend half of the unlaunched-run decision: a suspended plan must never keep an
@@ -8269,6 +9728,61 @@ spec:
         assert_eq!(applying.phase, Phase::Applying);
     }
 
+    /// The retire in `reconcile` is computed from the resolved groups, so a tick that cannot resolve
+    /// them returns before reaching it. Without this the plan would report `Ready=False` because its
+    /// inventory is unreadable *and* `WaitingForNodes` naming a Node it is no longer waiting on —
+    /// and would not start a run if that Node came back.
+    #[test]
+    fn an_unreadable_input_retires_a_readiness_hold_but_not_a_proxy_pod_wait() {
+        let nodes = ["worker-1".to_string()];
+
+        let mut held = PlaybookPlanStatus::default();
+        status::set_waiting_for_nodes_condition(
+            &mut held,
+            Some(status::WaitingForNodes::NodesNotReady(&nodes)),
+        );
+        record_input_failure(
+            &mut held,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        assert!(
+            !status::held_for_unready_nodes(&held),
+            "the hold ended when the inventory that named its hosts stopped resolving"
+        );
+
+        // The same condition, asserted by a run in flight rather than by the gate. That run is still
+        // executing — the read failure does not stop its Job — so its wait is still true and must
+        // survive. The `active_run` guard is what separates them.
+        let mut waiting_on_proxies = PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+            }),
+            ..Default::default()
+        };
+        status::set_waiting_for_nodes_condition(
+            &mut waiting_on_proxies,
+            Some(status::WaitingForNodes::ProxyPods(&nodes)),
+        );
+        record_input_failure(
+            &mut waiting_on_proxies,
+            "cannot resolve the plan's inventories: nope".into(),
+        );
+        let waiting = waiting_on_proxies
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "WaitingForNodes")
+            .unwrap();
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("ProxyPodsNotReady"));
+    }
+
     /// Once desired inputs are readable, an idle Recurring plan must replace the outage summary
     /// immediately rather than carrying it until the next scheduled run. Preserving the verdict is
     /// what lets a failed plan keep saying that its last run failed in the restored summary.
@@ -8419,6 +9933,162 @@ spec:
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    /// A plan held for down nodes has to say so without erasing what it last did: the verdict is
+    /// still the truth about the previous run, and the summary and condition are what explain why
+    /// there is not a new one. The forecast stays too — the hold is only ever entered for a plan
+    /// whose slot is already due, so a scheduled one is holding a run it still owes, and blanking
+    /// `nextRun` would say the opposite.
+    #[test]
+    fn a_plan_held_for_unready_nodes_reports_them_and_keeps_its_verdict() {
+        let next_run = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Failed,
+            summary: Some("0/1 up-to-date (1 outdated, last run failed)".into()),
+            next_run: Some(next_run),
+            ..Default::default()
+        };
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
+
+        assert_eq!(
+            status.phase,
+            Phase::Failed,
+            "a node going down does not undo the previous run's verdict"
+        );
+        assert_eq!(status.next_run, Some(next_run));
+        let summary = status.summary.as_deref().unwrap();
+        assert!(summary.contains("worker-1"), "{summary}");
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "WaitingForNodes")
+            .expect("the hold must be visible as a condition");
+        assert_eq!(waiting.status, "True");
+        assert_eq!(
+            waiting.reason.as_deref(),
+            Some("NodesNotReady"),
+            "distinguishable from a run waiting on its proxy pods"
+        );
+        let ready = status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .expect("a held plan is not converged, whatever its last verdict");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("NodesNotReady"));
+    }
+
+    /// A plan with no verdict yet has no lifecycle state worth keeping while it waits, so the hold
+    /// leaves it `Pending` rather than inventing one.
+    #[test]
+    fn a_plan_held_before_its_first_run_stays_pending() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Delayed,
+            ..Default::default()
+        };
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-1".to_string()]);
+
+        assert_eq!(status.phase, Phase::Pending);
+    }
+
+    /// A `OneShot` plan whose last run converged `worker-1`, and whose inventory has since gained
+    /// `worker-2` — the host a Node outage then holds it back from.
+    fn converged_plan_gaining_a_host(hash: &ExecutionHash) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            phase: Phase::Succeeded,
+            summary: Some("1/1 up-to-date".into()),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec!["worker-1".into(), "worker-2".into()],
+            }],
+            hosts_status: Some(BTreeMap::from([(
+                "worker-1".into(),
+                v1beta1::HostStatus {
+                    last_applied_hash: hash.to_string(),
+                    last_outcome: v1beta1::HostOutcome::Succeeded,
+                    ..Default::default()
+                },
+            )])),
+            conditions: vec![v1beta1::PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "True".into(),
+                reason: Some("AllHostsSucceeded".into()),
+                message: Some("1/1 hosts completed successfully".into()),
+                last_transition_time: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn ready_condition(status: &PlaybookPlanStatus) -> v1beta1::PlaybookPlanCondition {
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .cloned()
+            .expect("the plan carries a Ready condition")
+    }
+
+    /// The phase keeps the last run's verdict while the plan is held, but `Ready` must not: the
+    /// new host has never been applied to, and a green `Ready` over it reads as converged. Once
+    /// that host leaves the inventory the plan *is* converged again, and `Ready` and the summary
+    /// have to say so on that tick — there is no run coming that would say it for them.
+    #[test]
+    fn a_held_plan_is_not_ready_until_the_down_host_leaves_its_inventory() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = converged_plan_gaining_a_host(&hash);
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-2".to_string()]);
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        let held = ready_condition(&status);
+        assert_eq!(held.status, "False");
+        assert_eq!(held.reason.as_deref(), Some("NodesNotReady"));
+
+        hold_plan_for_unready_nodes(&mut status, &["worker-2".to_string()]);
+        assert_eq!(
+            ready_condition(&status).last_transition_time,
+            held.last_transition_time,
+            "every tick of the hold re-asserts it, and that must not read as a transition"
+        );
+
+        status.eligible_hosts[0]
+            .hosts
+            .retain(|host| host == "worker-1");
+        let outdated = find_outdated_hosts(&status, &hash);
+        release_node_readiness_hold(&mut status, outdated.len());
+
+        assert!(!status::held_for_unready_nodes(&status));
+        let released = ready_condition(&status);
+        assert_eq!(released.status, "True");
+        assert_eq!(released.reason.as_deref(), Some("HostsUpToDate"));
+        assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    /// Suspension retires the hold, `Ready` overlay included — but the host it was waiting for is
+    /// still not applied to, so `Ready` is restated as outdated rather than handed back the `True`
+    /// of the run before it.
+    #[test]
+    fn a_suspended_hold_restates_ready_from_the_hosts_it_left_unapplied() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = converged_plan_gaining_a_host(&hash);
+        hold_plan_for_unready_nodes(&mut status, &["worker-2".to_string()]);
+
+        suspended_advertises_no_pending_run(true, &mut status);
+
+        let ready = ready_condition(&status);
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason.as_deref(), Some("HostsOutdated"));
+        assert_eq!(
+            ready.message.as_deref(),
+            Some("1/2 hosts on the current revision")
+        );
     }
 
     /// A recovered run is put back onto the plan whole, but its retry number only counts towards
@@ -8916,6 +10586,682 @@ spec:
         }
     }
 
+    /// A finished run's terminal status, in the shape `record_finished` writes it: a verdict, the
+    /// per-host outcomes, and the hosts the run excluded — each with whether its Node was itself
+    /// down, which is the half the budget turns on.
+    fn terminal_play_status(
+        phase: v1beta1::PlayPhase,
+        hosts: &[(&str, v1beta1::HostOutcome)],
+        unreachable_hosts: &[(&str, bool)],
+    ) -> v1beta1::PlayStatus {
+        v1beta1::PlayStatus {
+            phase,
+            hosts: hosts
+                .iter()
+                .map(|(host, outcome)| {
+                    (
+                        host.to_string(),
+                        v1beta1::PlayHostResult {
+                            recap: v1beta1::PlayRecap::default(),
+                            outcome: outcome.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            unreachable_hosts: unreachable_hosts
+                .iter()
+                .map(|(host, node_not_ready)| v1beta1::UnreachableHost {
+                    host: host.to_string(),
+                    node_not_ready: *node_not_ready,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The reboot workflow, which is the one this behaviour was built around: a playbook reboots
+    /// its target, the connection drops, and the Node is `NotReady` for minutes. Exclusion keys off
+    /// "the proxy pod did not come up within the window", never off "this Node was down at some
+    /// point" — so on the retry that the Node's return releases, a proxy is scheduled, comes up
+    /// with a real address, and the host is in the run like any other. Keying it off the Node's
+    /// history instead would leave the post-reboot check permanently excluded from its own plan.
+    #[test]
+    fn a_node_whose_proxy_came_up_is_in_the_run_at_its_real_address() {
+        let hosts = managed_ssh_host_map(
+            vec![
+                managed_ssh::ProxyPodInfo {
+                    host: "node-a".into(),
+                    pod_ip: "10.42.1.7".into(),
+                    port: 22,
+                },
+                managed_ssh::ProxyPodInfo {
+                    host: "node-b".into(),
+                    pod_ip: "10.42.3.9".into(),
+                    port: 22,
+                },
+            ],
+            &[],
+        );
+
+        assert!(matches!(
+            hosts["node-b"],
+            ansible::ManagedSshHostInfo::Proxy { ref pod_ip, port } if pod_ip == "10.42.3.9" && port == 22
+        ));
+        assert_eq!(hosts.len(), 2);
+    }
+
+    /// The guard on launching a Job at all. A run still has work whenever anything it targets can
+    /// be reached, and a `StaticInventory` host never had a proxy pod to fail — so a plan spanning
+    /// both kinds must not be written off because its Nodes are down.
+    #[test]
+    fn a_run_is_only_pointless_when_every_host_it_targets_is_unreachable() {
+        let excluded = |hosts: &[&str]| -> Vec<v1beta1::UnreachableHost> {
+            hosts
+                .iter()
+                .map(|host| v1beta1::UnreachableHost {
+                    host: host.to_string(),
+                    node_not_ready: true,
+                })
+                .collect()
+        };
+        let hosts =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|name| name.to_string()).collect() };
+
+        assert!(nothing_left_to_reach(
+            &hosts(&["node-a", "node-b"]),
+            &excluded(&["node-a", "node-b"])
+        ));
+        assert!(!nothing_left_to_reach(
+            &hosts(&["node-a", "node-b"]),
+            &excluded(&["node-a"])
+        ));
+        assert!(
+            !nothing_left_to_reach(&hosts(&["node-a", "ccu.fritz.box"]), &excluded(&["node-a"])),
+            "an SSH host is reached without a proxy pod, so the run still has work"
+        );
+        assert!(!nothing_left_to_reach(&hosts(&["node-a"]), &[]));
+        // Never reached with an empty run, and a vacuous `all` must not make one look pointless.
+        assert!(!nothing_left_to_reach(&[], &[]));
+    }
+
+    /// The rule the attempt budget turns on: a failure is only forgiven when every host that did
+    /// not succeed sat on a Node the run had already written down as not `Ready`. Anything the
+    /// operator did reach is a real failure, because no Node coming back will change it.
+    #[test]
+    fn a_failure_is_only_confined_to_unreachable_nodes_when_the_run_recorded_them() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Succeeded,
+                &[("node-a", HostOutcome::Succeeded)],
+                &[],
+            )),
+            RunFailure::None
+        );
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true)],
+            )),
+            RunFailure::OnlyUnreachableNodes,
+            "every host the operator could reach succeeded"
+        );
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Failed),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true)],
+            )),
+            RunFailure::Real,
+            "the playbook failed on a host that was reached"
+        );
+
+        // Excluded for a reason a Node event will never fix: Kubernetes called the Node `Ready`,
+        // and the proxy pod still never came up — an untolerated taint, a failing image pull. It
+        // is excluded from the run exactly like a down Node, so only the recorded flag separates
+        // them, and getting that wrong would refund attempts to a broken configuration forever.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", false)],
+            )),
+            RunFailure::Real,
+            "a Ready Node whose proxy never came up is a configuration problem"
+        );
+
+        // One of each in the same run: the refund is all-or-nothing, so the taint-blocked host
+        // makes the whole run real however many down Nodes it shared the run with.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                    ("node-c", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true), ("node-c", false)],
+            )),
+            RunFailure::Real
+        );
+
+        // A Node that was `Ready` at launch: either it went down mid-run — the reboot case, where
+        // the operator did reach it — or its proxy pod never came up on a Node Kubernetes calls
+        // healthy. Neither is recorded, and neither is resolved by a Node event.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[("node-a", HostOutcome::Failed)],
+                &[],
+            )),
+            RunFailure::Real
+        );
+
+        // No recap was read at all, so nothing proves any host was reached — including the ones
+        // the run recorded.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Unknown,
+                &[("node-b", HostOutcome::Unknown)],
+                &[("node-b", true)],
+            )),
+            RunFailure::Real
+        );
+    }
+
+    fn rotated(revision: &str, phase: Phase) -> PlaybookPlanStatus {
+        PlaybookPlanStatus {
+            phase,
+            retry_count: 3,
+            observed_ssh_key_revision: Some(revision.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The rule the whole feature is: rotating the key a plan's `StaticInventory` hosts rejected
+    /// hands that plan its attempt budget back, so the rotation is a fix it can actually act on.
+    /// Without the reset the plan is woken and immediately declines — its tries are long spent,
+    /// because a static host has no proxy grace window in front of it and three attempts burn in
+    /// seconds.
+    #[test]
+    fn rotating_the_ssh_key_gives_a_failed_plan_its_attempts_back() {
+        let mut status = rotated("old", Phase::Failed);
+
+        assert!(sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("new")
+        ));
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// A converged plan is left alone. Rotating a key changes how the operator connects, not what it
+    /// applies, so there is nothing for it to do — and re-applying a playbook to healthy hosts
+    /// because their credentials were rotated is the behaviour this whole design exists to avoid.
+    #[test]
+    fn rotating_the_ssh_key_does_not_disturb_a_plan_that_succeeded() {
+        let mut status = rotated("old", Phase::Succeeded);
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("new")
+        ));
+        assert_eq!(status.retry_count, 3);
+        // Still recorded: the plan has seen this key, so a *later* failure must not be credited
+        // with a rotation that already happened.
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// The upgrade case. Every plan that predates this field observes its key for the first time on
+    /// the first tick after the operator is upgraded, and that is not a rotation — without this,
+    /// upgrading would hand a free retry to every failed plan in the cluster at once.
+    #[test]
+    fn the_first_observation_of_a_key_is_recorded_but_changes_nothing() {
+        let mut status = PlaybookPlanStatus {
+            phase: Phase::Failed,
+            retry_count: 3,
+            ..Default::default()
+        };
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("first")
+        ));
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("first"));
+    }
+
+    /// `None` covers both "this plan reaches no `StaticInventory` hosts" and "the Secrets could not
+    /// be read", and neither is evidence of anything. The second is why they are folded together: a
+    /// failed read that reset the budget would hand it back on every apiserver hiccup.
+    #[test]
+    fn an_unanswerable_key_observation_decides_nothing() {
+        let mut status = rotated("old", Phase::Failed);
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            None
+        ));
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("old"));
+    }
+
+    /// A rotation noticed mid-run is deferred rather than dropped: nothing is recorded, so the tick
+    /// that finds the plan idle still sees the change. Resetting here would talk over the attempt
+    /// the running run is currently spending.
+    #[test]
+    fn a_rotation_during_a_run_is_left_for_the_tick_after_it() {
+        let mut status = rotated("old", Phase::Applying);
+        status.active_run = Some(v1beta1::ActiveRun {
+            execution_hash: "abc".into(),
+            run_id: "run-1".into(),
+            job_name: "apply-plan-1".into(),
+            play_uid: "play-uid".into(),
+            hosts: vec!["ccu.fritz.box".into()],
+            run_number: 1,
+            attempt: 1,
+            triggered_slot: None,
+        });
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("new")
+        ));
+        assert_eq!(
+            status.observed_ssh_key_revision.as_deref(),
+            Some("old"),
+            "the rotation must still be there to notice once the run drains"
+        );
+    }
+
+    /// `Recurring` already restarts its budget at every schedule tick, so there is nothing to give
+    /// back — and `record_retry_budget` would clear the slot the current tick's budget belongs to.
+    #[test]
+    fn a_recurring_plan_records_the_rotation_without_touching_its_budget() {
+        let mut status = rotated("old", Phase::Failed);
+        status.retry_count_slot = Some(
+            "2025-08-12T20:00:00Z"
+                .parse::<DateTime<FixedOffset>>()
+                .unwrap(),
+        );
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::Recurring,
+            Some("new")
+        ));
+        assert_eq!(status.retry_count, 3);
+        assert!(status.retry_count_slot.is_some());
+        assert_eq!(status.observed_ssh_key_revision.as_deref(), Some("new"));
+    }
+
+    /// An unchanged key is not a rotation, however often the plan looks at it — otherwise every tick
+    /// of a failed plan would refund its budget and `maxAttempts` would stop bounding anything.
+    #[test]
+    fn an_unchanged_key_is_not_a_rotation() {
+        let mut status = rotated("same", Phase::Failed);
+
+        assert!(!sync_ssh_key_revision(
+            &mut status,
+            &ExecutionMode::OneShot,
+            Some("same")
+        ));
+        assert_eq!(status.retry_count, 3);
+    }
+
+    /// Only `StaticInventory` groups carry key material; a managed-ssh Node is reached with a
+    /// per-run certificate the operator mints itself, which no user rotates.
+    #[test]
+    fn only_static_inventory_groups_contribute_ssh_key_secrets() {
+        let groups = vec![
+            managed_ssh_group("workers", &["node-a"], None),
+            ssh_group_with_key("external", &["ccu.fritz.box"], "ccu", "ssh-key"),
+            ssh_group_with_key("more", &["pdu.fritz.box"], "pdu", "ssh-key"),
+            ssh_group_with_key("other", &["nas.fritz.box"], "nas", "other-key"),
+        ];
+
+        // Deduplicated: two inventories sharing a key must not hash it twice.
+        assert_eq!(
+            ssh_key_secret_names(&groups),
+            vec!["other-key".to_string(), "ssh-key".to_string()]
+        );
+        assert!(
+            ssh_key_secret_names(&[managed_ssh_group("workers", &["node-a"], None)]).is_empty()
+        );
+    }
+
+    fn finished_with(hosts: &[(&str, v1beta1::HostOutcome)]) -> v1beta1::PlayStatus {
+        let all_succeeded = hosts
+            .iter()
+            .all(|(_, outcome)| *outcome == v1beta1::HostOutcome::Succeeded);
+        v1beta1::PlayStatus {
+            phase: if all_succeeded {
+                v1beta1::PlayPhase::Succeeded
+            } else {
+                v1beta1::PlayPhase::Failed
+            },
+            ..terminal_play_status(v1beta1::PlayPhase::Failed, hosts, &[])
+        }
+    }
+
+    /// The verdict a plan parked on a machine that is not coming back reports. It is still a
+    /// failure — a host genuinely is not up to date — but it is not a *broken* one, and reporting it
+    /// as `Failed` left a plan healthily waiting for hardware indistinguishable at a glance from one
+    /// whose playbook does not work.
+    #[test]
+    fn a_run_left_only_with_hosts_it_could_not_reach_is_not_reported_as_failed() {
+        use v1beta1::HostOutcome;
+
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::Unreachable),
+            ])),
+            Phase::HostsUnreachable
+        );
+
+        // The single-host case, which is the one the review was written about: there are no other
+        // hosts to have succeeded, and the plan is still waiting for a machine rather than a fix.
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[("node-b", HostOutcome::Unreachable)])),
+            Phase::HostsUnreachable
+        );
+
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::Succeeded),
+            ])),
+            Phase::Succeeded
+        );
+    }
+
+    /// Gives `touched` an `ok` of its own, which is what a host a play reached carries in the common
+    /// case — `gather_facts` alone supplies it — and leaves the rest on the empty recap the
+    /// completion marker gets them.
+    fn succeeded_with_activity(hosts: &[(&str, bool)]) -> v1beta1::PlayStatus {
+        let mut status = terminal_play_status(
+            v1beta1::PlayPhase::Succeeded,
+            &hosts
+                .iter()
+                .map(|(host, _)| (*host, v1beta1::HostOutcome::Succeeded))
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        for (host, touched) in hosts {
+            if *touched {
+                let result = status.hosts.get_mut(*host).expect("just built");
+                result.recap.ok = 1;
+                status.recap.ok += 1;
+            }
+        }
+        status.host_count = status.hosts.len() as u32;
+        status
+    }
+
+    #[test]
+    fn a_successful_run_that_ran_nothing_anywhere_is_detected() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        let marker_only = succeeded_with_activity(&[("node-a", false), ("node-b", false)]);
+        assert_eq!(hosts_without_recap_activity(&marker_only), Some((2, 2)));
+
+        let worked = succeeded_with_activity(&[("node-a", true), ("node-b", true)]);
+        assert_eq!(hosts_without_recap_activity(&worked), None);
+
+        let failed =
+            terminal_play_status(PlayPhase::Failed, &[("node-a", HostOutcome::Failed)], &[]);
+        assert_eq!(hosts_without_recap_activity(&failed), None);
+        assert_eq!(
+            hosts_without_recap_activity(&v1beta1::PlayStatus {
+                phase: PlayPhase::Succeeded,
+                ..Default::default()
+            }),
+            None
+        );
+    }
+
+    /// The case the run-level question could not see: one play works and another names a group that
+    /// does not exist, so the working play's counters fill `status.recap` while the hosts the typo
+    /// missed are stamped with the current hash having run nothing. A `OneShot` plan then never
+    /// looks at them again, and reports `3/3 up-to-date`.
+    #[test]
+    fn hosts_a_working_playbook_never_reached_are_still_reported() {
+        let partially_applied =
+            succeeded_with_activity(&[("db-1", true), ("web-1", false), ("web-2", false)]);
+
+        assert_ne!(
+            partially_applied.recap,
+            v1beta1::PlayRecap::default(),
+            "the run-level total is non-empty, which is exactly what used to hide this"
+        );
+        assert_eq!(
+            hosts_without_recap_activity(&partially_applied),
+            Some((2, 3))
+        );
+    }
+
+    /// `sum_recap` counts every host Ansible processed, including the implicit localhost of a
+    /// `hosts: localhost` play, which is not one of the plan's hosts and gets no row. One such play
+    /// is therefore enough to put an `ok` in the run-level total while no inventory host ran
+    /// anything at all — the very case the run-level check was written for.
+    #[test]
+    fn a_localhost_play_does_not_mask_a_playbook_that_reached_no_inventory_host() {
+        let mut only_localhost_ran = succeeded_with_activity(&[("web-1", false), ("web-2", false)]);
+        only_localhost_ran.recap.ok = 1;
+
+        assert_eq!(
+            hosts_without_recap_activity(&only_localhost_ran),
+            Some((2, 2))
+        );
+    }
+
+    /// An empty per-host recap is not on its own the signature: a host the run excluded, or one a
+    /// `serial` batch stopped short of, also carries one. Only a host that came out `Succeeded`
+    /// having run nothing is a host the playbook silently skipped — and neither of the others can
+    /// occur under a `Succeeded` run anyway, so this pins the reason rather than the reachability.
+    #[test]
+    fn only_a_succeeded_host_counts_as_one_the_playbook_skipped() {
+        use v1beta1::HostOutcome;
+
+        for outcome in [
+            HostOutcome::Unreachable,
+            HostOutcome::NotReached,
+            HostOutcome::Incomplete,
+        ] {
+            let mut status = succeeded_with_activity(&[("node-a", true), ("node-b", false)]);
+            status.hosts.get_mut("node-b").expect("just built").outcome = outcome.clone();
+
+            assert_eq!(
+                hosts_without_recap_activity(&status),
+                None,
+                "{outcome:?} says why the host was not reached; it is not a silent skip"
+            );
+        }
+    }
+
+    /// Where the two exclusions part ways, deliberately. `HostsUnreachable` says the plan is waiting
+    /// for a machine and there is nothing to fix; an untolerated taint, a failing image pull or a
+    /// rejecting webhook is somebody to fix, and the Node it sits on is `Ready` and will stay
+    /// `Ready`. `host_results` records that as `NotReached`, so the run reads `Failed` — which is
+    /// what `classify_run_failure` has always called it, spending an attempt on it rather than
+    /// refunding one.
+    #[test]
+    fn a_run_left_only_with_ready_nodes_whose_proxies_never_came_up_is_reported_as_failed() {
+        use v1beta1::HostOutcome;
+
+        // The Node was down: nothing to fix, and its return is what the plan is waiting for.
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::Unreachable),
+            ])),
+            Phase::HostsUnreachable
+        );
+
+        // The Node was `Ready` throughout and the proxy never came up anyway.
+        assert_eq!(
+            phase_for_finished_run(&finished_with(&[
+                ("node-a", HostOutcome::Succeeded),
+                ("node-b", HostOutcome::NotReached),
+            ])),
+            Phase::Failed
+        );
+    }
+
+    /// One host that was reached and did not work makes the unreachable ones no longer the whole
+    /// story: there is something to fix, and the phase has to say so.
+    #[test]
+    fn anything_reached_that_did_not_succeed_keeps_the_run_failed() {
+        use v1beta1::HostOutcome;
+
+        for spoiler in [
+            HostOutcome::Failed,
+            HostOutcome::NotReached,
+            HostOutcome::Incomplete,
+            HostOutcome::Unknown,
+        ] {
+            assert_eq!(
+                phase_for_finished_run(&finished_with(&[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                    ("node-c", spoiler.clone()),
+                ])),
+                Phase::Failed,
+                "{spoiler:?} beside an unreachable host is a plan with something to fix"
+            );
+        }
+
+        // A run whose recap was never read reports every host `Unknown`, which proves nothing about
+        // reachability — it must not be dressed up as a plan waiting for hardware.
+        assert_eq!(
+            phase_for_finished_run(&play_history::lost_run_status(
+                "job",
+                &["node-a".to_string()]
+            )),
+            Phase::Failed
+        );
+    }
+
+    /// `HostsUnreachable` is a failure everywhere the mechanics ask, and only differs from `Failed`
+    /// in what it tells a human. Missing one of these would be silent: the plan would stop retrying,
+    /// or would lose its verdict to a lifecycle state the moment it went idle.
+    #[test]
+    fn the_unreachable_verdict_behaves_as_a_failure_everywhere_but_the_wording() {
+        assert!(is_failure_verdict(&Phase::HostsUnreachable));
+        assert!(retry_due(&Phase::HostsUnreachable, 1, 3));
+        assert!(!retry_due(&Phase::HostsUnreachable, 3, 3));
+        // Kept, not overwritten, once the plan goes idle — under a schedule and under the readiness
+        // hold alike. A verdict replaced by `Delayed`/`Pending` would erase the only thing on the
+        // plan that says what its last run did.
+        assert_eq!(
+            phase_while_waiting_for_schedule(&Phase::HostsUnreachable),
+            Phase::HostsUnreachable
+        );
+        assert_eq!(
+            phase_under_readiness_overlay(&Phase::HostsUnreachable),
+            Phase::HostsUnreachable
+        );
+        // And it is not a success: a rotated SSH key still wakes such a plan, since an unreachable
+        // StaticInventory host is exactly what a new key might fix.
+        assert!(status::may_need_another_run(&PlaybookPlanStatus {
+            phase: Phase::HostsUnreachable,
+            ..Default::default()
+        }));
+    }
+
+    /// The bound on the refund, and the reason it is a bound rather than a nicety.
+    ///
+    /// A refund is credit for progress. A run that applied the playbook to nobody has none to be
+    /// credited with, so it spends its attempt however good its excuse — and that is what stops a
+    /// flapping Node running a plan forever: the start gate reads the Node at tick time while
+    /// `node_not_ready` is read a grace window later, so a Node that is `Ready` for the first and
+    /// down by the second passes the gate *and* earns the refund. Without this the plan starts a
+    /// fresh run every grace window for as long as the Node keeps alternating, each one holding
+    /// host Leases that block every other plan targeting those Nodes.
+    #[test]
+    fn a_run_that_applied_the_playbook_to_nobody_is_never_refunded() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        // The single-node plan whose Node went down after the gate let it through: the whole run,
+        // and nothing in it succeeded.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[("node-b", HostOutcome::Unreachable)],
+                &[("node-b", true)],
+            )),
+            RunFailure::Real,
+            "a run that reached nobody made no progress, whatever the reason"
+        );
+
+        // Same for a whole inventory of them — it is the absence of progress that decides, not how
+        // many Nodes were down.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Unreachable),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-a", true), ("node-b", true)],
+            )),
+            RunFailure::Real
+        );
+
+        // And the line it must not cross: one host applied is progress, so the feature still works
+        // for the case it exists for.
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Succeeded),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true)],
+            )),
+            RunFailure::OnlyUnreachableNodes
+        );
+    }
+
+    /// A host the playbook stopped short of is not progress either. The run aborted, so nothing
+    /// converged, and the down Node was not what caused it — crediting the run for reaching hosts
+    /// it left half-applied would refund an attempt that a broken playbook needs to spend.
+    #[test]
+    fn an_aborted_run_is_not_refunded_because_one_of_its_nodes_was_down() {
+        use v1beta1::{HostOutcome, PlayPhase};
+
+        assert_eq!(
+            classify_run_failure(&terminal_play_status(
+                PlayPhase::Failed,
+                &[
+                    ("node-a", HostOutcome::Incomplete),
+                    ("node-b", HostOutcome::Unreachable),
+                ],
+                &[("node-b", true)],
+            )),
+            RunFailure::Real
+        );
+    }
+
     #[test]
     fn finishing_the_same_revision_restores_its_slot_and_run_number() {
         let slot = "2025-08-12T20:00:00Z"
@@ -8934,7 +11280,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             None,
         );
 
@@ -8977,7 +11323,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 1, slot),
-            &v1beta1::PlayPhase::Succeeded,
+            &RunFailure::None,
             None,
         );
 
@@ -8989,6 +11335,73 @@ spec:
             false,
             has_work_to_start(&ExecutionMode::OneShot, false, !outdated.is_empty()),
             attempt_budget_available(&ExecutionMode::OneShot, status.retry_count, 1),
+        ));
+    }
+
+    /// A `OneShot` run whose only non-successes were Nodes nobody could reach applied everything
+    /// there was to apply, so it hands the budget back exactly as a successful one does. What keeps
+    /// that from looping is the start gate: the hosts still outdated are all on Nodes that are
+    /// down, so the plan holds until the Node watch says one is back.
+    #[test]
+    fn a_oneshot_run_that_only_missed_unreachable_nodes_does_not_spend_an_attempt() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            retry_count: 2,
+            retry_count_slot: Some(slot),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 3, 3, slot),
+            &RunFailure::OnlyUnreachableNodes,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 0);
+        assert_eq!(status.retry_count_slot, None);
+        assert!(attempt_budget_available(
+            &ExecutionMode::OneShot,
+            status.retry_count,
+            3
+        ));
+    }
+
+    /// The other half of the rule: a run that failed on something it reached still spends its try,
+    /// even when a `NotReady` Node was among its targets. Three of those and the plan stops, which
+    /// is the whole point of the budget.
+    #[test]
+    fn a_oneshot_run_that_failed_on_a_reachable_host_still_spends_its_attempt() {
+        let slot = "2025-08-12T20:00:00Z"
+            .parse::<DateTime<FixedOffset>>()
+            .unwrap();
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        let mut status = PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            ..Default::default()
+        };
+
+        sync_desired_hash_after_finished_run(
+            &mut status,
+            &hash,
+            &ExecutionMode::OneShot,
+            &finished_run(hash, 3, 3, slot),
+            &RunFailure::Real,
+            None,
+        );
+
+        assert_eq!(status.retry_count, 3);
+        assert_eq!(status.retry_count_slot, Some(slot));
+        assert!(!attempt_budget_available(
+            &ExecutionMode::OneShot,
+            status.retry_count,
+            3
         ));
     }
 
@@ -9008,7 +11421,7 @@ spec:
             &hash,
             &ExecutionMode::Recurring,
             &finished_run(hash, 3, 1, slot),
-            &v1beta1::PlayPhase::Succeeded,
+            &RunFailure::None,
             None,
         );
 
@@ -9053,7 +11466,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             None,
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             retry_due(&Phase::Failed, max_attempts, max_attempts),
             1,
             1,
@@ -9139,7 +11552,7 @@ spec:
             let outcome = decide_terminal(
                 &mode,
                 Some(&Schedule::parse("0 3 * * *").unwrap()),
-                &v1beta1::PlayPhase::Failed,
+                &Phase::Failed,
                 true,
                 1,
                 2,
@@ -9225,7 +11638,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -9264,7 +11677,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(hash, Some(live_slot))),
         );
 
@@ -9291,7 +11704,7 @@ spec:
             &hash,
             &ExecutionMode::OneShot,
             &finished_run(hash, 3, 2, finished_slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(hash, None)),
         );
 
@@ -9336,7 +11749,7 @@ spec:
                 &hash,
                 &ExecutionMode::OneShot,
                 &finished_run(hash, 3, 2, finished_slot),
-                &v1beta1::PlayPhase::Failed,
+                &RunFailure::Real,
                 Some(&surviving_run_in(phase.clone(), hash, Some(live_slot))),
             );
 
@@ -9386,7 +11799,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             None,
         );
 
@@ -9415,7 +11828,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving_run(old_hash, Some(slot))),
         );
 
@@ -9444,7 +11857,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 3, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             Some(&surviving),
         );
 
@@ -9471,7 +11884,7 @@ spec:
             &new_hash,
             &ExecutionMode::OneShot,
             &finished_run(old_hash, 3, 2, slot),
-            &v1beta1::PlayPhase::Failed,
+            &RunFailure::Real,
             None,
         );
 
@@ -9486,17 +11899,29 @@ spec:
     /// words beside it.
     #[test]
     fn the_summary_always_counts_the_hosts_that_are_current() {
-        assert_eq!(plan_summary(0, 5, false), "5/5 up-to-date");
-        assert_eq!(plan_summary(2, 5, false), "3/5 up-to-date (2 outdated)");
+        assert_eq!(plan_summary(0, 5, &Phase::Succeeded), "5/5 up-to-date");
+        assert_eq!(
+            plan_summary(2, 5, &Phase::Succeeded),
+            "3/5 up-to-date (2 outdated)"
+        );
         // A failed run leaves no drift when its hosts already carried this revision — which is the
         // ordinary `Recurring` failure, and the one a drift count alone reports as healthy.
-        assert_eq!(plan_summary(0, 5, true), "5/5 up-to-date (last run failed)");
         assert_eq!(
-            plan_summary(2, 5, true),
+            plan_summary(0, 5, &Phase::Failed),
+            "5/5 up-to-date (last run failed)"
+        );
+        // Beside a `HostsUnreachable` phase the same line must not say the run failed: the point of
+        // that phase is that nothing is broken, and this column is the one right next to it.
+        assert_eq!(
+            plan_summary(1, 5, &Phase::HostsUnreachable),
+            "4/5 up-to-date (1 outdated, could not reach every host)"
+        );
+        assert_eq!(
+            plan_summary(2, 5, &Phase::Failed),
             "3/5 up-to-date (2 outdated, last run failed)"
         );
         // A plan with no eligible hosts states it rather than dividing by zero.
-        assert_eq!(plan_summary(0, 0, false), "0/0 up-to-date");
+        assert_eq!(plan_summary(0, 0, &Phase::Succeeded), "0/0 up-to-date");
     }
 
     #[test]
@@ -9505,7 +11930,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             None,
-            &v1beta1::PlayPhase::Succeeded,
+            &Phase::Succeeded,
             false,
             0,
             3,
@@ -9519,6 +11944,38 @@ spec:
     }
 
     #[test]
+    fn a_no_activity_diagnostic_preserves_the_successful_terminal_outcome() {
+        let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let outcome = decide_terminal(
+            &ExecutionMode::OneShot,
+            None,
+            &Phase::Succeeded,
+            false,
+            0,
+            2,
+            now,
+        );
+        let mut status = PlaybookPlanStatus {
+            phase: outcome.phase,
+            next_run: outcome.next_run,
+            summary: Some(outcome.summary),
+            ..Default::default()
+        };
+        apply_run_diagnostic(
+            &mut status,
+            RunDiagnostic::NoPlaybookActivity { hosts: 2, of: 2 },
+        );
+
+        assert_eq!(status.phase, Phase::Succeeded);
+        assert_eq!(status.next_run, None);
+        assert_eq!(
+            status.summary.as_deref(),
+            Some("2/2 up-to-date (the playbook ran no task on 2 of 2 hosts)")
+        );
+        assert_eq!(outcome.requeue, None);
+    }
+
+    #[test]
     fn decide_terminal_oneshot_failed_run_fails_and_never_reschedules() {
         let now = "2025-08-12T20:00:00Z".parse::<DateTime<Utc>>().unwrap();
         // A schedule is irrelevant in OneShot — even with one set it must resolve terminally and
@@ -9526,7 +11983,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             Some(&Schedule::parse("0 3 * * *").unwrap()),
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             false,
             1,
             3,
@@ -9551,14 +12008,11 @@ spec:
                 .unwrap(),
         );
 
-        for (outcome, expected) in [
-            (v1beta1::PlayPhase::Succeeded, Phase::Succeeded),
-            (v1beta1::PlayPhase::Failed, Phase::Failed),
-        ] {
+        for expected in [Phase::Succeeded, Phase::Failed, Phase::HostsUnreachable] {
             let terminal = decide_terminal(
                 &ExecutionMode::Recurring,
                 Some(&Schedule::parse("0 3 * * *").unwrap()),
-                &outcome,
+                &expected,
                 false,
                 0,
                 2,
@@ -9582,7 +12036,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::Recurring,
             Some(&Schedule::parse("0 3 * * *").unwrap()),
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             false,
             0,
             2,
@@ -9602,7 +12056,7 @@ spec:
         let outcome = decide_terminal(
             &ExecutionMode::OneShot,
             None,
-            &v1beta1::PlayPhase::Unknown,
+            &Phase::Failed,
             false,
             0,
             2,
@@ -9618,7 +12072,7 @@ spec:
         let succeeded = decide_terminal(
             &ExecutionMode::Recurring,
             None,
-            &v1beta1::PlayPhase::Succeeded,
+            &Phase::Succeeded,
             false,
             0,
             2,
@@ -9627,7 +12081,7 @@ spec:
         let failed = decide_terminal(
             &ExecutionMode::Recurring,
             None,
-            &v1beta1::PlayPhase::Failed,
+            &Phase::Failed,
             false,
             0,
             2,

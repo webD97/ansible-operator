@@ -152,14 +152,120 @@ A Node matched by a `ClusterInventory` stays in the inventory even when it is `N
 still schedules the proxy pod onto it and waits for the pod to become Ready. While it waits, the
 `PlaybookPlan` carries a `WaitingForNodes` condition naming the pending Node(s).
 
-If the proxy pod does not become Ready within the wait window, the run proceeds without that Node:
-Ansible reports it **unreachable** for the run, and the Node is retried on the next run, so it heals on
-its own once it recovers. The wait window is set by the cluster operator and shrinks the longer a Node
-has been unreachable (see [Deployment](../cluster-operators/deployment.md)).
+If the proxy pod does not become Ready within the wait window, the run proceeds without that Node.
+There is no address to reach it at, so the run does not try: it passes `--limit '!<node>'` to
+`ansible-playbook`, which excludes the Node from execution while leaving it in the inventory. It is
+never recorded as `Failed`, since no task ever ran on it; which [outcome
+](./results-and-troubleshooting.md#per-host-outcomes) it does get in `.status.hostsStatus` depends on
+what the operator saw at launch:
+
+- the Node was itself `NotReady` — `Unreachable`. For a `OneShot` plan its return to `Ready` starts
+  the next run on its own, so this heals without anyone touching the plan; a `Recurring` plan heals
+  at its next tick, which is the only thing that ever starts a run for it.
+- the Node was `Ready` and only the proxy pod failed to come up — `NotReached`. Nothing about the
+  Node is going to change, so nothing wakes the plan for it. See
+  [Unreachable Nodes and the attempt budget](#unreachable-nodes-and-the-attempt-budget) below and
+  [Hosts show `NotReached`](./results-and-troubleshooting.md#hosts-show-notreached).
+
+The wait window is set by the cluster operator and shrinks the longer a Node has been unreachable
+(see [Deployment](../cluster-operators/deployment.md)).
+
+Excluding rather than dropping is what keeps the inventory honest. The Node stays a member of its
+groups, so a playbook templating a cluster member list out of `groups['workers']` still sees the
+whole fleet — but nothing dials it, so a playbook that aborts on the first unreachable host
+(`any_errors_fatal: true`, a `serial` batch, `max_fail_percentage`) runs to completion on the hosts
+that are up instead of stopping at the one that is not.
+
+The one thing exclusion gives up is `max_fail_percentage` as a fleet-availability check: an excluded
+Node is not part of the denominator, so a rollout guarded that way no longer aborts because too much
+of the fleet is unavailable. It still aborts on hosts that were reached and failed.
 
 The same bounded wait applies when a proxy from an interrupted credential reset is still terminating.
 It is never reused, even if Kubernetes still reports it `Ready`; after the deadline the Node is marked
 unreachable for that run rather than holding the run and its host locks indefinitely.
+
+### Holding instead of starting
+
+All of the above is about a run that has already started. A `OneShot` plan that has *not* started one
+asks a cheaper question first: if **every** Node the run would target is `NotReady`, there is nothing
+for the run to do, so the plan holds instead of starting it. It carries a `WaitingForNodes` condition
+with reason `NodesNotReady`, and `.status.summary` names the Nodes it is waiting for. `Ready` is
+`False` with the same reason for as long as the hold lasts — the phase keeps the last run's
+verdict, but a plan holding a run has hosts it has not applied the current revision to.
+
+Holding rather than running matters because the run would achieve nothing and take the full wait
+window to find that out — a proxy pod per Node, every host lock held for the duration, and a `Failed`
+verdict that says nothing about the playbook. A held plan does none of that, and is released the
+moment one of those Nodes reports `Ready` again, which the operator notices at once.
+
+The hold is all-or-nothing on purpose. A run that can still reach *some* of its hosts goes ahead and
+reaches them; the `NotReady` ones stay in its inventory and are reported unreachable in the result
+rather than quietly dropped from it. `Recurring` plans never hold: their contract is to re-apply at
+every tick against whatever is reachable then.
+
+A plan can stay held indefinitely, and for a Node that is never coming back that is the intended
+resting state. It reads
+[`HostsUnreachable`](./results-and-troubleshooting.md#phases) rather than `Failed` for as
+long as that lasts, provided every host it did not apply to was one nothing could reach — the
+playbook is fine, and the plan is waiting for hardware. The condition says exactly which Node. Removing the Node from the cluster
+or from the inventory's selector is what ends it.
+
+The hold is asked before a run starts, so it cannot catch a proxy pod that fails *after* it passed.
+If that leaves a started run with every host excluded, the run is recorded straight away without a
+Job: there is no host for a playbook to run against. A host on a `NotReady` Node is `Unreachable`; a
+host whose Node was `Ready` but whose proxy failed is `NotReached`. A run containing only
+`Unreachable` hosts leaves the plan `HostsUnreachable`, while any `NotReached` host makes it
+`Failed`. It spends an attempt or not by the same rule as any other run — see below — and because no
+Job exists, there are no run logs for it. `.status.summary` and the `Play` record are where to look.
+
+### Unreachable Nodes and the attempt budget
+
+A run that can still reach some of its hosts does start, and it ends `Failed` if it could not reach
+the rest. That verdict stands — the result names every host that was not reached — but it does not
+cost the plan one of its [attempts](./scheduling-and-modes.md#retries), provided both halves hold:
+
+- the run **applied the playbook to at least one host**, and
+- every host that did *not* succeed sat on a Node that was already `NotReady` when the run launched.
+
+Then the run applied everything there was to apply, and a `OneShot` plan's budget is reset exactly as
+a fully successful run resets it. What the plan is waiting for is the Node, not another try, and the
+next try would be identical. On a scheduled plan the Node's return still starts that run within the
+same tick's `startingDeadlineSeconds` window, whatever `maxAttempts` is; once the window has closed
+it waits for the next tick.
+
+The first half is what keeps a plan from running forever against a Node that keeps coming and going.
+A refund is credit for progress, so a run that reached nobody spends its attempt however good its
+excuse — and a Node that alternates faster than the plan converges is exactly the case that would
+otherwise refund every attempt it costs. In the ordinary case this half never binds: a plan whose
+Nodes are *stably* down is held before it starts a run at all, and one with a healthy Node alongside
+the down one is applying the playbook to it.
+
+The cost is deliberate. A plan whose Nodes all go down between the readiness check and the launch
+spends an attempt, and after `maxAttempts` of that it stops — so a Node that flaps that many times
+and then genuinely returns needs someone to touch the plan (bump `maxAttempts`, or edit it) rather
+than converging on its own. Bounding the loop is worth more than converging through a flap. Once the
+budget is gone the Node stops waking the plan too, since there is no longer anything the plan is
+allowed to do about the Node coming back; touching the plan is what restores both.
+
+Only Nodes the operator recorded **at launch** count. Two failures that can look the same from the
+outside do spend an attempt, because no Node coming back resolves either:
+
+- a Node that was `Ready` when the run started and went down *while it ran* — a playbook that reboots
+  its target, say. The operator did reach it, and the run genuinely tried. What keeps the *following*
+  attempt from being spent is the hold above, for as long as the Node stays down.
+- a Node Kubernetes reports `Ready` whose proxy pod never came up anyway — an untolerated taint, a
+  failing image pull, a rejecting admission webhook. That is a configuration problem, and it is the
+  one the attempt budget exists to stop retrying. Such a host is reported
+  [`NotReached`](./results-and-troubleshooting.md#hosts-show-notreached), not `Unreachable`: the Node
+  is already `Ready`, so its heartbeats have nothing left to announce and the operator does not wake
+  the plan on them. The plan reads `Failed` rather than `HostsUnreachable`, which is the honest
+  answer — there is a pod spec to fix, not a machine to wait for.
+
+A run whose recap could not be read at all (`Unknown`, see
+[Results](./results-and-troubleshooting.md)) always spends its attempt: nothing proves any of its
+hosts was reached. So does a run the playbook aborted, since its surviving hosts are
+[`Incomplete`](./results-and-troubleshooting.md#hosts-show-incomplete) rather than applied — the
+down Node is not what stopped it, and the playbook failure is what needs the attempt.
 
 ## Requirements and limitations
 

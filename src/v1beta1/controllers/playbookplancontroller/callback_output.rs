@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 /// Per-host outcome counters, deserialized from the compact fixed-order array the callback plugin
-/// writes: `[ok, changed, unreachable, failed, skipped, rescued, ignored]`. Only `failed`/
-/// `unreachable` are consulted today (via `is_failure`); the rest mirror ansible's stats and are
-/// groundwork for future per-task progression info.
+/// writes: `[ok, changed, unreachable, failed, skipped, rescued, ignored, completed]`. Only
+/// `failed`/`unreachable` (via `is_failure`) and `completed` are consulted today; the rest mirror
+/// ansible's stats and are groundwork for future per-task progression info.
 #[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone, Default)]
-#[serde(from = "[u32; 7]")]
+#[serde(from = "[u32; 8]")]
 pub struct HostStats {
     pub ok: u32,
     pub changed: u32,
@@ -17,13 +17,29 @@ pub struct HostStats {
     pub skipped: u32,
     pub rescued: u32,
     pub ignored: u32,
+    /// The host produced a result for the completion marker the operator appends to every playbook,
+    /// so the playbook did not stop short of it. Not a counter: it is the one thing ansible's
+    /// counters cannot express, since a host cut short by an abort reports exactly what a host that
+    /// ran everything reports.
+    pub completed: bool,
 }
 
-impl From<[u32; 7]> for HostStats {
+impl From<[u32; 8]> for HostStats {
     /// Fixed wire order — must stay in lockstep with `ansible_operator_recap.py`. Changing it is
     /// a *shape*-compatible edit that would silently misread an in-flight message, so don't
     /// reorder: only ever add/remove positions (which changes the length and fails to parse).
-    fn from([ok, changed, unreachable, failed, skipped, rescued, ignored]: [u32; 7]) -> Self {
+    fn from(
+        [
+            ok,
+            changed,
+            unreachable,
+            failed,
+            skipped,
+            rescued,
+            ignored,
+            completed,
+        ]: [u32; 8],
+    ) -> Self {
         Self {
             ok,
             changed,
@@ -32,6 +48,7 @@ impl From<[u32; 7]> for HostStats {
             skipped,
             rescued,
             ignored,
+            completed: completed != 0,
         }
     }
 }
@@ -50,12 +67,82 @@ pub struct CallbackOutput {
     pub processed: BTreeMap<String, HostStats>,
 }
 
-/// Parses the container's termination message. Returns `None` if the message is empty or not
-/// parseable — truncated at the kubelet's size cap, or a hard crash (OOM/SIGKILL) before the
-/// stats hook ran. Callers must surface that as `HostOutcome::Unknown`, not `NotReached` (which
-/// means Ansible legitimately never got there).
+/// Marks a recap the callback deflated and base64-encoded because plain JSON would not have fitted
+/// the kubelet's termination-message cap. Must stay in lockstep with `COMPRESSED_PREFIX` in
+/// `ansible_operator_recap.py`.
+const COMPRESSED_PREFIX: &str = "z:";
+
+/// Marks a recap that would not fit even compressed, followed by the host count. Must stay in
+/// lockstep with `OVERSIZE_PREFIX` in `ansible_operator_recap.py`.
+const OVERSIZE_PREFIX: &str = "!:";
+
+/// The kubelet's `MaxContainerTerminationMessageLength`, which is what all of the above is working
+/// around. Read only to name the number in the diagnostic — the callback is what enforces it, since
+/// it is the side that decides what to write.
+pub const TERMINATION_MESSAGE_MAX_BYTES: usize = 4096;
+
+/// Ceiling on what a compressed recap may inflate to.
+///
+/// The termination message is written by a pod running the *user's* image, so it is untrusted input
+/// and a deflate stream is an amplifier: the kubelet's 4096-byte cap bounds what arrives, not what it
+/// expands to. The bound is far above any real recap — 800 hosts with long cloud-provider names is
+/// ~53 KB — so it can only ever reject something that was not a recap.
+const MAX_INFLATED_RECAP_BYTES: u64 = 1024 * 1024;
+
+/// Parses the container's termination message, plain or compressed. Returns `None` if the message is
+/// empty or not parseable — truncated at the kubelet's size cap, or a hard crash (OOM/SIGKILL)
+/// before the stats hook ran. Callers must surface that as `HostOutcome::Unknown`, not `NotReached`
+/// (which means Ansible legitimately never got there).
+///
+/// The compressed form exists because the cap is 4096 bytes per container and a plain recap runs out
+/// at roughly 60 hosts with cloud-provider node names — beyond which the message arrives as invalid
+/// JSON and every host reads `Unknown` on every retry until the attempt budget is gone. Compression
+/// is decided by the writer, per run, so a small fleet's message stays readable JSON; both forms are
+/// accepted here forever, since which one arrives depends on the fleet rather than on a version.
+///
+/// A prefix at the front is no truncation guard, in either direction: the message is trimmed at two
+/// layers and from opposite ends — the kubelet keeps the file's *last* 4096 bytes, and the status
+/// manager then keeps the *first* `12 KiB / containers` of what survived (see `job_builder`). A
+/// message that overflowed either arrives unparseable whichever end it lost, so the prefixes are
+/// legible only because the callback decides what fits before it writes.
 pub fn parse_callback_output(message: &str) -> Option<CallbackOutput> {
-    serde_json::from_str(message.trim()).ok()
+    let message = message.trim();
+
+    match message.strip_prefix(COMPRESSED_PREFIX) {
+        Some(encoded) => serde_json::from_slice(&inflate(encoded)?).ok(),
+        None => serde_json::from_str(message).ok(),
+    }
+}
+
+/// How many hosts a run had, when its recap overflowed the termination message even compressed.
+///
+/// Deliberately not folded into [`parse_callback_output`]: an overflowed recap carries no per-host
+/// data, so every outcome it produces is exactly what an unreadable message produces, and the
+/// verdicts must not diverge. What it does carry is the *reason*, which the operator has no other
+/// way to learn — a crashed run and an overflowed one are equally unparseable — so this is asked
+/// separately, by the one caller that turns it into a diagnostic.
+pub fn recap_overflowed_host_count(message: &str) -> Option<u32> {
+    message.trim().strip_prefix(OVERSIZE_PREFIX)?.parse().ok()
+}
+
+fn inflate(base64_encoded: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+
+    let deflated = base64::engine::general_purpose::STANDARD
+        .decode(base64_encoded)
+        .ok()?;
+
+    // One byte past the ceiling, so an over-long stream is *rejected* rather than silently cut to
+    // the limit — a truncation that happened to land on a closing brace would otherwise parse as a
+    // complete recap.
+    let mut inflated = Vec::new();
+    flate2::read::ZlibDecoder::new(deflated.as_slice())
+        .take(MAX_INFLATED_RECAP_BYTES + 1)
+        .read_to_end(&mut inflated)
+        .ok()?;
+
+    (inflated.len() as u64 <= MAX_INFLATED_RECAP_BYTES).then_some(inflated)
 }
 
 #[cfg(test)]
@@ -64,19 +151,21 @@ mod tests {
 
     #[test]
     fn parses_bare_host_array_map_positionally() {
-        let msg = r#"{"host-1":[2,1,0,0,0,0,0],"host-2":[2,0,0,1,0,0,0]}"#;
+        let msg = r#"{"host-1":[2,1,0,0,0,0,0,1],"host-2":[2,0,0,1,0,0,0,0]}"#;
 
         let parsed = parse_callback_output(msg).unwrap();
         assert_eq!(parsed.processed.len(), 2);
 
-        // [ok, changed, unreachable, failed, skipped, rescued, ignored]
+        // [ok, changed, unreachable, failed, skipped, rescued, ignored, completed]
         let h1 = &parsed.processed["host-1"];
         assert_eq!((h1.ok, h1.changed), (2, 1));
         assert!(!h1.is_failure());
+        assert!(h1.completed);
 
         let h2 = &parsed.processed["host-2"];
         assert_eq!(h2.failed, 1);
         assert!(h2.is_failure());
+        assert!(!h2.completed);
     }
 
     #[test]
@@ -92,10 +181,181 @@ mod tests {
         assert!(parse_callback_output("not json").is_none());
     }
 
+    /// Nothing but a test keeps the two spellings together, exactly as
+    /// `playbook_renderer::the_marker_task_name_matches_the_callback_that_reads_it` does for the
+    /// marker task. A drift here is invisible until a fleet is large enough to take the compressed
+    /// path — so it would first be seen on the clusters least able to afford it, as every host of
+    /// every run reading `Unknown`, and never on a cluster small enough for anyone to have tried
+    /// the format by hand.
+    #[test]
+    fn the_compressed_prefix_matches_the_callback_that_writes_it() {
+        let callback = include_str!("../../ansible/ansible_operator_recap.py");
+
+        assert!(
+            callback.contains(&format!("COMPRESSED_PREFIX = \"{COMPRESSED_PREFIX}\"")),
+            "the callback must mark a compressed recap with the prefix this parser strips"
+        );
+    }
+
+    fn compressed(json: &str) -> String {
+        use base64::Engine as _;
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(json.as_bytes()).unwrap();
+        format!(
+            "{COMPRESSED_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap())
+        )
+    }
+
+    /// The compressed form has to reach exactly the same `CallbackOutput` as the plain one — it is a
+    /// transport detail the writer picks per run based on fleet size, and nothing downstream is told
+    /// which arrived.
+    #[test]
+    fn a_compressed_recap_parses_to_the_same_thing_as_the_plain_one() {
+        let json = r#"{"host-1":[2,1,0,0,0,0,0,1],"host-2":[2,0,0,1,0,0,0,0]}"#;
+
+        let from_plain = parse_callback_output(json).unwrap();
+        let from_compressed = parse_callback_output(&compressed(json)).unwrap();
+
+        assert_eq!(from_compressed.processed.len(), from_plain.processed.len());
+        let h1 = &from_compressed.processed["host-1"];
+        assert_eq!((h1.ok, h1.changed), (2, 1));
+        assert!(h1.completed);
+        assert!(from_compressed.processed["host-2"].is_failure());
+    }
+
+    /// The whole point of the format: a fleet whose plain recap cannot fit the kubelet's 4096-byte
+    /// cap still round-trips. 200 hosts with EKS-style names is ~13 KB plain.
+    #[test]
+    fn a_recap_far_larger_than_the_kubelet_cap_round_trips_compressed() {
+        let hosts: Vec<String> = (0..200)
+            .map(|i| {
+                format!(
+                    r#""ip-10-0-{}-{}.eu-central-1.compute.internal":[12,3,0,0,7,0,0,1]"#,
+                    i / 250,
+                    i % 250
+                )
+            })
+            .collect();
+        let json = format!("{{{}}}", hosts.join(","));
+        assert!(json.len() > 4096, "the plain form must exceed the cap");
+
+        let wire = compressed(&json);
+        assert!(
+            wire.len() <= 4096,
+            "the compressed form must fit: {} bytes",
+            wire.len()
+        );
+        assert_eq!(parse_callback_output(&wire).unwrap().processed.len(), 200);
+    }
+
+    /// The message comes from a pod running the user's own image, so the compressed path is
+    /// untrusted input and the cap bounds only what *arrives*. A stream that inflates past the
+    /// ceiling is rejected like any other unreadable recap rather than allocated.
+    #[test]
+    fn a_decompression_bomb_is_refused_rather_than_inflated() {
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![b'a'; MAX_INFLATED_RECAP_BYTES as usize * 2])
+            .unwrap();
+        let bomb = {
+            use base64::Engine as _;
+            format!(
+                "{COMPRESSED_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap())
+            )
+        };
+        assert!(bomb.len() < 4096, "a bomb fits the cap; that is the point");
+
+        assert!(parse_callback_output(&bomb).is_none());
+    }
+
+    /// The marker exists to name the reason, not to change the answer: it carries no per-host data,
+    /// so it must parse as unreadable exactly like a crash does, and the host count must be
+    /// available separately.
+    #[test]
+    fn an_overflow_marker_is_unreadable_as_a_recap_but_names_its_host_count() {
+        assert!(parse_callback_output("!:900").is_none());
+        assert_eq!(recap_overflowed_host_count("!:900"), Some(900));
+        assert_eq!(recap_overflowed_host_count(" !:900\n"), Some(900));
+    }
+
+    /// The other half of the writer's contract, pinned for the same reason the compressed prefix
+    /// is: the marker is the only thing that turns the remaining ceiling into a diagnostic, and the
+    /// byte count is what the callback decides against. A drift in either leaves the operator
+    /// reporting a plain unreadable recap — silence — on precisely the fleets that need the reason.
+    #[test]
+    fn the_overflow_marker_and_the_cap_match_the_callback_that_applies_them() {
+        let callback = include_str!("../../ansible/ansible_operator_recap.py");
+
+        assert!(
+            callback.contains(&format!("OVERSIZE_PREFIX = \"{OVERSIZE_PREFIX}\"")),
+            "the callback must mark an overflowed recap with the prefix this reader looks for"
+        );
+        assert!(
+            callback.contains(&format!(
+                "TERMINATION_MESSAGE_MAX_BYTES = {TERMINATION_MESSAGE_MAX_BYTES}"
+            )),
+            "the diagnostic names a limit only the callback enforces, so it must be the same one"
+        );
+    }
+
+    #[test]
+    fn nothing_else_is_mistaken_for_an_overflow_marker() {
+        for message in [
+            "",
+            "!:",
+            "!:not-a-number",
+            "!:-1",
+            r#"{"host-1":[2,1,0,0,0,0,0,1]}"#,
+            "z:aGVsbG8=",
+        ] {
+            assert_eq!(
+                recap_overflowed_host_count(message),
+                None,
+                "{message:?} is not an overflow marker"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_compressed_message_returns_none_not_panic() {
+        assert!(parse_callback_output("z:not-base64!!").is_none());
+        assert!(
+            parse_callback_output("z:aGVsbG8=").is_none(),
+            "valid base64, not a zlib stream"
+        );
+        assert!(parse_callback_output("z:").is_none());
+    }
+
     #[test]
     fn wrong_length_array_returns_none() {
-        // A shape change (here 6 elements, not 7) fails to parse -> Unknown, never a silent misread.
+        // A shape change fails to parse -> Unknown, never a silent misread. The 7-element form is
+        // what a workspace rendered before the completion marker existed emits, and it must fail
+        // this way rather than be read as a 7-counter host with the last field defaulted.
         assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0]}"#).is_none());
+        assert!(parse_callback_output(r#"{"host-1":[2,0,0,1,0,0,0]}"#).is_none());
+    }
+
+    /// Completion is orthogonal to failure, and both directions occur: a host cut short by an
+    /// abort has clean counters and no completion, while a host that ignored an unreachable task
+    /// ran to the end with a counter set.
+    #[test]
+    fn completion_is_read_independently_of_the_counters() {
+        let msg = r#"{"cut-short":[1,1,0,0,1,0,0,0],"ignored-unreachable":[2,0,1,0,0,0,0,1]}"#;
+        let parsed = parse_callback_output(msg).unwrap();
+
+        let cut_short = &parsed.processed["cut-short"];
+        assert!(!cut_short.is_failure());
+        assert!(!cut_short.completed);
+
+        let ignored = &parsed.processed["ignored-unreachable"];
+        assert!(ignored.is_failure());
+        assert!(ignored.completed);
     }
 
     #[test]

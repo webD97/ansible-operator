@@ -192,9 +192,11 @@ spec:
                     outcome:
                       enum:
                       - Succeeded
-                      - Failed
                       - Unknown
+                      - Failed
+                      - Unreachable
                       - NotReached
+                      - Incomplete
                       type: string
                     recap:
                       description: |-
@@ -294,6 +296,48 @@ spec:
                 - skipped
                 - unreachable
                 type: object
+              unreachableHosts:
+                default: []
+                description: |-
+                  The managed-ssh hosts this run excluded from execution: their proxy pod never became Ready
+                  within the grace window, so there was no address to reach them at and the run passed
+                  `--limit '!<host>'` rather than dialling one. They stay in the rendered inventory, so
+                  `groups[]` still describes the full fleet.
+
+                  Their outcome in `hosts` follows `nodeNotReady`: `Unreachable` when the Node itself was down,
+                  `NotReached` when the Node was `Ready` and only its proxy pod failed. The two are recovered
+                  from in different places, and only the first is something a Node returning to `Ready` fixes.
+
+                  Written at the launch commit, because neither half is knowable later: the recap says nothing
+                  about a host it never processed, and the Node's own state cannot be re-read afterwards
+                  because by then it may have recovered.
+
+                  A run whose Job creation did not complete is resumed, re-reads its proxy pods and re-states
+                  this from what it finds, so that the record and the `--limit` file the same tick renders
+                  always describe one run. That still makes it "at launch": a run whose Job exists is adopted
+                  rather than resumed, so the last write is always the one immediately before the Job that ran.
+                items:
+                  description: |-
+                    A host excluded from a run, and the one distinction the exclusion itself does not carry.
+
+                    Both kinds are equally unreachable and are excluded identically, but they mean opposite things:
+                    a Node that was down is something no attempt could have helped with and that its own return
+                    resolves, while a `Ready` Node whose proxy pod never came up anyway — an untolerated taint, a
+                    failing image pull, a rejecting admission webhook — is a configuration problem that no Node event
+                    will ever resolve. Only the first is refunded an attempt, only the first is reported
+                    `Unreachable` (the second reads `NotReached`), and only the first keeps the host in the Node
+                    watch's wake set.
+                  properties:
+                    host:
+                      type: string
+                    nodeNotReady:
+                      description: The `Node` backing this host was itself not reporting `Ready` when the run launched.
+                      type: boolean
+                  required:
+                  - host
+                  - nodeNotReady
+                  type: object
+                type: array
             required:
             - failedHostCount
             - hostCount

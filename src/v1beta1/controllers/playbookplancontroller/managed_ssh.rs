@@ -22,7 +22,7 @@ use kube::{
     api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 
-use super::paths;
+use super::{node_readiness, paths};
 use crate::utils;
 use crate::v1beta1::{
     ca::CertificateAuthority,
@@ -31,7 +31,7 @@ use crate::v1beta1::{
         reconcile_error::{ReconcileError, is_not_found},
     },
     labels,
-    resources::Toleration,
+    resources::{Toleration, UnreachableHost},
 };
 
 pub const PROXY_SSH_PORT: i32 = 22;
@@ -65,12 +65,6 @@ const SFTP_SUBSYSTEM_MARKER: &str = "ansible-operator-sftp";
 /// namespace, never the host's (an ancestor), so a session can't join it via nsenter — the pod's
 /// PID namespace has to start out as the host's.
 const HOST_PROC_MOUNT_PATH: &str = "/host/proc";
-
-/// Unroutable stand-in `ansible_host` for a node whose proxy pod never became Ready in time (so it
-/// has no pod IP). `192.0.2.1` is RFC 5737 TEST-NET-1, a documentation range that never routes — the
-/// SSH dial to it is certain to fail, which is exactly what makes Ansible record the host
-/// `unreachable`. Rendered with a short connect timeout (see `inventory_renderer`).
-pub const UNREACHABLE_SENTINEL_IP: &str = "192.0.2.1";
 
 /// The two taints Kubernetes automatically applies to a `NotReady`/unreachable Node. We tolerate
 /// them with an **empty `effect`** (matches every effect, i.e. both `NoSchedule` and `NoExecute`) and
@@ -127,7 +121,7 @@ pub enum ProxyReadiness {
     /// `unreachable` names hosts whose pod never became Ready within its grace window.
     Ready {
         ready: Vec<ProxyPodInfo>,
-        unreachable: Vec<String>,
+        unreachable: Vec<UnreachableHost>,
     },
     /// At least one proxy pod is still `Running`-not-yet-Ready or within its startup/termination
     /// grace window; `waiting` names them so the caller can report them on the plan.
@@ -978,13 +972,22 @@ pub async fn ensure_proxy_infra(
             // deadline the host is rendered unreachable so a dead kubelet cannot wedge this run and
             // its Leases forever.
             state @ (PodReadyState::PreRunning | PodReadyState::Terminating) => {
-                let heartbeat_age = match nodes_api.get_opt(host).await? {
-                    Some(node) => node_ready_heartbeat_age_secs(&node, now),
-                    None => None,
-                };
+                // One read, two answers: how stale the node's heartbeat is (which shortens the
+                // grace) and whether it is reporting `Ready` at all (which is what the plan's
+                // attempt budget later turns on).
+                let node = nodes_api.get_opt(host).await?;
+                let heartbeat_age = node
+                    .as_ref()
+                    .and_then(|node| node_ready_heartbeat_age_secs(node, now));
                 let grace = effective_grace_secs(heartbeat_age, grace_policy);
                 match proxy_wait_age_secs(&pod, &state, now) {
-                    Some(age) if age >= grace => unreachable.push(host.clone()),
+                    // A host with no Node object at all is deliberately not recorded as not-ready:
+                    // nothing will ever report it `Ready` again either, so crediting it as a Node
+                    // that might come back would leave a plan refunding attempts to it forever.
+                    Some(age) if age >= grace => unreachable.push(UnreachableHost {
+                        host: host.clone(),
+                        node_not_ready: node.is_some_and(|node| !node_readiness::is_ready(&node)),
+                    }),
                     _ => waiting.push(host.clone()),
                 }
             }

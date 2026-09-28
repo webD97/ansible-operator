@@ -516,6 +516,16 @@ fn create_job_skeleton(
         // The recap callback writes to /dev/termination-log and the reconciler reads it back from
         // this container's state.terminated.message. These are the Kubernetes defaults, set
         // explicitly so the dependency is legible and can't be silently mutated away.
+        //
+        // The pod's container count is part of that dependency. The callback sizes the recap
+        // against one container's 4096 bytes, but the status manager then divides
+        // MaxPodTerminationMessageLogLength (12 KiB) evenly over every container in the *spec* —
+        // init and ephemeral included, whether or not they write anything — so 4096 is the real
+        // budget only while this pod stays at three (preflight, the optional collections
+        // installer, and this one). A fourth cuts it to 3072 and moves the recap ceiling from
+        // several hundred hosts to a couple of hundred, which the callback cannot see: it would
+        // write a message it believes fits, and every host of that run would read `Unknown`.
+        // `kubectl debug` reaches this too, by attaching an ephemeral container to a live run.
         termination_message_path: Some("/dev/termination-log".into()),
         termination_message_policy: Some("File".into()),
         security_context: plan.spec.security_context.as_ref().map(Into::into),
@@ -951,6 +961,11 @@ fn volume_name(prefix: &str, source: &str) -> String {
 /// Builds the `ansible-playbook` invocation. Connection details no longer appear here at all —
 /// each host's connection mechanism is expressed as inventory vars in the rendered
 /// `inventory.yml` instead, so there's no more per-strategy `-c`/`-l`/`--private-key` branching.
+///
+/// **Adding `--tags`/`--skip-tags` here is not a self-contained change.** Task filtering interacts
+/// with the completion marker the operator appends to every playbook, and getting it wrong either
+/// reports every host of every plan as `Incomplete` forever or stamps partially applied hosts as
+/// converged. Read `ansible::playbook_renderer::completion_marker_play` before starting.
 fn render_ansible_command(
     plan: &v1beta1::PlaybookPlan,
     extra_vars_filepaths: Vec<&String>,
@@ -997,6 +1012,13 @@ fn render_ansible_command(
     }));
 
     ansible_command.extend(["-i".into(), "inventory.yml".into()]);
+    // Relative, like `inventory.yml`: the container's working directory is the workspace mount.
+    // Which hosts this excludes lives in the file, not here — see `paths::ANSIBLE_LIMIT_FILENAME`
+    // for why that split is what keeps this function pure.
+    ansible_command.extend([
+        "--limit".into(),
+        format!("@{}", paths::ANSIBLE_LIMIT_FILENAME),
+    ]);
     ansible_command.push("playbook.yml".into());
 
     ansible_command
@@ -1271,12 +1293,33 @@ spec:
         let command = render_ansible_command(&pp, Vec::new());
 
         assert!(!command.iter().any(|arg| arg == "-c"));
-        assert!(!command.iter().any(|arg| arg == "-l"));
         assert!(!command.iter().any(|arg| arg == "--private-key"));
         assert!(command.iter().any(|arg| arg == "inventory.yml"));
         assert!(command.iter().any(|arg| arg == "playbook.yml"));
         // No verbosity requested -> no -v flag at all.
         assert!(!command.iter().any(|arg| arg.starts_with("-v")));
+    }
+
+    /// The whole point of naming a file instead of the hosts: which hosts a run excludes is only
+    /// settled at launch, while this function has to stay a pure function of the plan so a resumed
+    /// run rebuilds a byte-identical Job. Inlining the host names here would break that, silently —
+    /// a resumed run would build a Job differing from the one it committed to.
+    #[test]
+    fn the_limit_is_a_constant_file_reference_and_never_names_a_host() {
+        use crate::v1beta1::controllers::playbookplancontroller::job_builder::render_ansible_command;
+
+        let command = render_ansible_command(&minimal_plan(), Vec::new());
+
+        let limit = command
+            .iter()
+            .position(|arg| arg == "--limit")
+            .expect("every run passes a limit");
+        assert_eq!(
+            command[limit + 1],
+            format!("@{}", paths::ANSIBLE_LIMIT_FILENAME)
+        );
+        // Relative, like `inventory.yml`: resolved against the container's working directory.
+        assert!(!command[limit + 1].contains('/'));
     }
 
     #[test]

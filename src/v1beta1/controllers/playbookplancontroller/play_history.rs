@@ -33,7 +33,7 @@ use tracing::debug;
 
 use crate::v1beta1::{
     HostOutcome, Play, PlayHostResult, PlayPhase, PlayRecap, PlaySpec, PlayStatus, PlaybookPlan,
-    ResolvedHosts,
+    ResolvedHosts, UnreachableHost,
     controllers::reconcile_error::{ReconcileError, is_conflict, is_not_found},
     labels,
     playbookplancontroller::{
@@ -179,15 +179,27 @@ pub async fn commit_starting(
         play_uid,
         PlayPhase::Prepared,
         PlayPhase::Starting,
+        None,
     )
     .await
 }
 
+/// Commits the run to creating its Job, recording the hosts it is launching without — see
+/// [`PlayStatus::unreachable_hosts`].
+///
+/// This is the transition that means "the infrastructure has settled", which is the moment the set
+/// is both known and still true, so it is written here rather than observed later.
+///
+/// A replay is the no-op every step of this protocol is *as far as the phase goes*, but the set
+/// itself is re-stated — see [`decide_transition`]. A resumed run whose Job was never created comes
+/// back through here having re-read its proxy pods, and the record has to keep describing the run
+/// the caller is about to render and launch, not the one an earlier tick was going to.
 pub async fn commit_launching(
     client: &kube::Client,
     namespace: &str,
     play_name: &str,
     play_uid: &str,
+    unreachable_hosts: &[UnreachableHost],
 ) -> Result<Play, ReconcileError> {
     transition_phase(
         client,
@@ -196,6 +208,7 @@ pub async fn commit_launching(
         play_uid,
         PlayPhase::Starting,
         PlayPhase::Launching,
+        Some(unreachable_hosts),
     )
     .await
 }
@@ -226,6 +239,7 @@ pub async fn abort_unlaunched(
         play_uid,
         from,
         PlayPhase::Aborted,
+        None,
     )
     .await
 }
@@ -257,6 +271,7 @@ async fn transition_phase(
     play_uid: &str,
     expected: PlayPhase,
     next: PlayPhase,
+    unreachable_hosts: Option<&[UnreachableHost]>,
 ) -> Result<Play, ReconcileError> {
     let api = Api::<Play>::namespaced(client.clone(), namespace);
 
@@ -268,7 +283,8 @@ async fn transition_phase(
             .as_ref()
             .ok_or(ReconcileError::PreconditionFailed("Play has no status"))?;
 
-        let Some(status) = decide_transition(status, &expected, next.clone())? else {
+        let Some(status) = decide_transition(status, &expected, next.clone(), unreachable_hosts)?
+        else {
             return Ok(object);
         };
         match replace_status(&api, object, status).await {
@@ -290,13 +306,40 @@ async fn transition_phase(
 /// that already happened has to be a no-op rather than an error — while a record that advanced to
 /// some *third* phase must still fail loudly, because that means another writer is driving the same
 /// run.
+///
+/// The whole status is carried forward and only the phase — plus, for the launch commit, the
+/// excluded hosts — is replaced, so every field a later transition inherits survives to the
+/// terminal write.
+///
+/// **Idempotence is about the phase, not about the data the phase carries.** A replayed launch
+/// commit arrives with a *newer* exclusion set than the record holds — the run's proxy pods have had
+/// another tick to come up or give up — and that set has to land, because it is the same set the
+/// caller is about to render the run's `--limit` file and host addresses from. A record left saying
+/// something else would describe a different run than the one the Job executes: a host excluded in
+/// the file but not in the record loses its `unreachable` from the recap, and one excluded in the
+/// record but not in the file runs the playbook and is still reported unreachable, never stamped,
+/// and re-run for as long as the plan exists.
+///
+/// Refreshing it does not weaken "recorded at launch", because the caller only ever reaches here
+/// while the run's Job does not exist yet — once it does, the run is adopted rather than resumed
+/// (`reconciler::decide_job_presence`), so nothing comes back through this. The last write therefore
+/// always describes the run that actually ran. An *unchanged* set still writes nothing, so a resume
+/// that changed nothing stays the no-op the rest of this protocol is.
 fn decide_transition(
     status: &PlayStatus,
     expected: &PlayPhase,
     next: PlayPhase,
+    unreachable_hosts: Option<&[UnreachableHost]>,
 ) -> Result<Option<PlayStatus>, ReconcileError> {
     if status.phase == next {
-        return Ok(None);
+        return Ok(match unreachable_hosts {
+            Some(hosts) if hosts != status.unreachable_hosts => {
+                let mut restated = status.clone();
+                restated.unreachable_hosts = hosts.to_vec();
+                Some(restated)
+            }
+            _ => None,
+        });
     }
     if status.phase != *expected {
         return Err(ReconcileError::PreconditionFailed(
@@ -305,6 +348,9 @@ fn decide_transition(
     }
     let mut next_status = status.clone();
     next_status.phase = next;
+    if let Some(unreachable_hosts) = unreachable_hosts {
+        next_status.unreachable_hosts = unreachable_hosts.to_vec();
+    }
     Ok(Some(next_status))
 }
 
@@ -478,7 +524,8 @@ pub async fn delete_aborted(
 /// more, so every host it targeted falls to `Unknown`, exactly as for a run whose Job was reaped
 /// before the operator saw its recap.
 pub fn lost_run_status(job_name: &str, hosts: &[String]) -> PlayStatus {
-    terminal_status(job_name, hosts, None)
+    // No record, so nothing is known about which hosts it excluded either.
+    terminal_status(job_name, hosts, None, Vec::new())
 }
 
 /// Stamps the terminal outcome onto the run's existing immutable recovery record.
@@ -495,7 +542,14 @@ pub async fn record_finished(
         .name
         .clone()
         .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
-    let status = terminal_status(&job_name, hosts, parsed);
+    // The terminal status is built fresh rather than derived from the record, so anything the run
+    // wrote down about itself has to be carried across explicitly.
+    let unreachable_hosts = object
+        .status
+        .as_ref()
+        .map(|status| status.unreachable_hosts.clone())
+        .unwrap_or_default();
+    let status = terminal_status(&job_name, hosts, parsed, unreachable_hosts);
     match object.status.as_ref().map(|status| &status.phase) {
         Some(PlayPhase::Launching | PlayPhase::Running) => {
             replace_status(api, object, status).await
@@ -672,12 +726,17 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
 /// Counted over the *distinct* hosts, not over `hosts` itself: a node listed by two inventory groups
 /// is flattened into that slice twice, and comparing a deduplicated success count against the raw
 /// length would report a clean run as `Failed` — leaving its hosts outdated and re-running forever.
+///
+/// `unreachable_hosts` is the exception to "derived from the recap": it is what the run wrote down
+/// at its launch commit and is passed back in, because a status built from scratch would otherwise
+/// drop the one thing the recap cannot say.
 fn terminal_status(
     job_name: &str,
     hosts: &[String],
     parsed: Option<&CallbackOutput>,
+    unreachable_hosts: Vec<UnreachableHost>,
 ) -> PlayStatus {
-    let host_results = host_results(parsed, hosts);
+    let host_results = host_results(parsed, hosts, &unreachable_hosts);
     let host_count = host_results.len();
     let succeeded = host_results
         .values()
@@ -685,9 +744,27 @@ fn terminal_status(
         .count();
 
     let phase = match parsed {
-        None => PlayPhase::Unknown,
         Some(_) if succeeded == host_count && host_count != 0 => PlayPhase::Succeeded,
         Some(_) => PlayPhase::Failed,
+        // A run that excluded every host it targeted never launched a Job and has no recap to be
+        // missing: the exclusions settle its outcome on their own. `Unknown` is for a run that ran
+        // and whose result could not be read, and reporting that here would deny the plan the one
+        // thing it does know — that nobody could be reached.
+        //
+        // Asked over membership in `unreachable_hosts`, not over the outcome, because the outcome no
+        // longer answers it: `host_results` splits an exclusion into `Unreachable` or `NotReached`
+        // depending on whether the Node was down, so one `Ready`-Node proxy failure among the
+        // exclusions would drop an entirely known run into `Unknown` — misreporting it and denying
+        // the refund, the two things this arm exists to prevent. Membership is the question that was
+        // always meant: was every host excluded before the run?
+        None if host_count != 0
+            && host_results
+                .keys()
+                .all(|host| unreachable_hosts.iter().any(|entry| entry.host == *host)) =>
+        {
+            PlayPhase::Failed
+        }
+        None => PlayPhase::Unknown,
     };
 
     PlayStatus {
@@ -697,61 +774,164 @@ fn terminal_status(
         finished_at: Some(chrono::Local::now().fixed_offset()),
         host_count: host_count as u32,
         failed_host_count: (host_count - succeeded) as u32,
-        recap: sum_recap(parsed),
+        recap: sum_recap(parsed, &unreachable_hosts),
         hosts: host_results,
+        unreachable_hosts,
     }
 }
 
-/// The run's recap: the seven counters summed across every host Ansible processed.
-fn sum_recap(parsed: Option<&CallbackOutput>) -> PlayRecap {
+/// The run's recap: the seven counters the user's **own** playbook would have printed, running
+/// unmodified against the same fleet in the same condition.
+///
+/// That is the standard, and it is deliberately neither of the two things closer to hand. It is not
+/// the pod's `PLAY RECAP`, which counts the *operator's* playbook — the appended completion marker
+/// inflates every host's `ok`, and the hosts the run excluded are missing entirely. Nor is it a sum
+/// over [`host_results`], which is keyed by the run's own host list and so silently drops every host
+/// Ansible processed that is not an inventory host of the plan: the implicit localhost of a
+/// `hosts: localhost` play, an `add_host` target.
+///
+/// So it is summed from two sources, one per kind of host:
+///
+/// - the parsed recap, which is already the author's own counters — the callback subtracts the
+///   marker's `ok` per host, gated on the same per-host flag that records it, so a host that never
+///   ran the marker has nothing subtracted;
+/// - one `unreachable` per excluded host, which no recap can supply: the run passed
+///   `--limit '!<host>'`, so Ansible never processed it and never counted it. Without this the total
+///   would claim the run reached every host it targeted.
+///
+/// The two cannot overlap, which is what makes adding them safe: `--limit` keeps an excluded host
+/// out of every play, so it is never in `processed` — not even if the playbook `add_host`s a host of
+/// that name, since the limit still applies to it. A run that excluded *everything* has no recap at
+/// all and falls out as `0 + N`, which is again what the user's own playbook would print with every
+/// host down.
+///
+/// The consequence is that the total can exceed what the rows in `.status.hosts` account for, and
+/// that is correct rather than an inconsistency: `hostCount` counts the hosts the run targeted while
+/// the recap counts what the playbook did, and a `localhost` play has made those differ for as long
+/// as playbooks have had one.
+fn sum_recap(parsed: Option<&CallbackOutput>, unreachable_hosts: &[UnreachableHost]) -> PlayRecap {
     let mut total = PlayRecap::default();
-    if let Some(output) = parsed {
-        for s in output.processed.values() {
-            total.ok += s.ok;
-            total.changed += s.changed;
-            total.unreachable += s.unreachable;
-            total.failed += s.failed;
-            total.skipped += s.skipped;
-            total.rescued += s.rescued;
-            total.ignored += s.ignored;
-        }
+    for s in parsed.iter().flat_map(|output| output.processed.values()) {
+        total.ok += s.ok;
+        total.changed += s.changed;
+        total.unreachable += s.unreachable;
+        total.failed += s.failed;
+        total.skipped += s.skipped;
+        total.rescued += s.rescued;
+        total.ignored += s.ignored;
     }
+    total.unreachable += unreachable_hosts.len() as u32;
     total
 }
 
 /// Per-host recap + outcome for every targeted host. These outcomes are what
 /// `status::apply_terminal_play_status` later folds into the plan, so this is where the mapping is
-/// decided: absent from the recap means `NotReached`, no recap at all means `Unknown`.
+/// decided: absent from the recap means `NotReached`, no recap at all means `Unknown`, and a host
+/// the recap does carry is classified from its own counters by [`outcome_from_stats`].
+///
+/// A host the run excluded is the one outcome not read off the recap. It is absent from it — the
+/// run passed `--limit '!<host>'` precisely so nothing would be attempted against it — so what it
+/// gets is what the operator had already established about it at the launch commit, carried forward
+/// on the run's own record.
+///
+/// **Which** exclusion it was decides the outcome, because the two are recovered from in different
+/// places and only one of them can be recovered from at all by a Node coming back:
+///
+/// - the Node itself was not `Ready` (`node_not_ready`) — nothing could connect to it, and its next
+///   `Ready` heartbeat is exactly what fixes that. `Unreachable`, which is in the Node watch's wake
+///   set (`mappers::plan_awaits_node`) so the plan retries the moment the Node returns.
+/// - the Node was `Ready` and its proxy pod never came up anyway — an untolerated taint, a failing
+///   image pull, a rejecting admission webhook. The Node is already `Ready`, so no Node event will
+///   ever resolve it; only the pod spec will. `NotReached` — the same answer `mappers` gives a host
+///   a `serial` batch stopped short of, and for the same reason: this host's own heartbeats carry no
+///   news. Left `Unreachable`, it would wake the plan once per kubelet heartbeat for the plan's
+///   whole life, re-resolving both inventory kinds, re-reading every referenced Secret and listing
+///   every Node, long after the attempt budget stopped it acting.
+///
+/// Both keep `unreachable: 1` in the recap: the counter records that nothing connected, which is
+/// true either way, and it is what stops [`sum_recap`] reporting the run as having reached every
+/// host it targeted. The outcome records whose problem it is; they answer different questions.
 fn host_results(
     parsed: Option<&CallbackOutput>,
     hosts: &[String],
+    unreachable_hosts: &[UnreachableHost],
 ) -> BTreeMap<String, PlayHostResult> {
     hosts
         .iter()
         .map(|host| {
-            let result = match parsed {
-                None => PlayHostResult {
-                    recap: PlayRecap::default(),
-                    outcome: HostOutcome::Unknown,
-                },
-                Some(output) => match output.processed.get(host) {
+            let excluded = unreachable_hosts.iter().find(|entry| entry.host == *host);
+            let result = if let Some(entry) = excluded {
+                PlayHostResult {
+                    recap: PlayRecap {
+                        unreachable: 1,
+                        ..PlayRecap::default()
+                    },
+                    outcome: if entry.node_not_ready {
+                        HostOutcome::Unreachable
+                    } else {
+                        HostOutcome::NotReached
+                    },
+                }
+            } else {
+                match parsed {
                     None => PlayHostResult {
                         recap: PlayRecap::default(),
-                        outcome: HostOutcome::NotReached,
+                        outcome: HostOutcome::Unknown,
                     },
-                    Some(stats) => PlayHostResult {
-                        recap: recap_from_stats(stats),
-                        outcome: if stats.is_failure() {
-                            HostOutcome::Failed
-                        } else {
-                            HostOutcome::Succeeded
+                    Some(output) => match output.processed.get(host) {
+                        None => PlayHostResult {
+                            recap: PlayRecap::default(),
+                            outcome: HostOutcome::NotReached,
+                        },
+                        Some(stats) => PlayHostResult {
+                            recap: recap_from_stats(stats),
+                            outcome: outcome_from_stats(stats),
                         },
                     },
-                },
+                }
             };
             (host.clone(), result)
         })
         .collect()
+}
+
+/// The outcome a host's own recap counters describe.
+///
+/// Success is asked as `is_failure`, not re-derived from the counters, so that this and the run's
+/// verdict — which counts the hosts that came out `Succeeded` — can never disagree about what a
+/// success is. Only the failing half is split further: a host with no failed tasks that Ansible
+/// could not connect to at all is `Unreachable`. Reporting that as `Failed` would send an operator
+/// looking for a broken task.
+///
+/// A host carrying both counters is `Failed`: tasks did run and did fail before the connection went,
+/// and the playbook failure is the more actionable of the two.
+///
+/// Clean counters are the case the counters get wrong on their own, and where completion decides:
+/// a host the playbook stopped short of reports exactly what a host that ran every task reports.
+/// Trusting the counters there is what recorded a partially applied host as converged, permanently.
+/// Completion is only consulted on that branch — a host that did fail is `Failed` whether or not
+/// the run got as far as asking, and its failure is the actionable thing either way.
+///
+/// **A host that is in the recap but not in the plan's inventory would classify `Incomplete` here,
+/// and two things have to keep holding for that never to happen.** The implicit localhost of a
+/// `hosts: localhost` play is in the recap with `completed = false`, because the marker play targets
+/// `all` and `all` never matches an implicit localhost. It reaches no verdict only because
+/// [`host_results`] iterates the *run's* host list, so no outcome is computed for it at all. Widen
+/// either side — a marker play that also took `localhost`, or a `host_results` keyed off the recap —
+/// and a plain `localhost` play starts reporting a host as `Incomplete`, which is the operator's way
+/// of saying nothing converged.
+fn outcome_from_stats(stats: &HostStats) -> HostOutcome {
+    if !stats.is_failure() {
+        if stats.completed {
+            HostOutcome::Succeeded
+        } else {
+            HostOutcome::Incomplete
+        }
+    } else if stats.failed == 0 {
+        HostOutcome::Unreachable
+    } else {
+        HostOutcome::Failed
+    }
 }
 
 fn recap_from_stats(s: &HostStats) -> PlayRecap {
@@ -817,6 +997,13 @@ mod tests {
                 .iter()
                 .map(|(h, s)| (h.to_string(), s.clone()))
                 .collect(),
+        }
+    }
+
+    fn unreachable_host(host: &str, node_not_ready: bool) -> UnreachableHost {
+        UnreachableHost {
+            host: host.to_string(),
+            node_not_ready,
         }
     }
 
@@ -1054,8 +1241,11 @@ mod tests {
         play
     }
 
+    /// The run's counters are what Ansible reported, plus one `unreachable` per host the run
+    /// excluded — which no recap mentions, so summing the recap alone would claim the run reached
+    /// every host it targeted.
     #[test]
-    fn sum_recap_totals_across_hosts_and_is_zero_without_a_recap() {
+    fn sum_recap_totals_the_recap_plus_the_exclusions() {
         let out = output(&[
             (
                 "a",
@@ -1075,12 +1265,276 @@ mod tests {
             ),
         ]);
 
-        let recap = sum_recap(Some(&out));
+        let recap = sum_recap(Some(&out), &[unreachable_host("excluded", true)]);
         assert_eq!(recap.ok, 5);
         assert_eq!(recap.changed, 1);
         assert_eq!(recap.failed, 1);
+        assert_eq!(recap.unreachable, 1);
 
-        assert_eq!(sum_recap(None), PlayRecap::default());
+        assert_eq!(sum_recap(None, &[]), PlayRecap::default());
+
+        // A run that excluded every host it targeted has no recap at all, and its total is exactly
+        // what the user's own playbook would have printed with every host down.
+        assert_eq!(
+            sum_recap(
+                None,
+                &[unreachable_host("a", true), unreachable_host("b", false)]
+            ),
+            PlayRecap {
+                unreachable: 2,
+                ..PlayRecap::default()
+            }
+        );
+    }
+
+    /// The run's counters reproduce the user's **own** playbook, not the operator's rewrite of it
+    /// and not the rows in `.status.hosts`. Measured against a real `ansible-core`: a 1-task
+    /// `hosts: localhost` play then a 3-task `hosts: workers` play over `node-a`/`node-b`/`node-c`
+    /// with `node-c` down prints `ok=7, unreachable=1` when the author runs it themselves.
+    ///
+    /// The operator's run of the same playbook produces the wire message below — `node-c` excluded
+    /// so absent, the appended marker already subtracted per host, and `localhost` present because
+    /// `hosts: localhost` plays run (`workspace::render_limit` permits the implicit localhost). Two
+    /// wrong answers are close to hand and this pins against both: the pod's own `PLAY RECAP` says
+    /// `ok=9`, counting the marker task the operator appended, and summing the per-host rows says
+    /// `ok=6`, dropping `localhost` because it is not an inventory host of the plan.
+    #[test]
+    fn the_run_total_reproduces_the_users_own_playbook() {
+        let wire = output(&[
+            (
+                "localhost",
+                HostStats {
+                    ok: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "node-a",
+                HostStats {
+                    ok: 3,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "node-b",
+                HostStats {
+                    ok: 3,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let recap = sum_recap(Some(&wire), &[unreachable_host("node-c", true)]);
+
+        assert_eq!(recap.ok, 7);
+        assert_eq!(recap.unreachable, 1);
+
+        // And the rows are unaffected: the plan's three hosts, localhost among none of them.
+        let rows = host_results(
+            Some(&wire),
+            &[
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ],
+            &[unreachable_host("node-c", true)],
+        );
+
+        assert_eq!(rows.len(), 3);
+        assert!(!rows.contains_key("localhost"));
+        assert_eq!(rows["node-a"].outcome, HostOutcome::Succeeded);
+        assert_eq!(rows["node-c"].outcome, HostOutcome::Unreachable);
+    }
+
+    /// Where a host's verdict is read off the counters Ansible reported for it. The interesting line
+    /// is between `Failed` and `Unreachable`: they are fixed in different places — a broken task
+    /// versus a host that answered nothing — so reporting a dead machine as `Failed` would send an
+    /// operator looking for a task that never ran.
+    ///
+    /// Only a host the run actually attempted gets here. One the run *excluded* is classified in
+    /// `host_results` from the record the run wrote at its launch commit, so no verdict is ever
+    /// inferred from counters produced by dialling an address picked to fail.
+    #[test]
+    fn a_host_that_was_never_connected_to_is_unreachable_rather_than_failed() {
+        // Ran to the end, so the only thing left to classify is the counters.
+        let stats = |failed: u32, unreachable: u32| HostStats {
+            ok: 1,
+            failed,
+            unreachable,
+            completed: true,
+            ..Default::default()
+        };
+
+        assert_eq!(outcome_from_stats(&stats(0, 0)), HostOutcome::Succeeded);
+        assert_eq!(outcome_from_stats(&stats(0, 1)), HostOutcome::Unreachable);
+        assert_eq!(outcome_from_stats(&stats(1, 0)), HostOutcome::Failed);
+        // The connection dropped mid-run: something did run and did fail, which is the half worth
+        // reporting.
+        assert_eq!(outcome_from_stats(&stats(1, 1)), HostOutcome::Failed);
+
+        // The classification is per host, and a host the recap never mentions is not classified
+        // from counters at all.
+        let hosts = vec![
+            "reached".to_string(),
+            "unreachable".to_string(),
+            "absent".to_string(),
+        ];
+        let results = host_results(
+            Some(&output(&[
+                ("reached", stats(1, 0)),
+                ("unreachable", stats(0, 1)),
+            ])),
+            &hosts,
+            &[],
+        );
+
+        assert_eq!(results["reached"].outcome, HostOutcome::Failed);
+        assert_eq!(results["unreachable"].outcome, HostOutcome::Unreachable);
+        assert_eq!(results["absent"].outcome, HostOutcome::NotReached);
+        // The per-host counters travel with the verdict, so `unreachable: 1` is still readable on
+        // the host itself and not only in the run's total.
+        assert_eq!(results["unreachable"].recap.unreachable, 1);
+    }
+
+    /// The defect the completion marker exists for. A playbook that stops at the first failure —
+    /// `any_errors_fatal`, a failed `serial` batch, `max_fail_percentage` — leaves the surviving
+    /// hosts having run *part* of it, and their counters are byte-for-byte what a host that ran all
+    /// of it reports: `failed=0, unreachable=0`. Reading them as `Succeeded` stamped a partially
+    /// applied host as converged and dropped it from every future run.
+    #[test]
+    fn a_host_the_playbook_stopped_short_of_is_not_a_success() {
+        let cut_short = HostStats {
+            ok: 1,
+            skipped: 1,
+            completed: false,
+            ..Default::default()
+        };
+        let ran_it_all = HostStats {
+            ok: 3,
+            completed: true,
+            ..Default::default()
+        };
+
+        // Identical on every counter that exists — only completion separates them.
+        assert!(!cut_short.is_failure());
+        assert!(!ran_it_all.is_failure());
+        assert_eq!(outcome_from_stats(&cut_short), HostOutcome::Incomplete);
+        assert_eq!(outcome_from_stats(&ran_it_all), HostOutcome::Succeeded);
+
+        // A host that did fail is `Failed` whether or not the run got as far as asking: its own
+        // failure is the actionable thing, and it is what stopped the others.
+        let failed = HostStats {
+            ok: 1,
+            failed: 1,
+            completed: false,
+            ..Default::default()
+        };
+        assert_eq!(outcome_from_stats(&failed), HostOutcome::Failed);
+    }
+
+    /// The whole aborted run, end to end: one host fails, the play stops, and the two healthy hosts
+    /// must not come out of it recorded as having received the playbook.
+    #[test]
+    fn an_aborted_play_leaves_its_survivors_incomplete_and_the_run_failed() {
+        let hosts = vec![
+            "good-a".to_string(),
+            "good-b".to_string(),
+            "bad-c".to_string(),
+        ];
+        let cut_short = HostStats {
+            ok: 1,
+            skipped: 1,
+            ..Default::default()
+        };
+        let recap = output(&[
+            ("good-a", cut_short.clone()),
+            ("good-b", cut_short),
+            (
+                "bad-c",
+                HostStats {
+                    ok: 1,
+                    failed: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&recap), Vec::new());
+
+        assert_eq!(status.phase, PlayPhase::Failed);
+        assert_eq!(status.hosts["good-a"].outcome, HostOutcome::Incomplete);
+        assert_eq!(status.hosts["good-b"].outcome, HostOutcome::Incomplete);
+        assert_eq!(status.hosts["bad-c"].outcome, HostOutcome::Failed);
+        // None of the three is a success, so none of them is recorded as converged.
+        assert_eq!(status.failed_host_count, 3);
+    }
+
+    /// A host in the run's inventory that no play in the playbook targets. It reaches the marker —
+    /// which targets `all` — with no counters at all, and that is the honest answer: applying this
+    /// playbook to it is vacuous, so it is up to date. Before the marker it was absent from the
+    /// recap entirely, which read as `NotReached`, failed the run, and left the plan retrying a
+    /// host no run would ever touch until its attempt budget ran out.
+    #[test]
+    fn a_host_no_play_targets_is_converged_rather_than_never_reached() {
+        let hosts = vec!["web-1".to_string(), "db-1".to_string()];
+        let recap = output(&[
+            (
+                "web-1",
+                HostStats {
+                    ok: 2,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "db-1",
+                HostStats {
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&recap), Vec::new());
+
+        assert_eq!(status.phase, PlayPhase::Succeeded);
+        assert_eq!(status.hosts["db-1"].outcome, HostOutcome::Succeeded);
+        // Its counters stay empty: nothing ran on it, and the marker is subtracted back out by the
+        // callback, so the run's totals describe the playbook rather than the operator.
+        assert_eq!(status.hosts["db-1"].recap, PlayRecap::default());
+    }
+
+    /// An `Unreachable` host is not a success, so it must count against the run exactly as a failed
+    /// one does — the verdict asks `is_failure`, and splitting the outcome finer must not have
+    /// quietly moved that line.
+    #[test]
+    fn an_unreachable_host_still_makes_the_run_fail() {
+        let hosts = vec!["a".to_string(), "b".to_string()];
+        let recap = output(&[
+            (
+                "a",
+                HostStats {
+                    ok: 1,
+                    completed: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b",
+                HostStats {
+                    unreachable: 1,
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let status = terminal_status("job", &hosts, Some(&recap), Vec::new());
+
+        assert_eq!(status.phase, PlayPhase::Failed);
+        assert_eq!(status.failed_host_count, 1);
+        assert_eq!(status.hosts["b"].outcome, HostOutcome::Unreachable);
     }
 
     #[test]
@@ -1093,6 +1547,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1100,11 +1555,12 @@ mod tests {
                 "b",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
         ]);
-        let s = terminal_status("job", &hosts, Some(&clean));
+        let s = terminal_status("job", &hosts, Some(&clean), Vec::new());
         assert_eq!(s.phase, PlayPhase::Succeeded);
         assert_eq!(s.failed_host_count, 0);
 
@@ -1114,6 +1570,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1125,7 +1582,7 @@ mod tests {
                 },
             ),
         ]);
-        let s = terminal_status("job", &hosts, Some(&bad));
+        let s = terminal_status("job", &hosts, Some(&bad), Vec::new());
         assert_eq!(s.phase, PlayPhase::Failed);
         assert_eq!(s.failed_host_count, 1);
         assert_eq!(s.hosts["b"].outcome, HostOutcome::Failed);
@@ -1135,15 +1592,16 @@ mod tests {
             "a",
             HostStats {
                 ok: 1,
+                completed: true,
                 ..Default::default()
             },
         )]);
-        let s = terminal_status("job", &hosts, Some(&partial));
+        let s = terminal_status("job", &hosts, Some(&partial), Vec::new());
         assert_eq!(s.phase, PlayPhase::Failed);
         assert_eq!(s.hosts["b"].outcome, HostOutcome::NotReached);
 
         // No recap at all -> Unknown for the run and every host.
-        let s = terminal_status("job", &hosts, None);
+        let s = terminal_status("job", &hosts, None, Vec::new());
         assert_eq!(s.phase, PlayPhase::Unknown);
         assert_eq!(s.hosts["a"].outcome, HostOutcome::Unknown);
         assert_eq!(s.failed_host_count, 2);
@@ -1160,6 +1618,7 @@ mod tests {
                 "a",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
@@ -1167,12 +1626,13 @@ mod tests {
                 "b",
                 HostStats {
                     ok: 1,
+                    completed: true,
                     ..Default::default()
                 },
             ),
         ]);
 
-        let status = terminal_status("job", &hosts, Some(&clean));
+        let status = terminal_status("job", &hosts, Some(&clean), Vec::new());
 
         assert_eq!(status.phase, PlayPhase::Succeeded);
         assert_eq!(status.host_count, 2);
@@ -1194,6 +1654,7 @@ mod tests {
             &at(PlayPhase::Prepared),
             &PlayPhase::Prepared,
             PlayPhase::Starting,
+            None,
         )
         .unwrap()
         .expect("a pending transition must produce a status to write");
@@ -1204,7 +1665,8 @@ mod tests {
             decide_transition(
                 &at(PlayPhase::Starting),
                 &PlayPhase::Prepared,
-                PlayPhase::Starting
+                PlayPhase::Starting,
+                None
             )
             .unwrap()
             .is_none()
@@ -1215,7 +1677,8 @@ mod tests {
             decide_transition(
                 &at(PlayPhase::Running),
                 &PlayPhase::Prepared,
-                PlayPhase::Starting
+                PlayPhase::Starting,
+                None
             )
             .is_err()
         );
@@ -1225,10 +1688,245 @@ mod tests {
             decide_transition(
                 &at(PlayPhase::Succeeded),
                 &PlayPhase::Starting,
-                PlayPhase::Aborted
+                PlayPhase::Aborted,
+                None
             )
             .is_err()
         );
+    }
+
+    /// A resumed `Launching` run commits again with a *newer* set — its proxy pods have had another
+    /// tick to come up or give up — and that set has to land, because the same tick renders the
+    /// run's `--limit` file from it. Leaving the first answer standing would let the record and the
+    /// file describe different runs: a host excluded in the file but not the record loses its
+    /// `unreachable` from the recap, and one excluded in the record but not the file runs the
+    /// playbook, is reported unreachable anyway, is never stamped, and is re-run for the life of
+    /// the plan.
+    ///
+    /// The phase half of idempotence is untouched — nothing is written when the set has not moved,
+    /// which is what keeps a resume that changed nothing from being a write and another reconcile.
+    #[test]
+    fn a_replayed_launch_commit_restates_the_set_but_only_when_it_moved() {
+        let launching = decide_transition(
+            &PlayStatus {
+                phase: PlayPhase::Starting,
+                ..Default::default()
+            },
+            &PlayPhase::Starting,
+            PlayPhase::Launching,
+            Some(&[unreachable_host("node-b", true)]),
+        )
+        .unwrap()
+        .expect("the first commit writes the set");
+        assert_eq!(
+            launching.unreachable_hosts,
+            vec![unreachable_host("node-b", true)]
+        );
+
+        // The resume: node-b's proxy came up after all, and node-c's has since given up.
+        let restated = decide_transition(
+            &launching,
+            &PlayPhase::Starting,
+            PlayPhase::Launching,
+            Some(&[unreachable_host("node-c", false)]),
+        )
+        .unwrap()
+        .expect("a set that moved must be written, replay or not");
+        assert_eq!(
+            restated.unreachable_hosts,
+            vec![unreachable_host("node-c", false)]
+        );
+        assert_eq!(restated.phase, PlayPhase::Launching);
+
+        // Same set, same record: still nothing to write.
+        assert!(
+            decide_transition(
+                &restated,
+                &PlayPhase::Starting,
+                PlayPhase::Launching,
+                Some(&[unreachable_host("node-c", false)]),
+            )
+            .unwrap()
+            .is_none(),
+            "a resume that found the same hosts must not restamp the record"
+        );
+    }
+
+    /// The launch commit is the only writer of the excluded hosts, and the terminal write builds a
+    /// *fresh* status rather than editing the record's — so the set has to be carried across both
+    /// deliberately. Without that a host the run never attempted comes back as `NotReached`, and
+    /// the attempt budget loses the only evidence it has about why.
+    #[test]
+    fn hosts_recorded_at_launch_survive_every_later_transition() {
+        let starting = PlayStatus {
+            phase: PlayPhase::Starting,
+            ..Default::default()
+        };
+
+        let launching = decide_transition(
+            &starting,
+            &PlayPhase::Starting,
+            PlayPhase::Launching,
+            Some(&[unreachable_host("node-b", true)]),
+        )
+        .unwrap()
+        .expect("the launch commit writes a status");
+        assert_eq!(
+            launching.unreachable_hosts,
+            vec![unreachable_host("node-b", true)]
+        );
+
+        // Every other transition passes `None` and must leave the recorded set alone.
+        let aborted =
+            decide_transition(&launching, &PlayPhase::Launching, PlayPhase::Aborted, None)
+                .unwrap()
+                .expect("a pending transition produces a status");
+        assert_eq!(
+            aborted.unreachable_hosts,
+            vec![unreachable_host("node-b", true)]
+        );
+
+        // The recap carries only the host the run actually ran: `node-b` was limited out of it.
+        let terminal = terminal_status(
+            "apply-web-abc-1",
+            &["node-a".to_string(), "node-b".to_string()],
+            Some(&output(&[(
+                "node-a",
+                HostStats {
+                    ok: 1,
+                    completed: true,
+                    ..Default::default()
+                },
+            )])),
+            launching.unreachable_hosts.clone(),
+        );
+
+        assert_eq!(terminal.phase, PlayPhase::Failed);
+        assert_eq!(terminal.hosts["node-b"].outcome, HostOutcome::Unreachable);
+        assert_eq!(
+            terminal.unreachable_hosts,
+            vec![unreachable_host("node-b", true)]
+        );
+    }
+
+    /// A run that excluded every host never launches a Job, so no recap will ever exist for it —
+    /// but its outcome is not unknown, it is `Failed`, with every host carrying whichever exclusion
+    /// it was. Calling it `Unknown` would send an operator looking for lost instrumentation, and
+    /// would deny the plan the refund `classify_run_failure` owes a run whose Nodes were all down.
+    ///
+    /// The question is asked over membership in `unreachable_hosts`, not over the outcomes, and the
+    /// mixed case is why: the outcomes no longer agree with each other, so one `Ready`-Node proxy
+    /// failure among the exclusions would drop an entirely known run into `Unknown`.
+    #[test]
+    fn a_run_that_excluded_every_host_is_failed_rather_than_unknown() {
+        let hosts = vec!["node-a".to_string(), "node-b".to_string()];
+
+        let all_excluded = terminal_status(
+            "apply-web-abc-1",
+            &hosts,
+            None,
+            vec![
+                unreachable_host("node-a", true),
+                unreachable_host("node-b", true),
+            ],
+        );
+
+        assert_eq!(all_excluded.phase, PlayPhase::Failed);
+        assert_eq!(
+            all_excluded.hosts["node-a"].outcome,
+            HostOutcome::Unreachable
+        );
+        assert_eq!(all_excluded.failed_host_count, 2);
+        assert_eq!(all_excluded.recap.unreachable, 2);
+
+        let mixed_exclusions = terminal_status(
+            "apply-web-abc-1",
+            &hosts,
+            None,
+            vec![
+                unreachable_host("node-a", true),
+                unreachable_host("node-b", false),
+            ],
+        );
+
+        assert_eq!(mixed_exclusions.phase, PlayPhase::Failed);
+        assert_eq!(
+            mixed_exclusions.hosts["node-b"].outcome,
+            HostOutcome::NotReached
+        );
+        assert_eq!(mixed_exclusions.failed_host_count, 2);
+        assert_eq!(mixed_exclusions.recap.unreachable, 2);
+
+        // A run that did launch and whose recap could not be read is still `Unknown`: one of its
+        // hosts was reachable, so something ran and its result was lost.
+        let recap_lost = terminal_status(
+            "apply-web-abc-1",
+            &hosts,
+            None,
+            vec![unreachable_host("node-a", true)],
+        );
+
+        assert_eq!(recap_lost.phase, PlayPhase::Unknown);
+        assert_eq!(recap_lost.hosts["node-b"].outcome, HostOutcome::Unknown);
+    }
+
+    /// A host excluded because its Node was down is absent from the recap for a reason the recap
+    /// cannot express, so the default for an absent host is wrong for it in both directions:
+    /// `NotReached` would put it outside the Node watch's wake set, when that Node returning is
+    /// precisely what resolves it, and a run total summed over the recap alone would claim the run
+    /// reached every host it targeted.
+    #[test]
+    fn a_host_excluded_by_a_down_node_is_unreachable_rather_than_not_reached() {
+        let hosts = vec![
+            "ran".to_string(),
+            "excluded".to_string(),
+            "absent".to_string(),
+        ];
+        let results = host_results(
+            Some(&output(&[(
+                "ran",
+                HostStats {
+                    ok: 1,
+                    completed: true,
+                    ..Default::default()
+                },
+            )])),
+            &hosts,
+            &[unreachable_host("excluded", true)],
+        );
+
+        assert_eq!(results["ran"].outcome, HostOutcome::Succeeded);
+        assert_eq!(results["excluded"].outcome, HostOutcome::Unreachable);
+        assert_eq!(results["excluded"].recap.unreachable, 1);
+        assert_eq!(results["absent"].outcome, HostOutcome::NotReached);
+    }
+
+    /// Why a host was excluded decides its outcome, because the two exclusions are recovered from in
+    /// different places: a Node that was down is fixed by that Node returning, and `Unreachable` is
+    /// in the Node watch's wake set so the plan retries the moment it does. A `Ready` Node whose
+    /// proxy pod never came up is fixed in the pod's scheduling, and its Node has nothing further to
+    /// report — reporting that as `Unreachable` too woke the plan once per kubelet heartbeat for its
+    /// whole life, re-resolving inventories, re-reading Secrets and listing every Node, long after
+    /// the attempt budget had stopped it acting.
+    ///
+    /// The counters do not split: nothing connected either way, and that is what keeps the run's
+    /// recap from claiming it reached every host it targeted.
+    #[test]
+    fn an_excluded_hosts_outcome_says_which_kind_of_exclusion_it_was() {
+        let hosts = vec!["node-a".to_string(), "node-b".to_string()];
+        let results = host_results(
+            None,
+            &hosts,
+            &[
+                unreachable_host("node-a", true),
+                unreachable_host("node-b", false),
+            ],
+        );
+
+        assert_eq!(results["node-a"].outcome, HostOutcome::Unreachable);
+        assert_eq!(results["node-b"].outcome, HostOutcome::NotReached);
+        assert_eq!(results["node-a"].recap.unreachable, 1);
+        assert_eq!(results["node-b"].recap.unreachable, 1);
     }
 
     /// `abort_unlaunched` is the only way into `Aborted`, and it is only ever legitimate while the

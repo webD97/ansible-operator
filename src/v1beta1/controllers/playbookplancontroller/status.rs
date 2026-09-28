@@ -3,7 +3,7 @@ use k8s_openapi::api::batch;
 use crate::{
     utils::upsert_condition,
     v1beta1::{
-        HostOutcome, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
+        HostOutcome, Phase, PlayPhase, PlayStatus, PlaybookPlanCondition, PlaybookPlanStatus,
         distinct_host_count,
     },
 };
@@ -136,26 +136,52 @@ pub fn set_blocked_condition(status: &mut PlaybookPlanStatus, blocked: Option<&B
     upsert_condition(&mut status.conditions, condition);
 }
 
-/// Sets the plan-level `WaitingForNodes` condition, reporting whether this run is currently waiting
-/// for managed-ssh proxy pods to become Ready on one or more target nodes (a node may be `NotReady`
-/// or its proxy pod still starting). `Some(hosts)` sets it `True` naming the pending hosts; `None` —
-/// the proxies are all Ready, or timed out and the run is proceeding — sets it `False`. Like
-/// `Blocked`, this is an orthogonal transient overlay on the plan's lifecycle, not a phase of its own,
-/// so a condition models it better than a phase would.
+/// What a plan is waiting on the cluster's nodes for, when it is waiting on them at all.
+///
+/// The two are genuinely different waits and a reader has to be able to tell them apart: one
+/// happens *inside* a run that has already committed to its hosts, the other happens *instead* of
+/// starting one. They share a condition because to anyone watching the plan they are the same
+/// question — "why is nothing happening, and what would change that?" — and a plan can only ever be
+/// in one of them at a time.
+pub enum WaitingForNodes<'a> {
+    /// A run is under way and its managed-ssh proxy pods have not all come up yet (a node may be
+    /// `NotReady`, or its pod still starting). Resolves on its own, one way or the other: the pods
+    /// become Ready, or the grace window closes and the run proceeds without those hosts.
+    ProxyPods(&'a [String]),
+    /// No run was started, because every host one would target is on a node that is not `Ready`.
+    /// Resolves when a node does — the controller's Node watch is what notices.
+    NodesNotReady(&'a [String]),
+}
+
+/// Sets the plan-level `WaitingForNodes` condition. `None` — the proxies are all Ready or timed out
+/// and the run is proceeding, or there are no down nodes holding a run back — sets it `False`.
+///
+/// Like `Blocked`, this is an orthogonal transient overlay on the plan's lifecycle, not a phase of
+/// its own, so a condition models it better than a phase would.
 pub fn set_waiting_for_nodes_condition(
     status: &mut PlaybookPlanStatus,
-    waiting: Option<&[String]>,
+    waiting: Option<WaitingForNodes>,
 ) {
     let now = chrono::Local::now().fixed_offset();
 
     let condition = match waiting {
-        Some(hosts) => PlaybookPlanCondition {
+        Some(WaitingForNodes::ProxyPods(hosts)) => PlaybookPlanCondition {
             type_: "WaitingForNodes".into(),
             status: "True".into(),
             reason: Some("ProxyPodsNotReady".into()),
             message: Some(format!(
                 "waiting for managed-ssh proxy pods on host(s): {}",
                 hosts.join(", ")
+            )),
+            last_transition_time: Some(now),
+        },
+        Some(WaitingForNodes::NodesNotReady(nodes)) => PlaybookPlanCondition {
+            type_: "WaitingForNodes".into(),
+            status: "True".into(),
+            reason: Some("NodesNotReady".into()),
+            message: Some(format!(
+                "not starting a run: every node it would target is not Ready ({})",
+                nodes.join(", ")
             )),
             last_transition_time: Some(now),
         },
@@ -169,6 +195,34 @@ pub fn set_waiting_for_nodes_condition(
     };
 
     upsert_condition(&mut status.conditions, condition);
+}
+
+/// Whether the plan is currently reporting the [`WaitingForNodes::NodesNotReady`] hold, as opposed
+/// to the proxy-pod wait that shares the condition or no wait at all.
+///
+/// Exists so a caller can retire *its* wait without touching the other one. Clearing the condition
+/// unconditionally looks harmless — the tick that starts a run re-asserts `ProxyPodsNotReady` a
+/// moment later — but `upsert_condition` restamps `lastTransitionTime` whenever the status flips,
+/// so the round trip through `False` turns a status that says nothing new into a write, a
+/// `resourceVersion` bump and another reconcile, every five seconds for as long as a run waits on
+/// its proxy pods. It also leaves the timestamp meaning "the last tick" rather than "when the wait
+/// began".
+pub fn held_for_unready_nodes(status: &PlaybookPlanStatus) -> bool {
+    status.conditions.iter().any(|condition| {
+        condition.type_ == "WaitingForNodes"
+            && condition.status == "True"
+            && condition.reason.as_deref() == Some("NodesNotReady")
+    })
+}
+
+/// Whether the plan's last outcome leaves something a further run could still apply.
+///
+/// One comparison, but shared on purpose: the mapper that wakes a plan on an SSH key rotation and
+/// the budget reset that lets the woken plan act must agree exactly. If the mapper were the wider of
+/// the two it would wake plans that then decline to do anything; if it were the narrower, a plan
+/// would sit on a fix it had already been given.
+pub fn may_need_another_run(status: &PlaybookPlanStatus) -> bool {
+    status.phase != Phase::Succeeded
 }
 
 pub fn clear_run_conditions(status: &mut PlaybookPlanStatus) {
@@ -252,7 +306,14 @@ pub fn set_invalid_scheduling_configuration_condition(
     set_ready_overlay(status, "InvalidSchedulingConfiguration", message);
 }
 
-/// Temporarily replaces the host-derived `Ready` verdict with a configuration failure.
+/// Marks the plan as not ready while the readiness gate holds it back: its last verdict still
+/// stands, but there are hosts it has not applied the current revision to and cannot reach. Without
+/// this a converged plan that gains a host on a down Node keeps the `Ready=True` of its previous run.
+pub fn set_nodes_not_ready_condition(status: &mut PlaybookPlanStatus, message: &str) {
+    set_ready_overlay(status, "NodesNotReady", message);
+}
+
+/// Temporarily replaces the host-derived `Ready` verdict with a reason the plan cannot act on.
 fn set_ready_overlay(status: &mut PlaybookPlanStatus, reason: &str, message: &str) {
     upsert_condition(
         &mut status.conditions,
@@ -283,6 +344,15 @@ pub fn clear_invalid_scheduling_configuration_condition(
     outdated_count: usize,
 ) -> bool {
     clear_ready_overlay(status, outdated_count, "InvalidSchedulingConfiguration")
+}
+
+/// Retires the [`set_nodes_not_ready_condition`] overlay once the plan is no longer held, returning
+/// whether that overlay was present so the caller only replaces its matching plan summary.
+pub fn clear_nodes_not_ready_condition(
+    status: &mut PlaybookPlanStatus,
+    outdated_count: usize,
+) -> bool {
+    clear_ready_overlay(status, outdated_count, "NodesNotReady")
 }
 
 /// Retires one temporary readiness overlay, restating `Ready` from the plan's per-host results.
@@ -527,10 +597,8 @@ mod tests {
     fn waiting_for_nodes_condition_names_hosts_then_clears_in_place() {
         let mut status = PlaybookPlanStatus::default();
 
-        set_waiting_for_nodes_condition(
-            &mut status,
-            Some(&["worker-1".to_string(), "worker-2".to_string()]),
-        );
+        let hosts = ["worker-1".to_string(), "worker-2".to_string()];
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
         let waiting = status
             .conditions
             .iter()
@@ -541,6 +609,18 @@ mod tests {
         let message = waiting.message.as_deref().unwrap();
         assert!(message.contains("worker-1"), "{message}");
         assert!(message.contains("worker-2"), "{message}");
+
+        // The other wait shares the condition but must be tellable apart by its reason: one happens
+        // inside a run, the other instead of starting one.
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::NodesNotReady(&hosts)));
+        let waiting = status
+            .conditions
+            .iter()
+            .find(|c| c.type_ == "WaitingForNodes")
+            .unwrap();
+        assert_eq!(waiting.status, "True");
+        assert_eq!(waiting.reason.as_deref(), Some("NodesNotReady"));
+        assert!(waiting.message.as_deref().unwrap().contains("worker-1"));
 
         set_waiting_for_nodes_condition(&mut status, None);
         assert_eq!(
@@ -558,6 +638,62 @@ mod tests {
             .find(|c| c.type_ == "WaitingForNodes")
             .unwrap();
         assert_eq!(cleared.status, "False");
+    }
+
+    /// The predicate and the writer have to agree on the same two strings, and nothing but a test
+    /// makes them: a typo in either would silently turn the hold into "no hold", which reads as a
+    /// working plan and re-enables the clear the guard exists to prevent.
+    #[test]
+    fn only_the_nodes_not_ready_hold_answers_the_hold_predicate() {
+        let mut status = PlaybookPlanStatus::default();
+        let hosts = ["worker-1".to_string()];
+
+        assert!(!held_for_unready_nodes(&status), "no condition, no hold");
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        assert!(
+            !held_for_unready_nodes(&status),
+            "a run waiting on its proxy pods is not a plan held from starting one"
+        );
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::NodesNotReady(&hosts)));
+        assert!(held_for_unready_nodes(&status));
+
+        set_waiting_for_nodes_condition(&mut status, None);
+        assert!(!held_for_unready_nodes(&status));
+    }
+
+    /// Why the caller has to ask before clearing. Re-stating the same wait is free — the condition
+    /// is byte-identical, so the plan's status write is a no-op — but a round trip through `False`
+    /// is not: it restamps `lastTransitionTime`, and a status that differs only in a timestamp is
+    /// still a write, a `resourceVersion` bump and another reconcile, once per tick for the whole
+    /// length of the wait.
+    #[test]
+    fn a_round_trip_through_cleared_restamps_a_wait_that_did_not_change() {
+        let mut status = PlaybookPlanStatus::default();
+        let hosts = ["worker-1".to_string()];
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        // Backdated so "kept" and "restamped" are distinguishable however coarse the clock is.
+        let started = "2025-08-12T20:00:00Z"
+            .parse::<chrono::DateTime<chrono::FixedOffset>>()
+            .unwrap();
+        status.conditions[0].last_transition_time = Some(started);
+
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        assert_eq!(
+            status.conditions[0].last_transition_time,
+            Some(started),
+            "the same wait, re-stated, is the same wait"
+        );
+
+        set_waiting_for_nodes_condition(&mut status, None);
+        set_waiting_for_nodes_condition(&mut status, Some(WaitingForNodes::ProxyPods(&hosts)));
+        assert_ne!(
+            status.conditions[0].last_transition_time,
+            Some(started),
+            "clearing and re-asserting loses when the wait began"
+        );
     }
 
     /// A run whose recap could not be read is still reported through its terminal `Play`, not

@@ -355,6 +355,20 @@ pub enum Phase {
     /// schedule ticks, with `nextRun` naming the next one.
     Succeeded,
 
+    /// The latest run reached and applied the playbook to every host it *could* reach, and the only
+    /// hosts left over were ones nothing could connect to.
+    ///
+    /// A failure, and counted as one everywhere the budget and the schedule ask — but a different
+    /// one from `Failed`, which means something the operator did reach did not work. Nothing here is
+    /// wrong with the playbook: a machine is down, or a `StaticInventory` host is refusing
+    /// connections. The plan is waiting for hardware, not for someone to fix it, and reporting that
+    /// as `Failed` made a healthily-waiting plan indistinguishable at a glance from a broken one.
+    ///
+    /// Requires *every* non-succeeded host to be `Unreachable`. One host that ran a task and failed,
+    /// or one the play stopped short of, makes the run `Failed` — the unreachable hosts are then not
+    /// the whole story.
+    HostsUnreachable,
+
     /// The PlaybookPlan's namespace is not enrolled for the operator (not in the chart's
     /// `watchNamespaces`), so the operator has no RBAC to read its Secrets or create its Job and
     /// refuses to run it. Terminal until an administrator enrols the namespace and the operator
@@ -431,6 +445,17 @@ pub struct PlaybookPlanStatus {
     #[serde(default, with = "crate::v1beta1::resources::custom_rfc3339")]
     #[schemars(with = "Option<String>")]
     pub retry_count_slot: Option<DateTime<FixedOffset>>,
+    /// Fingerprint of the SSH key material this plan's `StaticInventory` hosts are reached with,
+    /// as it was when the plan last looked. Absent for a plan that reaches no such hosts.
+    ///
+    /// Deliberately *not* part of `currentHash`. That hash decides which hosts are outdated, so
+    /// folding a key into it would re-apply the playbook to every host that is already current —
+    /// rotating a key changes how the operator connects, not what it applies. Kept beside the hash
+    /// instead, this notices the rotation without claiming a new revision: a plan whose last run
+    /// did not succeed gets its `retryCount` back, because the old key may well be why it failed,
+    /// and `lastAppliedHash` still keeps the run off the hosts that are already converged.
+    #[serde(default)]
+    pub observed_ssh_key_revision: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
@@ -477,10 +502,40 @@ pub enum HostOutcome {
     #[default]
     Unknown,
     Succeeded,
+    /// Ansible connected to the host and a task failed on it.
     Failed,
-    /// The host was in scope for this run but Ansible never reached it (e.g. an earlier host in its
-    /// `serial` batch stopped the play).
+    /// Nothing could open a connection to the host, so no task ran on it — a `StaticInventory` host
+    /// that is down or refusing the key, or a cluster Node that was itself not `Ready`, which the
+    /// run excludes rather than dialling.
+    ///
+    /// Distinct from `Failed` because the two are fixed in different places. Distinct from
+    /// `NotReached` because something has to come back for this host before anything can be
+    /// attempted on it, and the operator is watching for exactly that: a Node returning to `Ready`
+    /// wakes the plan. A host whose connection dropped part-way through, leaving both failed and
+    /// unreachable tasks behind, reads `Failed`: something did run and did fail, which is the more
+    /// actionable half.
+    Unreachable,
+    /// The host was in scope for this run, nothing was attempted on it, and no Node coming back will
+    /// change that. Two causes, one answer:
+    ///
+    /// - an earlier host in its `serial` batch stopped the play, so the fix is on *that* host;
+    /// - the run excluded it because its managed-ssh proxy pod never came up on a Node that was
+    ///   itself `Ready` — an untolerated taint, a failing image pull, a rejecting admission webhook.
+    ///   The fix is in the pod's scheduling, not on the Node.
+    ///
+    /// What they share is the part the operator acts on: this host's own `Ready` heartbeats carry no
+    /// news, so `mappers::plan_awaits_node` leaves it out of the Node watch's wake set. Contrast
+    /// `Unreachable`, where a Node returning is precisely what resolves it.
     NotReached,
+    /// Ansible ran tasks on the host, none of them failed, and the playbook still stopped before
+    /// reaching the end for it — an `any_errors_fatal` abort, a failed `serial` batch, a
+    /// `max_fail_percentage` rollout halt. Some other host is what failed.
+    ///
+    /// This host received *part* of the playbook. Its counters look exactly like a host that
+    /// received all of it — that is the whole reason the outcome exists — so it is deliberately not
+    /// `Succeeded`, and the run does not record the playbook as applied to it. Fix whatever failed
+    /// elsewhere in the run; this host is re-applied on the next one.
+    Incomplete,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

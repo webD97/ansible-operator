@@ -27,7 +27,8 @@ per-host status, and the summary line.
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
-| `Failed` | The latest run did not succeed on every host, or its recap could not be read. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable). |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Summary
@@ -63,7 +64,10 @@ printer columns:
   `HostsOutdated` describe **the whole plan**, counted over every eligible host. The two are worded
   differently on purpose: `n/m hosts completed successfully` is a statement about an execution,
   `n/m hosts on the current revision` about the plan's standing, and the second is not a claim that
-  anything ran.
+  anything ran. While a `OneShot` plan is
+  [held for `NotReady` Nodes](./cluster-nodes.md#holding-instead-of-starting), `Ready` is `False`
+  with reason `NodesNotReady` even if the phase still shows the last run's `Succeeded`: the phase is
+  what the plan last did, and `Ready` says it has hosts it has not yet applied to.
 - **`Running`** — the operator has identified this run's own Job in a non-terminal state
   (`JobRunning`). It is set in the same reconcile that creates the Job (a run adopted during recovery
   picks it up on the next tick), and re-asserted on every tick that observes it unfinished, so it
@@ -81,9 +85,21 @@ printer columns:
   message names the host and the run holding it. This one is not a column — read it with `kubectl
   describe` or `-o yaml`. It clears on its own once every lock the run needs is free. See
   [Host locks](./scheduling-and-modes.md#host-locks).
-- **`WaitingForNodes`** — managed-SSH proxy pods are not `Ready` yet. The message names the pending
-  Nodes. It clears when the proxies become Ready or their wait expires. See
-  [NotReady nodes](./cluster-nodes.md#notready-nodes).
+- **`WaitingForNodes`** — the plan is waiting on the state of its target Nodes. The `reason` says
+  which of the two waits it is, and the message names the Nodes:
+  - `ProxyPodsNotReady` — a run is under way and its managed-SSH proxy pods are not `Ready` yet. It
+    clears when the proxies become Ready or their wait expires. See
+    [NotReady nodes](./cluster-nodes.md#notready-nodes).
+  - `NodesNotReady` — no run was started, because every Node one would target is `NotReady`. Only
+    `OneShot` plans hold this way. It clears when one of those Nodes becomes `Ready`, which the
+    operator notices at once — and also whenever the plan stops being held for any other reason:
+    suspending it, a schedule window closing, or an inventory change that leaves it no such hosts.
+    A held plan that is then suspended reports `suspended; no new run will start` instead, since
+    suspension is what is stopping the run at that point, not the Node. While the hold stands,
+    `Ready` is `False` with the same reason; when it clears, `Ready` goes back to describing the
+    hosts (`HostsUpToDate` / `HostsOutdated`), so a plan whose down Node left the inventory reads
+    `Ready=True` again without another run.
+    See [Holding instead of starting](./cluster-nodes.md#holding-instead-of-starting).
 
 `.status.summary` is a one-line human summary (also a column), and `.status.currentHash` is the
 current [execution hash](./scheduling-and-modes.md#drift-detection).
@@ -99,9 +115,11 @@ prevents an old Job and a new revision from targeting the same host concurrently
 
 | Outcome | Meaning |
 |---|---|
-| `Succeeded` | Ansible applied the playbook to this host successfully. `lastAppliedHash` is bumped to the current hash. |
-| `Failed` | Ansible reached the host but a task failed. |
-| `NotReached` | The host was in scope but Ansible never got to it — e.g. an earlier host in its `serial` batch stopped the play. Not an error *on this host*. |
+| `Succeeded` | Ansible applied the playbook to this host successfully, **and the playbook ran to the end for it**. `lastAppliedHash` is bumped to the current hash. |
+| `Failed` | Ansible connected to the host and a task failed on it. A host whose connection dropped part-way through also reads `Failed`: something ran and failed before it went. |
+| `Unreachable` | Nothing could connect to the host, so no task ran on it — a Node that was itself `NotReady`, a `StaticInventory` host that is down, or one refusing the key. Fixed on the host or the Node, not in the playbook. The plan is waiting for the machine, and a Node returning to `Ready` starts the next run on its own. See [NotReady nodes](./cluster-nodes.md#notready-nodes). |
+| `NotReached` | The host was in scope but nothing was attempted on it, and no Node coming back will change that — either an earlier host in its `serial` batch stopped the play, or the run excluded it because its managed-SSH proxy never came up on a Node that was otherwise `Ready`. An excluded host still counts `unreachable` in the recap — its own and the run's — because nothing connected to it, which is all that counter records; the outcome is what says where to look. See [Hosts show `NotReached`](#hosts-show-notreached). |
+| `Incomplete` | Tasks ran on this host and none of them failed, but the playbook stopped before finishing for it, because a **different** host failed — `any_errors_fatal`, a failed `serial` batch, `max_fail_percentage`. It received *part* of the playbook, so it is not recorded as converged and is re-applied on the next run. See [Hosts show `Incomplete`](#hosts-show-incomplete). |
 | `Unknown` | The operator could not read a recap for this host — its **own instrumentation** failed, not Ansible. Distinct from `NotReached`. Worth investigating (see below). |
 
 Each host also records `lastAppliedHash` (the hash it last *succeeded* on — this is what drift
@@ -130,8 +148,38 @@ kubectl get plays -n my-team
 # apply-web-config-a1b2c3-2   web-config      3  12        3       0            0  Succeeded   8m
 ```
 
-The columns mirror the Ansible **recap**, summed across every host the run targeted. `kubectl get
-plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
+The counter columns are the Ansible **recap** your own playbook would have printed, had you run it
+unmodified against the same fleet in the same condition. They are deliberately not a transcript of
+the pod's `PLAY RECAP`, which differs from it in two operator-introduced ways: the appended
+completion-marker task adds an `ok` to every host (subtracted back out here), and a host the run
+[excluded](#hosts-show-unreachable) is missing from it entirely (counted here as `unreachable`, since
+that is what your own run would have reported for a host nothing could dial). By the same standard a
+`hosts: localhost` play's counters are included, so the totals can exceed what the per-host rows
+account for — `Hosts` counts the machines targeted, the counters count what the playbook did.
+
+If a run succeeds and any of its hosts ran no task at all, the plan summary says how many:
+`3/3 up-to-date (the playbook ran no task on 2 of 3 hosts)`, with the operator log carrying the
+longer version. This commonly means a `hosts:` pattern matched no inventory group — for example,
+`webserver` instead of `webservers`. Find the hosts in the `Play`'s `.status.hosts`, where they are
+the ones whose recap counters are all zero, and check the Job output for Ansible's
+`Could not match supplied host pattern` warning.
+
+The question is asked **per host**, not over the run's totals, because a playbook usually has more
+than one play: one working play — or a single `hosts: localhost` play, whose counters are in the
+totals — is enough to make the run look busy while a mistyped pattern quietly reaches nobody. Those
+hosts are still recorded as up to date, since applying a playbook that names none of them is vacuous
+(see [`NotReached`](#per-host-outcomes) for the case where something did stop the run short of a
+host), which is exactly why the summary says so: a `OneShot` plan will otherwise never look at them
+again.
+
+An inventory that is deliberately wider than its playbook produces the same observable result, and
+so does a playbook that leaves hosts untouched on purpose: with `gather_facts: false`, a `run_once`
+task runs — and is counted — on one host only, and a `meta: end_host` guard ends a host without
+running anything on it. Nothing can tell these apart from a mistake, so the note appears on every
+run of such a plan. The operator keeps the successful verdict either way and asks you to confirm
+which case you intended rather than treating one as a failure.
+
+`kubectl get plays -o wide` adds the less-common counters (`rescued`, `skipped`, `ignored`), the run number and
 the `Try` column — which try of its execution that run was, in the sense
 [Retries](./scheduling-and-modes.md#retries) gives it. Each `Play`'s `.status` also carries the per-host recap and outcome plus `finishedAt`:
 
@@ -679,9 +727,76 @@ Compare them run ID by run ID, against both of the last two listings. A Lease's 
 
 ### Hosts show `NotReached`
 
-Expected when a play stops early — for example a `serial` batch that failed before reaching later
-hosts, or a `run_once` task that aborted. Fix the host that actually failed (its outcome is `Failed`);
-the `NotReached` hosts should proceed on the next run.
+Nothing was attempted on the host. Two causes, told apart by what the rest of the run looks like:
+
+- **a play stopped early** — a `serial` batch that failed before reaching later hosts, or a
+  `run_once` task that aborted. Fix the host that actually stopped it (its outcome is `Failed` or
+  `Unreachable`); the `NotReached` hosts proceed on the next run without further action.
+- **the run excluded a cluster Node whose proxy pod never came up, on a Node that was itself
+  `Ready`.** The run's `Play` record says which it was:
+
+  ```sh
+  kubectl get play <name> -o jsonpath='{.status.unreachableHosts}'
+  # [{"host":"node-b","nodeNotReady":false}]   <- the Node was Ready; the proxy pod is the problem
+  ```
+
+  The Node is healthy; its managed-SSH proxy pod is what failed to schedule or start, so look at the
+  pod, not the machine: an untolerated taint, a failing image pull, a rejecting admission webhook, or
+  exhausted capacity. See [NotReady nodes](./cluster-nodes.md#notready-nodes) for the tolerations a
+  proxy pod needs.
+
+The second case does **not** clear itself. Nothing about the Node is going to change — it is already
+`Ready` — so the operator does not wake the plan on its heartbeats, and the plan reports `Failed` and
+spends an [attempt](./scheduling-and-modes.md#retries) on each run until the pod can start. That is
+the intended reading: there is something here for someone to fix.
+
+### Hosts show `Unreachable`
+
+Nothing opened a connection, so nothing in the playbook is implicated. Where to look depends on how
+the host is reached:
+
+- a **cluster Node**: the Node was itself `NotReady` when the run launched, so the run excluded it
+  rather than dialling it. Start with the Node — [NotReady nodes](./cluster-nodes.md#notready-nodes).
+  (A Node that was `Ready` and whose *proxy pod* never came up reads
+  [`NotReached`](#hosts-show-notreached) instead, because that is fixed in the pod, not on the Node.)
+- a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
+  `spec.ssh.secretRef`.
+
+Such a run leaves the plan in the `HostsUnreachable` phase rather than `Failed`, provided *every*
+host that did not succeed was one nothing could connect to. That is the distinction the phase exists
+for: the playbook is fine and the plan is waiting for a machine. One host that ran a task and failed
+alongside them, and the phase is `Failed` again — the unreachable hosts are no longer the whole story.
+So does one host left [`NotReached`](#hosts-show-notreached) by a proxy pod that could not start on a
+`Ready` Node: that is a configuration to fix, not a machine to wait for.
+
+A `OneShot` plan does not spend an [attempt](./scheduling-and-modes.md#retries) on a run whose only
+non-successes were hosts on Nodes that were already `NotReady` when it launched, and it holds rather
+than starting another run while they stay down — so a plan in this state is waiting for the Node, not
+stuck. That relief is specific to cluster Nodes the operator saw go down: an unreachable
+`StaticInventory` host, or a Node that was `Ready` when the run started, is a failure like any other
+and does spend its attempts.
+
+### Hosts show `Incomplete`
+
+Nothing is wrong with this host. Some **other** host in the same run failed, and the playbook is
+configured to stop the whole play when one does — `any_errors_fatal: true`, a `serial` batch that
+failed outright, or a `max_fail_percentage` threshold. Ansible stopped at that point, so this host
+ran the tasks up to it and never ran the rest.
+
+Fix whatever failed elsewhere in the run; every `Incomplete` host is re-applied on the next one.
+`kubectl get play <name> -o jsonpath='{.status.hosts}'` shows which host failed.
+
+Its recap counters look exactly like a fully applied host's — `failed=0, unreachable=0` — which is
+why the operator does not read them on their own. It appends a `__ansible_operator_completion_marker`
+play to every playbook, whose one task runs for each host that reached the end. An abort stops the
+whole playbook run, so nobody reaches the marker; a host that failed or went unreachable is dropped
+from later plays, so it does not either. That play is why run logs show one more `PLAY` than the
+playbook has, and its task is subtracted back out of every count the operator reports, so
+`.status.recap` describes the playbook rather than the operator.
+
+Before this existed, such a host was recorded `Succeeded` and stamped converged — permanently, since
+`OneShot` then skips a converged host on every later run. If a plan looks converged on a host that
+demonstrably never received the whole playbook, that is what happened.
 
 ### Hosts show `Unknown`
 
@@ -709,6 +824,36 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
   run can be recovered from, so the operator releases the run's locks and proxy pods and reports
   the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts
   normally.
+- **The plan has too many hosts for one recap.** The recap travels in the Job container's
+  termination message, which Kubernetes caps at 4096 bytes. The operator compresses it when it does
+  not fit, which is good for several hundred hosts, but a plan larger than that cannot report a
+  per-host result at all. This case says so rather than leaving you to guess: `.status.summary`
+  reads *"the recap for N hosts does not fit the kubelet's termination-message limit"*, and the
+  operator logs the same. Split the plan across smaller inventories — each plan gets its own recap,
+  so two plans of 300 hosts fit where one of 600 does not.
+
+  Unlike the other causes here, this one is deterministic: every retry reproduces it, so the plan
+  spends its whole [attempt budget](./scheduling-and-modes.md#retries) and then stops. No host is
+  recorded as converged even where the playbook succeeded, so the split has to happen before the
+  plan can make progress.
+
+### A `hosts: localhost` play has no per-host outcome
+
+Expected. Every run is launched with `--limit`, whose pattern list names `all` and `localhost` before
+excluding the hosts nothing could reach — so a `hosts: localhost` play runs exactly as it would
+without the operator, but localhost is not one of the plan's hosts. It gets no entry in
+`.status.hostsStatus` and no `lastAppliedHash`, and nothing about it is ever recorded as converged or
+outdated. Its output is in the run's Job log.
+
+Its counters *are* in `.status.recap`, because that total reproduces your playbook rather than the
+plan's host list (see [Run history](#run-history)). So the recap can exceed what the per-host rows
+add up to, and the `Ok` column can exceed what `Hosts` would suggest. That is not an inconsistency:
+`Hosts` counts the machines the run targeted, the recap counts what the playbook did.
+
+Note that `localhost` here is Ansible's *implicit* localhost, which `all` never matches: a
+`hosts: all` play does not pick it up, and neither does the operator's completion-marker play, which
+targets `all`. A `StaticInventory` host that happens to be named `localhost` is an ordinary host of
+the plan and is reported like any other.
 
 ### A change is not being picked up
 
@@ -718,10 +863,12 @@ references — trigger a re-run of already current hosts. Editing an unrelated `
 schedule that has not fired yet) will not. Confirm `.status.currentHash` actually changed after your
 edit.
 
-An inventory's group variables do count, but not at once: the operator does not watch
-`ClusterInventory` or `StaticInventory`, so such an edit waits for the plan's next reconcile, which
-is up to an hour for a settled `OneShot` plan. Touching the plan itself — any edit, an annotation
-included — wakes it immediately.
+An inventory's group variables count too, and take effect at once: the operator watches the
+`ClusterInventory` and `StaticInventory` resources a plan references, alongside the plan itself and
+the Secrets it names. If an inventory edit appears to do nothing, check that the plan's
+`.spec.inventoryRefs` really names *that* inventory, and that the two live in the same namespace —
+inventory references are resolved in the plan's own namespace, so a same-named inventory elsewhere
+is a different object.
 
 ### It never seems to run
 

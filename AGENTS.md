@@ -73,16 +73,16 @@ src/v1beta1/
   controllers/
     playbookplancontroller/          the big one — see below
     clusterinventorycontroller/      resolves Node → hosts, watches Nodes, writes ClusterInventoryStatus
-    clusterinventorycontroller/mappers.rs   maps Node changes to ClusterInventory reconciles
     nodeaccesspolicycontroller/      writes NodeAccessPolicyStatus (matched namespaces / allowed nodes) for observability; watches ns + nodes
-    nodeaccesspolicycontroller/mappers.rs   maps Namespace/Node changes to all policy reconciles
+    selector_trigger.rs              label_changes: the set-valued controllers' watch trigger — ticks only on a label change, an appearance or a disappearance; must stay in lockstep with what nodeselector.rs reads
     ansible_inventory.rs             ResolvedInventoryGroup (ManagedSsh | Ssh) + ResolvedHosts; AnsibleInventory trait (get_hosts); distinct_hosts/_count (every host-population count, in both controllers)
     nodeselector.rs                  node_matches / selector_matches / selector_matches_fail_closed (INV-1)
     reconcile_error.rs               shared ReconcileError (thiserror)
   controllers/playbookplancontroller/
     reconciler.rs                    the reconcile pipeline (below); patch_status via JSON merge patch
-    mappers.rs                       maps Secret and NodeAccessPolicy changes to affected plans
+    mappers.rs                       maps Secret, NodeAccessPolicy, ClusterInventory and StaticInventory changes to affected plans; the Secret watch asks two rules (named in `variables`/`files`, or holding a StaticInventory's SSH key)
     node_access.rs                   NodeAccessPolicy enforcement: fail-closed intersection clamp (INV-2/3/5)
+    node_readiness.rs                Node Ready-condition predicates + the OneShot "hold instead of starting" gate; readiness only, never authorization
     managed_ssh.rs                   proxy pods (hostPID + nsenter = NODE ROOT), per-run sshd config/certs/principals, NetworkPolicy, cleanup (INV-4/7)
     locking.rs                       per-host Leases (operator ns) for run mutual-exclusion
     play_history.rs                  writes/prunes the immutable Play run records; its module doc is the authoritative PlayPhase state machine
@@ -92,6 +92,7 @@ src/v1beta1/
     callback_output.rs               parses the recap the callback wrote to the pod termination message
     triggers.rs                      validated 5-field Schedule newtype + total evaluate_schedule / forecast_next_run, timezone-aware
     status.rs                        folds a terminal Play's per-host results into PlaybookPlanStatus conditions (the only place run outcomes reach the plan)
+                                     `Phase::HostsUnreachable` splits a failed run in two: everything reachable was applied and only unreachable hosts are left. A failure everywhere the mechanics ask (`is_failure_verdict` — retries, schedule window, summary wording) and differs from `Failed` only in what it tells a human, so a plan parked on a dead machine does not read as a broken playbook. Decided by `phase_for_finished_run`, which needs the per-host results and so runs where the terminal `PlayStatus` is still in hand; `FinishedRun` carries the resulting verdict rather than the run's own `PlayPhase`.
     paths.rs                         shared mount-path conventions between workspace/inventory_renderer/job_builder
   ansible/
     playbook_renderer.rs             round-trips spec.template.playbook YAML (validation)
@@ -225,6 +226,59 @@ Two gates, deliberately: `attempt_budget_available` at `may_start_new_run` is th
 answered by the schedule-window gate, which is the only one that can tell a retry of the current
 tick from the first run of the next.
 
+The operator appends a `__ansible_operator_completion_marker` play to every rendered playbook
+(`ansible::playbook_renderer`), and the recap callback reports per host whether it produced a result
+for that play's single task. This is the only way to tell "ran the whole playbook" from "was fine up
+to the point the play stopped": under an `any_errors_fatal`/`serial`/`max_fail_percentage` abort a
+surviving host reports `failed=0, unreachable=0`, identical to one that ran every task, and no
+callback hook announces the abort. An abort ends the whole playbook run so nobody reaches the marker,
+while a host that failed or went unreachable is dropped from later plays and so does not reach it
+either — which makes the answer per host. `HostOutcome::Incomplete` is that case, and it is
+deliberately not `Succeeded`, so `apply_terminal_play_status` does not stamp `lastAppliedHash` on a
+host that received part of a playbook. The task name is duplicated in `playbook_renderer.rs` and
+`ansible_operator_recap.py`; a test pins them together, because a drift there reads as "nothing
+converged" on every plan at once.
+
+A `OneShot` run gets its budget back when it made all the progress that was available to it, which
+is a `Succeeded` verdict *or* a failure confined to Nodes the run recorded as not `Ready` at its
+launch commit **and that still applied the playbook to at least one host**
+(`classify_run_failure`, `PlayStatus::unreachable_hosts`). That record holds every host
+the run excluded, each flagged with whether its Node was itself down — a host excluded because a
+`Ready` Node's proxy pod never came up is a configuration problem and is not refunded. It has to be
+captured at launch and persisted: the recap says nothing at all about a host the run excluded, and
+the Node may have recovered by the time the result is drained.
+
+That record and the run's `--limit` file are written from **one** variable in one tick, and must
+stay that way. A resumed run whose Job was never created re-reads its proxy pods, so the launch
+commit re-states the set rather than treating the replay as a pure no-op — the phase half stays
+idempotent, the data half does not. Left un-restated, the file and the record would describe
+different runs: a host excluded in one but not the other either loses its `unreachable` from the
+recap, or runs the playbook and is reported unreachable anyway, never stamped, and re-run forever.
+It is still "at launch", because a run whose Job exists is adopted rather than resumed, so the last
+write is always the one immediately before the Job that ran.
+
+An SSH key rotation is the one input that is *noticed* without being hashed. `StaticInventory`
+key material is deliberately outside the execution hash — that hash decides which hosts are outdated,
+so folding a key into it would re-apply the playbook to hosts that are already current. Instead
+`status.observedSshKeyRevision` fingerprints it (`execution_evaluator::hash_secret_data`), and a
+change restores a `OneShot` plan's attempt budget when its last run did not succeed
+(`sync_ssh_key_revision`). The budget reset is the point: a plan whose hosts rejected the old key has
+spent every try by then — a `StaticInventory` host has no proxy grace window in front of it — so
+waking it alone would achieve nothing. `mappers::ssh_secret_to_playbookplans` supplies the wake-up,
+and both sides share `status::may_need_another_run` so the mapper can never wake a plan the reset
+would then decline. The first observation is recorded without acting, which is what keeps an upgrade
+from handing every failed plan a free retry at once.
+
+The "applied to at least one host" half is a bound, not a nicety: the gate reads the Node at tick
+time while `node_not_ready` is read a grace window later, so a Node that alternates across that
+window passes the gate *and* earns the refund, and the plan would run every grace window forever.
+A refund is credit for progress, so a run with none spends its attempt and `maxAttempts` bounds the
+flap. Hysteresis on the gate's release was considered and rejected — it damages the reboot workflow
+the gate exists for, and only filters flaps faster than the delay it adds. That relief
+and the `node_readiness` start gate are a matched pair — the relief is what stops a stranded Node
+burning the budget, the gate is what stops the plan re-running against it every grace window. Neither
+belongs without the other.
+
 ### Run records and recovery (`Play`)
 
 Every run is written down **before** anything is created for it, as a `Play` in the plan's
@@ -257,7 +311,9 @@ handful of decisions that are easy to undo by accident:
   `Play`s (which book revision and slot before anything is created) before a new run is prepared.
   Since `maxAttempts` the question is no longer "did a run take this slot" but "is there anything
   left for a run to do in it": a record still `Running` or one that `Succeeded` closes the window,
-  while failures close it only once they have spent the budget. `retryCountSlot` binds
+  while failures close it only once they have spent the budget. A `OneShot` failure the budget
+  refunded (`returns_its_attempt`) spent nothing and is not counted — the refund and this count must
+  answer from the same predicate, or the refund is taken back here. `retryCountSlot` binds
   `retryCount` to its recurring execution, so status can close an exhausted window after its records
   have been pruned and `next_attempt` does not restart at one when `lastTriggeredRun` is stale.
 - **`spec.suspend` is decided before the inventory is read** (`resolve_unlaunched_before_inputs`),
@@ -328,9 +384,63 @@ Per-node **Leases** give run mutual exclusion.
 `.watches(secrets_api, …, mappers::secret_to_playbookplans(…))` re-triggers a plan when a
 referenced Secret changes — but Secret/Job watches are set up **per enrolled namespace**, not
 cluster-wide (the operator's `secrets`/`jobs` RBAC is scoped there; a cluster-wide `Api::all`
-watch would 403). `clusterinventorycontroller` has the Node → ClusterInventory equivalent
-(`mappers::node_to_inventories`); `nodeaccesspolicycontroller` recomputes policy status on any
-namespace/node change.
+watch would 403). The `ClusterInventory`/`StaticInventory` watches
+(`mappers::cluster_inventory_to_playbookplans` / `..._static_...`) are cluster-wide like the plan
+watch itself, since CRD reads are (R1). They exist because `resolve_inventory` reads both kinds
+**live on every tick**, so their contents were always fresh whenever a reconcile happened — nothing
+made one happen, and an inventory that gained a host reached its plans only on their next requeue.
+`clusterinventorycontroller` and `nodeaccesspolicycontroller` are the *set-valued* controllers: their
+whole status is a function of every Node (and, for policies, every Namespace), so there is no
+per-object targeting to do and both recompute everything on every trigger. What is narrow is the
+**trigger**, `selector_trigger::label_changes` + `Controller::reconcile_all_on`, which ticks only
+when a label moves or an object appears or disappears. A mapper cannot do this job: `watches`
+flattens `watcher::Event` through `touched_objects()` before the mapper runs, and a deleted Node
+still carries the labels it matched with, so a content-only predicate would miss every deletion and
+strand a departed machine in `resolvedHosts` until the hourly requeue. The filter hashes **labels**
+because labels are exactly what `nodeselector` reads — a selector term over taints, annotations or
+spec fields would be invisible to it, so the two must move together.
+
+The plan controller also watches **Nodes**, through one reflector serving two jobs: the mapper
+(`mappers::node_to_playbookplans`) and the readiness lookups the reconcile does
+(`node_readiness::unready_nodes`). The mapper is deliberately narrow — a Node that is `Ready` *and*
+in the plan's `eligibleHosts` *and* not yet on the plan's `currentHash` — because every kubelet
+reposts its Node status periodically, so an "all plans" mapping would reconcile every plan every few
+minutes forever, scaling with node count. A converged cluster matches no plans and the heartbeats
+fall on the floor. It asks the *plan* as well as the host, because a wake the plan cannot act on
+costs exactly as much as one it can: a suspended plan, a `OneShot` plan out of attempts, and every
+`Recurring` plan are all refused. `Recurring` is refused outright because only the clock starts its
+runs — the readiness gate it would be released by is `OneShot`-only — and it is the one mode with no
+budget to bound the wakes, so one stuck host would otherwise wake it per heartbeat forever.
+
+`reconciler::new` is `async` for one reason: it waits for that reflector's initial LIST before
+handing back a controller. An unsynced Node cache reports every node `Ready`, which is precisely the
+answer that starts the runs the readiness gate exists to hold back — so after a restart every held
+plan would launch one, take its hosts' Leases for the full proxy grace window and report everything
+unreachable. `main` drives this controller as a future of its own so that wait does not delay the
+other two.
+
+The wait is bounded (`NODE_CACHE_SYNC_TIMEOUT`, 2 min) and **fatal**: `await_node_cache` panics
+rather than carrying on, because `Store::wait_until_ready` resolves only on a populated cache or a
+dropped writer, and a `watcher` retries a failing watch forever — so an unbounded wait would leave
+the controller pending for the life of the process while the other two kept the operator looking
+healthy. `join!` in `main` is what turns that panic into a process exit; spawning the controllers
+instead would park it in a `JoinHandle` nobody reads and restore exactly the silent half-alive state.
+
+**It bounds the first sync only.** A watch that breaks after the cache is populated leaves the
+`Store` serving its last contents for the life of the process, so the gate keeps answering from a
+snapshot and degrades from there — a Node that goes down afterwards still reads `Ready`. That is
+deliberately not treated the same way: with no answer at all, refusing to start is strictly better
+than guessing, while with a stale one every response trades one failure for another (crashing turns
+an apiserver blip into a restart loop; holding every run stops a fleet on a watch error). Which
+trade is right is an open decision, so the reflector task (`NodeWatchFailures`) only escalates its
+log after `NODE_WATCH_FAILURES_BEFORE_ESCALATING`, repeats that line every
+`NODE_WATCH_ESCALATION_INTERVAL` and says when the watch recovers — making the state loud, which is
+the half that was missing. Only `Apply`, `Delete` and `InitDone` count as the cache updating: a
+watcher whose re-LIST keeps failing yields `Init` before every attempt, so counting that as success
+would never let a failing re-list escalate.
+
+That reflector is for **readiness only**. `node_access::enforce` keeps its own *live* Node read:
+the allow-set is a security gate and INV-5 says it is never served from a cache.
 
 ## Enrolled namespaces (R1)
 
@@ -374,6 +484,11 @@ dedicated to Ansible ops (see `THREAT_MODEL.md` §6 / T-INFO-1).
 - The `NodeAccessPolicy` CRD is *cluster-scoped* — creating one requires cluster RBAC, which is
   what makes it an admin (not tenant) control. Enforcement reads **every** policy in the cluster;
   a namespace's allow-set is the union across all policies whose `namespaceSelector` matches it.
+- **`watcher` streams back off through `controllers::watch_backoff::WatchBackoff`, not
+  `.default_backoff()`.** kube's `StreamBackoff` resets its delay on every `Ok` item, and a watcher
+  whose re-LIST fails yields `Ok(Event::Init)` before every retry, so `.default_backoff()` retries a
+  refused LIST about once a second for as long as it is refused. `WatchBackoff` drops that reset and
+  keeps only the one after two quiet minutes; use it for any new `watcher` stream.
 
 ## User & operator documentation (`docs/` mdBook) — keep in sync with the code
 
