@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::v1beta1::{
     self, ClusterInventory, ExecutionMode, HostOutcome, InventoryRef, NodeAccessPolicy,
     StaticInventory,
-    playbookplancontroller::{node_readiness, reconciler, status},
+    playbookplancontroller::{node_readiness, node_recreation, reconciler, status},
 };
 
 /// Returns a closure that maps a `NodeAccessPolicy` change to *every* PlaybookPlan, so their
@@ -124,7 +124,7 @@ pub fn node_to_playbookplans(
         playbookplan_reader
             .state()
             .iter()
-            .filter(|plan| plan_awaits_node(plan, node_name))
+            .filter(|plan| plan_awaits_node(plan, &node, node_name))
             .map(|plan| ObjectRef::from(&**plan))
             .inspect(|obj_ref| {
                 debug!("Reconcile of {obj_ref} triggered by node {node_name} becoming Ready");
@@ -198,7 +198,22 @@ pub fn node_to_playbookplans(
 /// `Succeeded` on an older revision. The last matters more than it looks: a plan held by the
 /// readiness gate never ran, so it still carries the *previous* run's `Succeeded` outcomes, and this
 /// watch is the only thing that releases it.
-fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
+///
+/// The Node object itself is read for one thing only: whether it is the *same machine* the record
+/// was written about. A rebuilt Node keeps the name `hostsStatus` is keyed by, so a plan's cached
+/// status still claims it is converged — and the reconcile this wakes is precisely what drops that
+/// claim (`node_recreation`). Asking here too is what keeps the wake set and the start gate from
+/// disagreeing about one host: without it a replaced machine is ignored until the plan's next
+/// hourly requeue, having been declared outdated by the very tick that would have run on it.
+///
+/// It is asked **only of hosts `eligibleHosts` records as cluster Nodes**, which is what keeps this
+/// agreeing with the start gate. A `StaticInventory` host may share a name with a Node the plan
+/// never targets, and a Node object says nothing about that machine — so asking would report a
+/// replacement the reconcile rightly refuses to act on (`node_recreation` only touches managed-ssh
+/// hosts), leaving a wake condition that every kubelet heartbeat re-triggers and nothing can ever
+/// clear. A record written before the connection was tracked answers "not a Node" and is simply not
+/// asked, which costs at most one delayed wake-up on the tick after an upgrade.
+fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &Node, node_name: &str) -> bool {
     if plan.spec.suspend || !matches!(plan.spec.mode, ExecutionMode::OneShot) {
         return false;
     }
@@ -218,19 +233,21 @@ fn plan_awaits_node(plan: &v1beta1::PlaybookPlan, node: &str) -> bool {
     let targeted = status
         .eligible_hosts
         .iter()
-        .any(|group| group.hosts.iter().any(|host| host == node));
+        .any(|group| group.hosts.iter().any(|host| host == node_name));
 
     targeted
         && status
             .hosts_status
             .as_ref()
-            .and_then(|hosts| hosts.get(node))
+            .and_then(|hosts| hosts.get(node_name))
             .is_none_or(|host| {
-                host.last_applied_hash != status.current_hash
-                    && !matches!(
-                        host.last_outcome,
-                        HostOutcome::Failed | HostOutcome::NotReached | HostOutcome::Incomplete
-                    )
+                (node_recreation::node_replaced_since(host.applied_at, node)
+                    && v1beta1::is_node_host(&status.eligible_hosts, node_name))
+                    || (host.last_applied_hash != status.current_hash
+                        && !matches!(
+                            host.last_outcome,
+                            HostOutcome::Failed | HostOutcome::NotReached | HostOutcome::Incomplete
+                        ))
             })
 }
 
@@ -541,7 +558,104 @@ mod tests {
         vec![crate::v1beta1::ResolvedHosts {
             name: "workers".into(),
             hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            connection: Some(crate::v1beta1::HostConnection::ManagedSsh),
         }]
+    }
+
+    fn eligible_external(hosts: &[&str]) -> Vec<crate::v1beta1::ResolvedHosts> {
+        vec![crate::v1beta1::ResolvedHosts {
+            name: "edge".into(),
+            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            connection: Some(crate::v1beta1::HostConnection::Ssh),
+        }]
+    }
+
+    /// A Node that cannot be a replacement for anything: with no `creationTimestamp` there is
+    /// nothing for `node_recreation::node_replaced_since` to read as one. Every case below that is
+    /// about the *host's* recorded state uses it, so each keeps asking exactly what it asked before
+    /// the predicate learned about rebuilt machines.
+    fn unreplaced_node() -> Node {
+        Node::default()
+    }
+
+    /// When the run that made the records below was prepared.
+    fn claimed_at() -> chrono::DateTime<chrono::FixedOffset> {
+        "2026-01-01T00:00:00Z".parse().unwrap()
+    }
+
+    fn node_created_at(created: &str) -> Node {
+        let created: chrono::DateTime<chrono::FixedOffset> = created.parse().unwrap();
+        Node {
+            metadata: kube::core::ObjectMeta {
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(created.timestamp()).unwrap(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A rebuilt machine inherits the name its record is keyed by, so the plan's cached status still
+    /// says the host carries the current revision. The reconcile a Node event wakes is what drops
+    /// that claim, so this predicate has to agree with it — otherwise the machine that just came
+    /// back is passed over until the plan's hourly requeue, declared outdated by the very tick that
+    /// would have run on it.
+    #[test]
+    fn a_plan_awaits_a_host_whose_node_was_replaced_since_it_applied() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_at = Some(claimed_at());
+        let plan = plan_awaiting("node-a", converged);
+
+        assert!(
+            !plan_awaits_node(&plan, &unreplaced_node(), "node-a"),
+            "on the machine the record was written about, this plan is converged"
+        );
+        assert!(
+            !plan_awaits_node(&plan, &node_created_at("2025-12-31T00:00:00Z"), "node-a"),
+            "a Node older than the run that claimed it is that same machine"
+        );
+        assert!(plan_awaits_node(
+            &plan,
+            &node_created_at("2026-01-02T00:00:00Z"),
+            "node-a"
+        ));
+    }
+
+    /// The same record, reached as an external machine. A Node of that name is a different machine
+    /// the plan never targets, so its replacement says nothing about this host — and the reconcile
+    /// this would wake refuses to clear the claim (`node_recreation` only touches managed-ssh
+    /// hosts), so every kubelet heartbeat of that Node would buy a full reconcile that can never
+    /// change the answer.
+    #[test]
+    fn an_external_host_is_not_woken_by_a_node_that_shares_its_name() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_at = Some(claimed_at());
+        let mut plan = plan_awaiting("edge-1", converged);
+        plan.status.as_mut().unwrap().eligible_hosts = eligible_external(&["edge-1"]);
+
+        assert!(!plan_awaits_node(
+            &plan,
+            &node_created_at("2026-01-02T00:00:00Z"),
+            "edge-1"
+        ));
+    }
+
+    /// A record written before the connection was tracked. Answering "not a Node" costs at most one
+    /// delayed wake-up after an upgrade; answering "Node" for an external host costs a wake nothing
+    /// can ever clear.
+    #[test]
+    fn a_host_whose_connection_was_never_recorded_is_not_treated_as_a_node() {
+        let mut converged = host("abc", HostOutcome::Succeeded);
+        converged.applied_at = Some(claimed_at());
+        let mut plan = plan_awaiting("node-a", converged);
+        plan.status.as_mut().unwrap().eligible_hosts[0].connection = None;
+
+        assert!(!plan_awaits_node(
+            &plan,
+            &node_created_at("2026-01-02T00:00:00Z"),
+            "node-a"
+        ));
     }
 
     #[test]
@@ -553,8 +667,8 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(plan_awaits_node(&plan, "node-a"));
-        assert!(plan_awaits_node(&plan, "node-b"));
+        assert!(plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
+        assert!(plan_awaits_node(&plan, &unreplaced_node(), "node-b"));
     }
 
     #[test]
@@ -565,7 +679,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!plan_awaits_node(&plan, "node-b"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-b"));
     }
 
     /// The whole point of the predicate: a converged plan must not be woken by the periodic Node
@@ -594,9 +708,9 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
         assert!(
-            plan_awaits_node(&plan, "node-b"),
+            plan_awaits_node(&plan, &unreplaced_node(), "node-b"),
             "a host left behind by the current revision is still owed a run"
         );
     }
@@ -628,7 +742,7 @@ mod tests {
     fn a_plan_does_not_await_a_host_that_was_reached_and_failed() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::Failed));
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// A `NotReached` host is blocked on whichever host stopped its `serial` batch, not on its own
@@ -637,7 +751,7 @@ mod tests {
     fn a_plan_does_not_await_a_host_an_earlier_batch_stopped_the_play_for() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::NotReached));
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// The other cause of `NotReached`, and the one this predicate was costing the most: a host the
@@ -650,7 +764,7 @@ mod tests {
     fn a_plan_does_not_await_a_host_whose_proxy_failed_on_a_ready_node() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::NotReached));
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// An `Incomplete` host ran and did not fail — the playbook stopped for it because a *different*
@@ -661,7 +775,7 @@ mod tests {
     fn a_plan_does_not_await_a_host_another_hosts_failure_cut_short() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::Incomplete));
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// The case the watch exists for: a Node that was down is excluded from the run and recorded
@@ -670,7 +784,7 @@ mod tests {
     fn a_plan_awaits_a_host_left_unreachable_by_a_node_that_was_down() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
 
-        assert!(plan_awaits_node(&plan, "node-a"));
+        assert!(plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// An unreadable recap proves nothing about whether the host was reached, so it stays eligible
@@ -679,7 +793,7 @@ mod tests {
     fn a_plan_awaits_a_host_whose_recap_could_not_be_read() {
         let plan = plan_awaiting("node-a", host("", HostOutcome::Unknown));
 
-        assert!(plan_awaits_node(&plan, "node-a"));
+        assert!(plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// A plan held by the readiness gate never ran, so its hosts still carry the *previous* run's
@@ -689,7 +803,7 @@ mod tests {
     fn a_plan_awaits_a_host_that_succeeded_on_an_older_revision() {
         let plan = plan_awaiting("node-a", host("older", HostOutcome::Succeeded));
 
-        assert!(plan_awaits_node(&plan, "node-a"));
+        assert!(plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     /// Suspending a plan and editing its playbook is an ordinary workflow, and it leaves every host
@@ -701,13 +815,13 @@ mod tests {
     fn a_suspended_plan_awaits_nothing() {
         let mut plan = plan_awaiting("node-a", host("", HostOutcome::Unreachable));
         assert!(
-            plan_awaits_node(&plan, "node-a"),
+            plan_awaits_node(&plan, &unreplaced_node(), "node-a"),
             "the same plan unsuspended is one the watch exists for"
         );
 
         plan.spec.suspend = true;
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     fn plan_awaiting_with_attempts(
@@ -731,12 +845,13 @@ mod tests {
             let plan = plan_awaiting_with_attempts("node-a", host("", outcome.clone()), 3);
 
             assert!(
-                !plan_awaits_node(&plan, "node-a"),
+                !plan_awaits_node(&plan, &unreplaced_node(), "node-a"),
                 "{outcome:?}: an exhausted budget is not something a Ready Node can restore"
             );
             assert!(
                 plan_awaits_node(
                     &plan_awaiting_with_attempts("node-a", host("", outcome.clone()), 2),
+                    &unreplaced_node(),
                     "node-a"
                 ),
                 "{outcome:?}: a plan with a try left is exactly what the watch is for"
@@ -755,14 +870,14 @@ mod tests {
         for outcome in [HostOutcome::Unreachable, HostOutcome::Unknown] {
             let oneshot = plan_awaiting("node-a", host("", outcome.clone()));
             assert!(
-                plan_awaits_node(&oneshot, "node-a"),
+                plan_awaits_node(&oneshot, &unreplaced_node(), "node-a"),
                 "{outcome:?}: the same plan as OneShot is one the watch exists for"
             );
 
             let mut recurring = oneshot;
             recurring.spec.mode = ExecutionMode::Recurring;
 
-            assert!(!plan_awaits_node(&recurring, "node-a"));
+            assert!(!plan_awaits_node(&recurring, &unreplaced_node(), "node-a"));
         }
     }
 
@@ -780,7 +895,7 @@ mod tests {
             plan.spec.mode = ExecutionMode::Recurring;
 
             assert!(
-                !plan_awaits_node(&plan, "node-a"),
+                !plan_awaits_node(&plan, &unreplaced_node(), "node-a"),
                 "retryCount {retry_count}"
             );
         }
@@ -790,7 +905,7 @@ mod tests {
     fn a_plan_without_a_status_awaits_nothing() {
         let plan = PlaybookPlan::new("web", PlaybookPlanSpec::default());
 
-        assert!(!plan_awaits_node(&plan, "node-a"));
+        assert!(!plan_awaits_node(&plan, &unreplaced_node(), "node-a"));
     }
 
     fn node_named(name: &str, ready: bool) -> Node {

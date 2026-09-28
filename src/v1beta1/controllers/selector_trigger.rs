@@ -2,12 +2,30 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
 use futures::{Stream, StreamExt as _};
-use kube::runtime::{WatchStreamExt as _, watcher};
+use kube::runtime::watcher;
 use kube::{Api, Resource, ResourceExt as _};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error};
 
-use crate::v1beta1::controllers::watch_backoff::WatchBackoff;
+use crate::v1beta1::controllers::watch_stream::restarting_watcher;
+
+/// How long a set-valued controller waits for label churn to stop before recomputing, as
+/// `Controller::with_config(Config::default().debounce(…))`.
+///
+/// [`label_changes`] emits one tick per label change, and `reconcile_all_on` fans each tick out to
+/// *every* object the controller owns — so a burst of label writes costs
+/// `writes × objects` reconciles, each of which lists every Node in the cluster and patches a
+/// status. That burst is not hypothetical: a `PlaybookPlan` with `spec.provides` labels every Node
+/// it converged, one PATCH at a time, as each run finishes
+/// (`playbookplancontroller::node_labels`). Recomputing per Node while the fleet is being labelled
+/// answers the same question hundreds of times and publishes the same answer at the end.
+///
+/// The scheduler's debounce is trailing-edge and resets on each request for the same object, so a
+/// burst collapses into one reconcile per object once it goes quiet. Kept short deliberately: it
+/// delays *every* trigger of these controllers, a spec edit included, and a `ClusterInventory` that
+/// is slow to publish `observedGeneration` holds the plans that reference it
+/// (`ReconcileError::InventoryNotSynced`). A second buys the coalescing without being felt.
+pub const RECOMPUTE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Emits one tick whenever a watched object's **labels** change, it appears, or it disappears —
 /// and stays silent for every other update.
@@ -45,14 +63,12 @@ where
 {
     let kind = M::kind(&M::DynamicType::default()).to_string();
 
-    watcher(api, watcher::Config::default())
-        // The delay `Controller::watches` used to supply. A bare `watcher` re-lists on the very
-        // next poll after an error, and the retry that made that acceptable belongs to the
-        // controller: `Controller::run` wraps its trigger streams in `StreamBackoff`, which only
-        // ever sees the errors that reach it as stream items. This one answers them here, so
-        // without this a persistent failure — a revoked `nodes` grant, an apiserver refusing the
-        // watch — would re-list as fast as the requests come back, and log a line each time.
-        .backoff(WatchBackoff::default())
+    // The delay `Controller::watches` used to supply, and the restart that makes a failure cost one
+    // error instead of a dozen — both are `restarting_watcher`'s, and a bare `watcher` has neither:
+    // it re-lists on the very next poll after an error, and the retry that made that acceptable
+    // belongs to the controller (`Controller::run` wraps its trigger streams in `StreamBackoff`,
+    // which only ever sees the errors that reach it as stream items).
+    restarting_watcher(api, watcher::Config::default())
         .scan(TrackedLabels::default(), move |tracked, event| {
             let tick = match event {
                 Ok(event) => tracked.absorb(&kind, event),

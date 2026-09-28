@@ -14,6 +14,33 @@ pub enum ReconcileError {
     #[error("Referenced {kind} {name:?} does not exist")]
     InventoryNotFound { kind: &'static str, name: String },
 
+    #[error(
+        "Host {host:?} is reached both as a cluster Node (group {node_group:?}) and as an external host (group {ssh_group:?}); one name cannot mean two machines"
+    )]
+    AmbiguousHost {
+        host: String,
+        node_group: String,
+        ssh_group: String,
+    },
+
+    #[error(
+        "Host {host:?} is reached as an external host by {first} and by {second}, with different SSH credentials; one name cannot be reached two ways"
+    )]
+    AmbiguousHostCredentials {
+        host: String,
+        first: String,
+        second: String,
+    },
+
+    #[error(
+        "Referenced ClusterInventory {name:?} has not published its resolved hosts for generation {generation} yet (observed: {observed})"
+    )]
+    InventoryNotSynced {
+        name: String,
+        generation: i64,
+        observed: String,
+    },
+
     #[error("Referenced Secret {name:?} does not exist")]
     SecretNotFound { name: String },
 

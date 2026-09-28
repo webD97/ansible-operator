@@ -322,6 +322,22 @@ manifests are generated from the operator binary itself (`ansible-operator crds`
 the subchart's `templates/` directory.
 The regeneration procedure lives in `chart/README.md`.
 
+### Schema changes are part of an upgrade
+
+A release using `crds.install: false` owns this step itself: apply the definitions shipped with the
+new chart version *before* the operator that expects them. A field or a selector operator a plan
+author writes is rejected by the API server while an older schema is installed, and the rejection
+names the CRD rather than the chart, so it reads like an authoring mistake.
+
+A schema can also become **stricter**, and one has: a `ClusterInventory`'s `spec.hosts[]` entries no
+longer accept unknown fields. Until that change the API server kept whatever was written there and
+the operator ignored it, so a misspelt `matchExpresions` applied cleanly and left the group matching
+**every** Node in the cluster. It is now pruned with a warning, and `kubectl apply` rejects it by
+default. Anything that has been silently carrying such a field — a manifest in Git, a chart of your
+own — therefore starts failing to apply after this upgrade, on an object nobody edited. That is the
+point of the change, but it is worth knowing before the pipeline tells you: the fix is to correct the
+field name, and the group it belongs to was never selecting what it claimed to.
+
 The chart declares `kubeVersion: ">=1.25.0-0"` because two CRDs use **CRD validation rules**
 (`x-kubernetes-validations`):
 
@@ -342,6 +358,58 @@ deleting a CRD deletes every custom resource of that kind cluster-wide. `crds.ke
 `true` and annotates the definitions with `helm.sh/resource-policy: keep`, so uninstalling the
 chart leaves both the definitions and your `PlaybookPlan`s in place; set it to `false` if you
 would rather have an uninstall clean everything up.
+
+## Node labels for plan dependencies
+
+A `PlaybookPlan` that sets `spec.provides` publishes what it has finished onto the Nodes it
+converged, as a label `<namespace>.plan.ansible.cloudbending.dev/<plan-name>` carrying the declared
+version. Another plan's `ClusterInventory` selects on that label, so its runs only ever reach hosts
+the first plan is done with; ordinary workloads can use the same label in `nodeAffinity`.
+
+This needs `patch` on Nodes, which is **cluster-wide** — RBAC cannot narrow a verb to one field, so
+the same grant would permit editing taints, `spec.unschedulable` or any other label. The chart
+therefore ships the permission with a guard, and both halves are values you control:
+
+```yaml
+# values.yaml
+nodeLabels:
+  enabled: true          # grants nodes: patch and turns the feature on
+  admissionPolicy: true  # holds that grant to the operator's own label keys
+```
+
+`nodeLabels.admissionPolicy` renders a `ValidatingAdmissionPolicy` and binding that allow the
+operator's ServiceAccount to add, change and remove only keys containing
+`.plan.ansible.cloudbending.dev/`, and require everything else about the Node — spec, annotations,
+every other label — to be unchanged. It is scoped to that ServiceAccount, so it never gets in the
+way of an administrator editing a Node, including cleaning these labels up by hand.
+
+**On Kubernetes below 1.30** the policy API is not generally available, and the install fails with
+`no matches for kind "ValidatingAdmissionPolicy" in version "admissionregistration.k8s.io/v1"`. Set
+`nodeLabels.admissionPolicy=false`: the feature keeps working and the `patch` grant is simply
+unguarded. The chart does not detect this for you on purpose — `helm template` without
+`--api-versions` reports the API as missing, so a capability check would quietly drop the guard
+while keeping the permission, and a security control that disappears without a word is worse than
+one you turned off knowingly.
+
+**Labels left behind** — by a plan deleted while the operator was down, or by uninstalling the
+operator — are swept whenever the operator's plan cache completes a full listing: at startup, and
+again after any watch reconnection. A label is removed only when the plan named in its key no longer
+exists; a plan that still exists but has stopped providing is handled by its own reconcile.
+
+**To keep the operator off Node objects entirely**, set `nodeLabels.enabled=false`. Plans with
+`spec.provides` still run; they report in their status that node labels are disabled on this
+cluster, so a plan waiting on one of them says why instead of waiting silently. Note that this also
+removes the permission to *remove* labels already written: the sweep above still runs, but it can
+only report what it found — a warning naming the orphaned labels — and you remove them with
+`kubectl label nodes -l '<key>' '<key>-'`, where `<key>` is
+`<namespace>.plan.ansible.cloudbending.dev/<plan-name>`. A plan that still exists is not in that
+warning; its `ProvidesLabels` condition counts the Nodes still carrying its label.
+
+Watch for that warning after turning the feature off: until those labels are gone, plans selecting
+on them still treat those Nodes as ready.
+
+See [Playbook plans](../running-playbooks/playbook-plans.md) for authoring `spec.provides`, and
+[Cluster nodes](../running-playbooks/cluster-nodes.md) for selecting on the labels.
 
 ## Grant node access
 

@@ -706,6 +706,10 @@ fn build_play(play: &PlayRef<'_>) -> Result<Play, ReconcileError> {
             run_number: play.run_number,
             attempt: play.attempt,
             inventory: play.inventory.to_vec(),
+            // Taken from the plan the run is being prepared from, not passed in by the caller:
+            // the version is already part of `play.hash`, so a second copy that could disagree
+            // with it would describe a revision that never existed.
+            provides_version: play.plan.provides_version().map(str::to_string),
             triggered_slot: play.triggered_slot,
         },
     );
@@ -1040,6 +1044,42 @@ mod tests {
         ExecutionHash::from_hex("1").unwrap()
     }
 
+    /// The record is what a host's `appliedVersion` is later stamped from, so it has to be taken
+    /// from the plan the run is prepared out of. Reading the live plan when the result comes back
+    /// instead would label the hosts of a run that finished after an edit for the revision that
+    /// edit introduced — one they never received.
+    #[test]
+    fn build_play_records_the_version_its_revision_declared() {
+        let hash = hash();
+        let inventory = vec![ResolvedHosts {
+            name: "nodes".into(),
+            hosts: vec!["a".into()],
+            ..Default::default()
+        }];
+
+        let mut plan = plan("web", "plan-uid");
+        assert_eq!(
+            build_play(&play_ref(&plan, &hash, "run-1", "fp-1", 1, &inventory))
+                .unwrap()
+                .spec
+                .provides_version,
+            None,
+            "a plan that provides nothing records nothing"
+        );
+
+        plan.spec.provides = Some(crate::v1beta1::Provides {
+            version: "1.4.2".into(),
+        });
+        assert_eq!(
+            build_play(&play_ref(&plan, &hash, "run-1", "fp-1", 1, &inventory))
+                .unwrap()
+                .spec
+                .provides_version
+                .as_deref(),
+            Some("1.4.2")
+        );
+    }
+
     #[test]
     fn build_play_records_the_identity_recovery_reads_back() {
         let plan = plan("web", "plan-uid");
@@ -1047,6 +1087,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into(), "b".into()],
+            ..Default::default()
         }];
         let built = build_play(&play_ref(&plan, &hash, "run-1", "fp-1", 3, &inventory)).unwrap();
 
@@ -1082,6 +1123,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into()],
+            ..Default::default()
         }];
         let build = |run_id: &str, fp: &str, run_number: u32, uid: &str| {
             let plan = plan("web", uid);
@@ -1153,6 +1195,7 @@ mod tests {
         let inventory = vec![ResolvedHosts {
             name: "nodes".into(),
             hosts: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
         }];
 
         let status = prepared_status(&play_ref(&plan, &hash, "run-1", "fp", 1, &inventory));

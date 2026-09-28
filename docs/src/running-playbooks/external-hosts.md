@@ -84,6 +84,37 @@ and key Secret; they are mounted at distinct paths and do not collide. You can a
 `StaticInventory` and `ClusterInventory` references in one plan; external hosts and cluster Nodes then
 appear in the same rendered inventory and are applied by the same Job.
 
+**One name, one machine.** Within a plan, an external host may not share a name with a cluster Node
+the same plan reaches. Everything about a host is keyed by its name — its lock, its recorded outcome,
+its connection variables — so a name meaning two machines would give one of them an outcome the other
+earned. The operator refuses such a plan before it runs anything and says which host and which two
+groups; see
+[the plan's inputs cannot be read](./results-and-troubleshooting.md#the-plans-inputs-cannot-be-read).
+The names only have to be unique within one plan. Renaming the external host is not a way out on its
+own, though: the operator renders no `ansible_host` for a `StaticInventory` host and the group's
+`variables` may not supply one, so the name is what Ansible dials. Narrow one of the two inventories
+instead, until the plan no longer reaches both.
+
+**One name, one set of credentials.** For the same reason, two `StaticInventory`s referenced by one
+plan may not name the same host with a different `ssh.user` or `ssh.secretRef`. That name is one
+machine, so it gets one lock and one outcome, but the rendered inventory would carry two connection
+configurations for it and Ansible would keep whichever its group ordering happens to prefer — so the
+run would connect as somebody the manifests do not agree on. Naming the same host in two
+`StaticInventory`s with the *same* user and Secret is fine, and stays allowed.
+
+## Dependencies between plans are cluster-Nodes only
+
+The [`spec.provides`](./playbook-plans.md#declaring-what-a-plan-provides) mechanism — a plan
+publishing what it has finished so other plans can wait for it — works by labelling **Node objects**,
+so it does not extend to `StaticInventory` hosts. An external machine has no Kubernetes object to
+carry the label.
+
+That cuts both ways. A plan whose hosts are external can still set `provides`, but nothing is
+published for those hosts (if the plan also targets cluster Nodes, those are labelled as usual). And
+a dependent plan's `StaticInventory` groups are unaffected by dependency labels: they use no
+selectors at all, so their hosts are always in the run. Order work on external machines within a
+single playbook instead, or across plans by hand.
+
 ## What you do not set
 
 As with cluster nodes, the operator renders `ansible_user`, `ansible_ssh_private_key_file`, and the
