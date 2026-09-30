@@ -13,7 +13,7 @@ use k8s_openapi::{
         },
     },
     apimachinery::pkg::{
-        apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference},
+        apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference, Time},
         util::intstr::IntOrString,
     },
 };
@@ -192,8 +192,9 @@ pub async fn reset_incomplete_run(
 }
 
 /// A proxy pod's k8s state as far as the readiness gate cares: Ready (with its pod IP), still
-/// `Running` (waited on indefinitely), stuck before `Running` (subject to the grace window), or
-/// `Terminating` (a deleted pod that has not disappeared yet, also subject to the grace window).
+/// `Running` (waited on indefinitely while its Node is `Ready`, see [`proxy_wait_age_secs`]), stuck
+/// before `Running` (subject to the grace window), or `Terminating` (a deleted pod that has not
+/// disappeared yet, also subject to the grace window).
 #[derive(Debug, PartialEq)]
 enum PodReadyState {
     ReadyWithIp(String),
@@ -213,7 +214,7 @@ enum PodReadyState {
 /// the object is really gone, at which point the pod is recreated against the current CA.
 ///
 /// Otherwise: Ready-condition `True` + a pod IP ⇒ `ReadyWithIp`; else a pod that has reached
-/// `Running` ⇒ `Running` (sshd still coming up — waited on with no timeout, as before); anything
+/// `Running` ⇒ `Running` (sshd still coming up, or its Node has stopped reporting); anything
 /// earlier (`Pending`/`Unknown`/absent phase) ⇒ `PreRunning`.
 fn proxy_pod_readiness(pod: &Pod) -> PodReadyState {
     if pod.metadata.deletion_timestamp.is_some() {
@@ -273,13 +274,64 @@ fn effective_grace_secs(heartbeat_age_secs: Option<i64>, policy: &ProxyGracePoli
     0
 }
 
-fn proxy_wait_age_secs(pod: &Pod, state: &PodReadyState, now_epoch_secs: i64) -> Option<i64> {
+/// The grace a proxy pod actually gets: the heartbeat-scaled `tiered_secs`, shortened to
+/// `not_ready_cap_secs` when its Node exists and is not `Ready`.
+///
+/// Only such a host is capped because only it has somewhere to go afterwards: it is excluded as
+/// `node_not_ready`, which refunds the run's attempt, and the Node's return to `Ready` wakes the plan
+/// for it while the tick's window is still open. A longer tolerance for down Nodes is the plan's
+/// `startingDeadlineSeconds`, not this wait, which every other host of the run sits out at the start
+/// with it. A pod on a `Ready` Node is still making progress (being scheduled, pulling
+/// the image), and cutting that short would turn a slow first pull into a spent attempt, so it keeps
+/// the full grace.
+fn proxy_grace_secs(
+    tiered_secs: i64,
+    node_not_ready: bool,
+    not_ready_cap_secs: Option<i64>,
+) -> i64 {
+    match not_ready_cap_secs {
+        Some(cap) if node_not_ready => tiered_secs.min(cap),
+        _ => tiered_secs,
+    }
+}
+
+/// How long the readiness gate has been waiting on `pod`, or `None` for a pod it waits on without a
+/// timeout.
+///
+/// A `Running` pod on a `Ready` Node is only starting sshd, so it has no timeout. On a Node that is
+/// not `Ready` it does: when a Node stops heartbeating, the node lifecycle controller marks its pods
+/// `Ready=False` but leaves them `Running`, and proxy pods tolerate the not-ready taints, so they
+/// are never evicted either. A pod that was Ready when its Node died would otherwise hold the whole
+/// run, and its host Leases, until the Node came back. Its wait starts when it lost readiness.
+fn proxy_wait_age_secs(
+    pod: &Pod,
+    state: &PodReadyState,
+    node_not_ready: bool,
+    now_epoch_secs: i64,
+) -> Option<i64> {
     let started = match state {
         PodReadyState::Terminating => pod.metadata.deletion_timestamp.as_ref(),
         PodReadyState::PreRunning => pod.metadata.creation_timestamp.as_ref(),
+        // The transition may carry the kubelet's clock rather than the API server's; one running
+        // behind would start the wait before the pod existed. `None` orders first, so a missing
+        // transition falls back to the creation time.
+        PodReadyState::Running if node_not_ready => {
+            ready_condition_transition(pod).max(pod.metadata.creation_timestamp.as_ref())
+        }
         PodReadyState::ReadyWithIp(_) | PodReadyState::Running => None,
     }?;
     Some(now_epoch_secs - started.0.as_second())
+}
+
+fn ready_condition_transition(pod: &Pod) -> Option<&Time> {
+    pod.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|condition| condition.type_ == "Ready")?
+        .last_transition_time
+        .as_ref()
 }
 
 /// Node taints Kubernetes auto-applies to a `NotReady` node tolerated by every proxy pod, merged with
@@ -848,6 +900,9 @@ async fn ensure_client_cert(
 
 /// Ensures a proxy pod (+ its Secret + the run's NetworkPolicy) exists and is Ready for every
 /// host in `hosts`. Safe to call every reconcile tick — only missing pieces are created.
+///
+/// `not_ready_grace_cap_secs` bounds the wait for a host whose Node is not `Ready` (see
+/// [`proxy_grace_secs`]); `None` leaves every host on `grace_policy` alone.
 // Each argument is a distinct, unrelated input (two namespaces, hash, hosts, CA, image, policy,
 // owner); bundling them into a struct would only move the noise, so keep them explicit.
 #[allow(clippy::too_many_arguments)]
@@ -859,6 +914,7 @@ pub async fn ensure_proxy_infra(
     run_id: &str,
     hosts: &[ProxyHost],
     grace_policy: &ProxyGracePolicy,
+    not_ready_grace_cap_secs: Option<i64>,
     ca: &CertificateAuthority,
     proxy_image: &str,
     network_policy_egress: Option<Vec<NetworkPolicyEgressRule>>,
@@ -965,28 +1021,37 @@ pub async fn ensure_proxy_infra(
                 pod_ip: ip,
                 port: PROXY_SSH_PORT,
             }),
-            // Reached Running — sshd is coming up; wait indefinitely, exactly as before (no timeout).
-            PodReadyState::Running => waiting.push(host.clone()),
-            // A pod stuck before Running or terminating after a reset gets the same
-            // heartbeat-scaled deadline. Until then a terminating pod is never adopted; after the
-            // deadline the host is rendered unreachable so a dead kubelet cannot wedge this run and
-            // its Leases forever.
-            state @ (PodReadyState::PreRunning | PodReadyState::Terminating) => {
+            // A pod stuck before Running, terminating after a reset, or Running on a Node that is
+            // no longer Ready gets the same heartbeat-scaled deadline. Until then a terminating pod
+            // is never adopted; after the deadline the host is rendered unreachable so a dead
+            // kubelet cannot wedge this run and its Leases forever. A Running pod on a Ready Node
+            // is only starting sshd and is waited on without one (`proxy_wait_age_secs`).
+            state @ (PodReadyState::Running
+            | PodReadyState::PreRunning
+            | PodReadyState::Terminating) => {
                 // One read, two answers: how stale the node's heartbeat is (which shortens the
-                // grace) and whether it is reporting `Ready` at all (which is what the plan's
-                // attempt budget later turns on).
+                // grace) and whether it is reporting `Ready` at all (which decides whether a
+                // `Running` pod is on a clock, and is what the plan's attempt budget later turns
+                // on).
                 let node = nodes_api.get_opt(host).await?;
                 let heartbeat_age = node
                     .as_ref()
                     .and_then(|node| node_ready_heartbeat_age_secs(node, now));
-                let grace = effective_grace_secs(heartbeat_age, grace_policy);
-                match proxy_wait_age_secs(&pod, &state, now) {
-                    // A host with no Node object at all is deliberately not recorded as not-ready:
-                    // nothing will ever report it `Ready` again either, so crediting it as a Node
-                    // that might come back would leave a plan refunding attempts to it forever.
+                // A host with no Node object at all is deliberately not recorded as not-ready:
+                // nothing will ever report it `Ready` again either, so crediting it as a Node that
+                // might come back would leave a plan refunding attempts to it forever.
+                let node_not_ready = node
+                    .as_ref()
+                    .is_some_and(|node| !node_readiness::is_ready(node));
+                let grace = proxy_grace_secs(
+                    effective_grace_secs(heartbeat_age, grace_policy),
+                    node_not_ready,
+                    not_ready_grace_cap_secs,
+                );
+                match proxy_wait_age_secs(&pod, &state, node_not_ready, now) {
                     Some(age) if age >= grace => unreachable.push(UnreachableHost {
                         host: host.clone(),
-                        node_not_ready: node.is_some_and(|node| !node_readiness::is_ready(&node)),
+                        node_not_ready,
                     }),
                     _ => waiting.push(host.clone()),
                 }
@@ -1700,16 +1765,55 @@ mod tests {
         pod.metadata.deletion_timestamp = Some(Time(Timestamp::from_second(900).unwrap()));
 
         assert_eq!(
-            proxy_wait_age_secs(&pod, &PodReadyState::Terminating, 1_000),
+            proxy_wait_age_secs(&pod, &PodReadyState::Terminating, false, 1_000),
             Some(100)
         );
         assert_eq!(
-            proxy_wait_age_secs(&pod, &PodReadyState::PreRunning, 1_000),
+            proxy_wait_age_secs(&pod, &PodReadyState::PreRunning, false, 1_000),
             Some(900)
         );
         assert_eq!(
-            proxy_wait_age_secs(&pod, &PodReadyState::Running, 1_000),
+            proxy_wait_age_secs(&pod, &PodReadyState::Running, false, 1_000),
             None
+        );
+    }
+
+    /// A pod that was Ready when its Node died stays `Running` with `Ready=False` for as long as the
+    /// Node is gone, and is never evicted. Waiting on it without a timeout held the whole run, and
+    /// its Leases, until the Node came back; it gets the grace instead, from when it lost readiness.
+    #[test]
+    fn a_running_pod_is_timed_only_on_a_node_that_is_not_ready() {
+        use k8s_openapi::jiff::Timestamp;
+
+        let mut pod = pod_with(Some("Running"), false, Some("10.0.0.5"), Some(100));
+        pod.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].last_transition_time =
+            Some(Time(Timestamp::from_second(700).unwrap()));
+
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::Running, true, 1_000),
+            Some(300),
+            "timed from the moment it lost readiness, not from its creation"
+        );
+        assert_eq!(
+            proxy_wait_age_secs(&pod, &PodReadyState::Running, false, 1_000),
+            None,
+            "on a Ready Node it is only starting sshd"
+        );
+
+        let without_transition = pod_with(Some("Running"), false, None, Some(100));
+        assert_eq!(
+            proxy_wait_age_secs(&without_transition, &PodReadyState::Running, true, 1_000),
+            Some(900)
+        );
+
+        // A kubelet clock behind the API server's stamps a transition before the pod existed.
+        let mut behind = pod_with(Some("Running"), false, None, Some(100));
+        behind.status.as_mut().unwrap().conditions.as_mut().unwrap()[0].last_transition_time =
+            Some(Time(Timestamp::from_second(40).unwrap()));
+        assert_eq!(
+            proxy_wait_age_secs(&behind, &PodReadyState::Running, true, 1_000),
+            Some(900),
+            "never timed from before the pod's creation"
         );
     }
 
@@ -1780,6 +1884,20 @@ mod tests {
         assert_eq!(effective_grace_secs(Some(5 * DAY), &flat), 600);
         assert_eq!(effective_grace_secs(Some(20 * DAY), &flat), 600);
         assert_eq!(effective_grace_secs(Some(40 * DAY), &flat), 0);
+    }
+
+    #[test]
+    fn only_a_not_ready_node_has_its_grace_capped() {
+        assert_eq!(proxy_grace_secs(600, true, Some(30)), 30);
+        // A `Ready` Node's pod may still be pulling its image: it keeps the full wait.
+        assert_eq!(proxy_grace_secs(600, false, Some(30)), 600);
+        assert_eq!(proxy_grace_secs(600, true, None), 600);
+    }
+
+    #[test]
+    fn the_cap_never_lengthens_the_tiered_grace() {
+        assert_eq!(proxy_grace_secs(150, true, Some(14_400)), 150);
+        assert_eq!(proxy_grace_secs(0, true, Some(30)), 0);
     }
 }
 

@@ -30,7 +30,7 @@ applies:
 
 - **it cannot list Nodes.** The `PlaybookPlan` controller waits for its Node cache before it
   reconciles anything, and gives up after two minutes. Node readiness is what decides whether a
-  `OneShot` run is worth starting at all ([NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes)),
+  run is worth starting at all ([NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes)),
   and an empty cache reports every Node as `Ready` — so starting anyway would launch exactly the
   runs a waiting plan exists to hold back. Check that the operator's `ClusterRole` still grants
   `list`/`watch` on `nodes` and that the API server is reachable. A cause that clears itself — RBAC
@@ -44,10 +44,10 @@ applies:
 The same loss of access *after* startup does not crash the operator, and does not stop it either —
 which is why it is worth knowing about. The Node cache keeps serving whatever it last saw, so the
 operator carries on making readiness decisions from a snapshot: a Node that goes down from then on
-still reads `Ready`, so a `OneShot` run starts against it and spends the full proxy wait discovering
-otherwise, and a plan already
-[held](../running-playbooks/cluster-nodes.md#holding-instead-of-starting) for a Node is not released
-when that Node comes back until its hourly re-check. Nothing else misbehaves, and everything
+still reads `Ready`, so a run starts against it and spends the proxy wait discovering otherwise, and
+a plan already [held](../running-playbooks/cluster-nodes.md#holding-instead-of-starting) for a Node
+is not released when that Node comes back until its hourly re-check (on a scheduled plan, until its
+window closes). Nothing else misbehaves, and everything
 recovers on its own the moment the watch does.
 
 It is not silent. After a handful of consecutive failures the operator logs a line saying the Node
@@ -115,11 +115,18 @@ When a `ClusterInventory` targets a `NotReady` Node, the operator still schedule
 waits for the pod to become Ready. If it does not become Ready in time, the run proceeds without that
 Node — Ansible reports it unreachable, and it is retried on the next run. The same bound applies to
 an old-credential pod still terminating after a reset; it is never reused. A pod that has reached
-`Running` normally is waited on until Ready as usual.
+`Running` is waited on until Ready without a limit while its Node is `Ready`. If its Node stops
+being `Ready` first, the same bound applies from the moment the pod lost its readiness, so a Node
+that dies while the run is still bringing up other proxies cannot hold the run until it returns.
+
+The same wait bounds a proxy pod that does not come up on a `Ready` Node, such as one still pulling
+its image: the tiers below look only at the heartbeat, not at whether the Node is `Ready`.
 
 The wait scales with how long the Node has been silent (its last `Ready` heartbeat): a Node that only
-just went `NotReady` is given the full wait, one silent for longer is given up on sooner. Tune it via
-`managedSsh.readiness`:
+just went `NotReady` is given the full wait, one silent for longer is given up on sooner. A healthy
+Node's heartbeat is up to a few minutes old, since the kubelet only reports its status every few
+minutes when nothing changes, so a threshold of `0` days matches practically no Node, healthy ones
+included. Tune it via `managedSsh.readiness`:
 
 ```yaml
 # values.yaml
@@ -132,6 +139,12 @@ managedSsh:
 
 The defaults wait 600 / 300 / 150 / 0 seconds for a Node last seen within 3 / 7 / 30 / more days.
 Like the other config values, a change rolls the operator rather than hot-reloading.
+
+For a run of a scheduled `PlaybookPlan`, the wait for a Node that is `NotReady` is further capped
+at the plan's `startingDeadlineSeconds` and at half the time to its next tick. Every run waits
+again, so a longer wait on a short schedule would make the plan miss ticks. See
+[NotReady nodes](../running-playbooks/cluster-nodes.md#notready-nodes) for what happens to such a
+Node afterwards.
 
 ## Enrolled namespaces
 
