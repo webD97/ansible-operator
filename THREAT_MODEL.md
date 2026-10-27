@@ -317,9 +317,8 @@ NodeAccessPolicy enforcement is **always on**. With no matching policy, managed-
 resolve to **zero** nodes and silently do nothing.
 - *Mitigation:* intentional (default-deny). `warn!` on exclusion; status shows
   `eligibleHosts`.
-- *Residual:* an operator upgrading an existing cluster without deploying an allow-all
-  policy will see all managed-ssh plans stop. This is a **breaking rollout caveat**, not a
-  vuln — see §6.
+- *Residual:* an install that deploys no `NodeAccessPolicy` runs no managed-ssh plan on any
+  node until an admin writes one. This is an operational requirement, not a vuln — see §6.
 - *Severity:* Operational, not security.
 
 ### Elevation of privilege (the core of this model)
@@ -422,7 +421,7 @@ any of that namespace's ServiceAccounts' API RBAC.
   privileged the namespace's ServiceAccounts are.
 
 **T-ESC-8 — Tampering with a `Play` record to steer a run in progress.**
-A `Play` is no longer only history: recovery reads it back to decide whether an unlaunched run
+A `Play` is not only history: recovery reads it back to decide whether an unlaunched run
 may still be resumed, and to re-derive what that run executes. Anyone with `update` on `plays` in an
 enrolled namespace could therefore try to rewrite what a committed run does.
 - *Reduced attack surface:* the record stores neither the plan spec, nor the resolved inventory
@@ -501,10 +500,12 @@ This design is **only** as strong as the environment it runs in. The following a
    run's run-ID principal via `AuthorizedPrincipalsFile` (T-INFO-3) — so a non-enforcing CNI does
    not collapse it. NetworkPolicy still limits reachability to node-root proxy pods and blocks
    non-cert traffic; keep it on for multi-tenant.
-2. **Deploy a `NodeAccessPolicy` for the operator namespace before/at rollout.**
-   Enforcement is always-on and fail-closed; absent a policy, managed-ssh plans resolve to
-   zero nodes (T-DOS-2). See the `cluster-admins` doc in
-   [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
+2. **Deploy a `NodeAccessPolicy` for every namespace that runs managed-ssh plans.**
+   Enforcement is always-on, fail-closed and keyed on the *plan's* namespace; absent a matching
+   policy, that namespace's managed-ssh plans resolve to zero nodes (T-DOS-2). Plans do not
+   belong in the operator namespace (see the deployment guide), so a policy for it grants
+   nothing useful.
+   See [`examples/v1beta1/node-access-policy.yaml`](examples/v1beta1/node-access-policy.yaml).
 3. **Lock down the operator namespace.** It runs the node-root proxy pods and the Tier-0
    operator ServiceAccount, and holds their per-host Secrets and NetworkPolicies. Per-run client
    certificates live in enrolled plan namespaces (A3), while the CA itself is in-memory only (A2).
@@ -516,6 +517,10 @@ This design is **only** as strong as the environment it runs in. The following a
    bounds *which nodes*, but managed-ssh on any authorized node is root on that node (T-ESC-4).
 6. **Pin the proxy image** to a digest from a registry you trust, via `managedSsh.proxyImage`.
    The chart seed is digest-pinned; preserve that property when overriding it (T-ESC-5).
+7. **Run exactly one operator process.** Each process holds its own in-memory CA (A2, INV-6), so
+   a second one mints certs the first one's proxy pods do not trust, and the two tear down each
+   other's half-built runs. The chart refuses `replicaCount` above 1 and uses the `Recreate`
+   strategy, which covers rollouts; it cannot prevent a short overlap outside one (R10).
 
 ---
 
@@ -613,6 +618,7 @@ fully implemented and carries no open tail; see T-INFO-1 and §8.)
 | R7 | Add per-tenant ResourceQuota/LimitRange guidance and optionally a max-fan-out guard. | T-DOS-1 | Low |
 | R8 | Pin host identity: replace the `@cert-authority *` wildcard with per-host known_hosts entries so host certs are bound to the intended node. | T-SPOOF-2 | Low |
 | R9 | Consider a cryptographic hash (or explicit run UID) wherever `ExecutionHash` feeds security-relevant naming/labels/principals. | T-ESC-6 | Low |
+| R10 | Single-process operation (§6 item 7) is enforced for rollouts only. A Deployment does not guarantee at most one pod: a pod on a partitioned Node is replaced after the eviction timeout while it may still run, and so is a force-deleted pod. The overlap breaks runs being built (availability), not isolation — each CA's certs are still principal-scoped. Leader election would close it and is not planned. | §6 item 7 | Low |
 
 ---
 

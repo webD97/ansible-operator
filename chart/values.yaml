@@ -9,6 +9,10 @@ crds:
   # alone; they then have to be deleted manually. Upgrades reconcile schema changes either way.
   keep: true
 
+# The operator must run as a single process, because its SSH CA lives only in its memory and is
+# never shared: a second replica would mint certificates the first one's proxy pods do not trust.
+# Only 0 and 1 are accepted, and the Deployment uses the Recreate strategy so an upgrade never
+# overlaps the old and the new pod.
 replicaCount: 1
 
 image:
@@ -46,8 +50,8 @@ fullnameOverride: ""
 
 # Enrolled tenant namespaces (R1 / THREAT_MODEL T-INFO-1). The operator may read/write Secrets and
 # create Jobs ONLY in these namespaces plus its own (.Release.Namespace, always enrolled). This is
-# the security boundary that replaces the old cluster-wide Secret/Job/Pod grants — an operator
-# compromise is bounded to the enrolled namespaces, not the whole cluster.
+# the security boundary in place of cluster-wide Secret/Job/Pod grants — an operator compromise is
+# bounded to the enrolled namespaces, not the whole cluster.
 #
 # Fail-closed: a PlaybookPlan created in a namespace NOT listed here (and not the operator namespace)
 # is refused with status.phase = UnauthorizedNamespace. There is deliberately no "all namespaces"
@@ -116,7 +120,8 @@ nodeLabels:
   admissionPolicy: true
 
 # Optional egress NetworkPolicies. Rules use the native networking.k8s.io/v1 NetworkPolicy egress
-# schema. Disabled by default so an upgrade never broadens or changes existing network controls.
+# schema. Disabled by default because useful rules are specific to each cluster, and a wrong default
+# would break Ansible's outbound connections.
 #
 # CAUTION: these are raw NetworkPolicy egress rule arrays, so empty-vs-unrestricted follows
 # NetworkPolicy semantics, not Helm's:

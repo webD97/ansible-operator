@@ -228,10 +228,16 @@ spec:
         ansible_python_interpreter: /usr/bin/python3
 ```
 
-Group variables are part of a plan's execution hash, so changing one re-applies the playbook to the
-affected Nodes on the next run. The connection variables the operator manages itself — `ansible_host`,
-`ansible_port`, `ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
+Group variables are part of the execution hash of every plan that references the inventory, so
+changing one re-applies that plan's playbook to all of its Nodes on its next run, not only to that
+group's Nodes. The connection variables the operator manages itself — `ansible_host`, `ansible_port`,
+`ansible_user`, and the `ansible_ssh_*` options — are rejected: they are wired from
 managed SSH, and a plan that references an inventory setting one does not run until you remove it.
+
+Which group a Node is in is not part of the hash. A Node that has already been applied and then moves
+to another group, for example after a relabel, is not re-run, even when the new group sets different
+variables — see
+[Moving a host between groups](./scheduling-and-modes.md#moving-a-host-between-groups).
 
 ## Tolerations
 
@@ -342,11 +348,11 @@ a Node that goes down after its proxy pod was already up, when the pod stopped b
 launches only once every proxy pod is up or given up on, and every run waits again, so without that
 bound one dead Node would stretch each run of a short schedule past its interval and make the plan
 miss ticks. A Node that is `Ready` keeps the full wait: its proxy pod may simply still be pulling
-its image. The down Node is reported `Unreachable` as before. By the time the operator gives up on
-it, the tick's window has usually closed, so it waits for the next tick. If Nodes are expected to be
-down around the tick (rebooting, say), give the plan a longer `startingDeadlineSeconds`. That
-lengthens this wait too, and once the window outlasts the wait, the Node's return to `Ready` still
-gets a run within the same tick.
+its image. The down Node is reported `Unreachable`, as described above. By the time the operator
+gives up on it, the tick's window has usually closed, so it waits for the next tick. If Nodes are
+expected to be down around the tick (rebooting, say), give the plan a longer
+`startingDeadlineSeconds`. That lengthens this wait too, and once the window outlasts the wait, the
+Node's return to `Ready` still gets a run within the same tick.
 
 Excluding rather than dropping is what keeps the inventory honest. The Node stays a member of its
 groups, so a playbook templating a cluster member list out of `groups['workers']` still sees the

@@ -60,6 +60,12 @@ const DEFAULT_RECURRING_ATTEMPTS: u32 = 1;
 /// How long a plan waits before making a try it still owes. Short because a scheduled retry has only
 /// the remainder of its tick's `startingDeadlineSeconds` window to start in.
 const RETRY_REQUEUE: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long an idle plan waits before re-reading a desired input that only an edit can fix.
+///
+/// A safety net, not the way such a plan recovers: the edit that fixes it — the plan itself, or a
+/// referenced inventory or Secret, which every mapper matches by name and so wakes on creation too
+/// — reconciles it straight away. See [`input_error_waits_for_an_edit`] for when it applies.
+const PERMANENT_INPUT_ERROR_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// How long [`new`] waits for a reflector's initial LIST before taking the process down with it.
 ///
 /// Deliberately generous, because the two ways of getting it wrong are not symmetric: too short
@@ -474,8 +480,8 @@ pub async fn new(
     // Owned-Job and referenced-Secret watches are set up per enrolled namespace instead of once
     // cluster-wide: the operator holds `jobs`/`secrets` RBAC only in these namespaces (R1), so a
     // cluster-wide `Api::all` watch would 403. A Secret edit in an enrolled namespace still promptly
-    // re-triggers its plan (preserving "input changed -> reapply"); the merged effect is identical to
-    // the old single cluster-wide watch, just bounded to the allowlist.
+    // re-triggers its plan ("input changed -> reapply"); the merged effect is identical to a single
+    // cluster-wide watch, just bounded to the allowlist.
     for namespace in enrolled_namespaces.iter() {
         let jobs_api: Api<Job> = Api::namespaced(client.clone(), namespace);
         let secrets_api: Api<Secret> = Api::namespaced(client.clone(), namespace);
@@ -779,9 +785,9 @@ async fn reconcile(
     // status mirror may already have moved on — so the finalizer is kept until a tick finds neither.
     let recovered_a_run = recovered.is_some();
     if recovered_a_run {
-        // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, or
-        // adopted from a release that predates it — would otherwise keep the run it is holding
-        // outside the contract for as long as that run lasts.
+        // Re-asserted rather than assumed: a plan that lost the finalizer — stripped by hand, for
+        // example — would otherwise keep the run it is holding outside the contract for as long as
+        // that run lasts.
         ensure_run_cleanup_finalizer(&api, &object)
             .await
             .or_else(|error| error.is_conflict().then_some(()).ok_or(error))?;
@@ -1008,20 +1014,21 @@ async fn reconcile(
     // cluster — it is the plan's own spec — but a spec that cannot produce a valid Job has to be
     // caught *before* a run takes its Leases and starts its proxy pods, or the rejection lands at
     // Job creation, where no retry can clear it and the plan wedges holding those Leases.
-    if let Err(error) =
-        validate_file_entries(&object).and_then(|()| validate_workspace_not_referenced(&object))
+    if let Err(error) = validate_playbook(&object)
+        .and_then(|()| validate_file_entries(&object))
+        .and_then(|()| validate_workspace_not_referenced(&object))
     {
-        report_desired_input_error(
+        let reported = report_desired_input_error(
             &context,
             &object,
             &api,
             unlaunched_run.as_ref(),
             &mut resource_status,
             &error,
-            InputFailure::same(error.to_string()),
+            spec_input_failure(&object, &error),
         )
         .await?;
-        return Err(error);
+        return conclude_input_error(namespace, name, error, reported, &resource_status);
     }
 
     // Steps 0 and 0b: resolve the plan's inventories and clamp them to what NodeAccessPolicy grants
@@ -1035,7 +1042,7 @@ async fn reconcile(
     } = match resolve_authorized_inventory(&context, &object).await {
         Ok(resolved) => resolved,
         Err(error) => {
-            report_desired_input_error(
+            let reported = report_desired_input_error(
                 &context,
                 &object,
                 &api,
@@ -1045,7 +1052,7 @@ async fn reconcile(
                 inventory_input_failure(&error),
             )
             .await?;
-            return Err(error);
+            return conclude_input_error(namespace, name, error, reported, &resource_status);
         }
     };
     if !excluded_nodes.is_empty() {
@@ -1102,7 +1109,7 @@ async fn reconcile(
 
     // Inventory-author group variables are part of the execution hash (a change re-applies the
     // playbook to otherwise-current hosts). Keyed by group name; groups without variables
-    // contribute nothing, so inventories that set none hash exactly as before.
+    // contribute nothing, so inventories that set none do not move the hash.
     let inventory_variables: Vec<(&str, &serde_json::Value)> = target_groups
         .iter()
         .filter_map(|group| {
@@ -1128,7 +1135,7 @@ async fn reconcile(
             // its hosts are still known-authorized and the hold is safe, but it is not free: the
             // hold renews those Leases every tick, and an indefinite one starves every other plan
             // targeting the same hosts. That is what `input_error_supersedes_unlaunched` bounds.
-            report_desired_input_error(
+            let reported = report_desired_input_error(
                 &context,
                 &object,
                 &api,
@@ -1138,7 +1145,7 @@ async fn reconcile(
                 InputFailure::same(format!("cannot read referenced Secrets: {error}")),
             )
             .await?;
-            return Err(error);
+            return conclude_input_error(namespace, name, error, reported, &resource_status);
         }
     };
 
@@ -2344,6 +2351,18 @@ fn withdraw_replaced_machines(
     }
 }
 
+/// Checks that `spec.template.playbook` parses as a playbook, through the same
+/// `ansible::render_playbook` that renders it into the run's workspace.
+///
+/// That rendering otherwise happens only when the workspace is written, after the run has taken its
+/// host Leases and started its proxy pods, and its failure there holds the run open against a spec
+/// no tick can fix.
+fn validate_playbook(plan: &PlaybookPlan) -> Result<(), ReconcileError> {
+    ansible::render_playbook(&plan.spec)
+        .map(|_| ())
+        .map_err(ReconcileError::InvalidPlaybook)
+}
+
 /// Checks that every `spec.template.files` entry can name a directory of its own under the
 /// workspace, that no two claim the same one, and that each body describes one usable Kubernetes
 /// volume source.
@@ -2584,10 +2603,9 @@ fn not_ready_proxy_grace_cap<Tz: TimeZone>(
 /// and go: with `0 * * * *` and four hours, 06:30 still reports the 03:00 slot, and once that window
 /// is taken the plan sleeps to 07:00 — 04:00, 05:00 and 06:00 never ran.
 ///
-/// It is a warning and not a rejection, because the configuration is valid and plans already exist
-/// that use it; rejecting it would break them on upgrade. A wide deadline is also what a maintenance
-/// window *is*, so the fix is a judgement the author has to make: usually a deadline shorter than
-/// the interval, occasionally a sparser schedule.
+/// It is a warning and not a rejection, because the configuration is valid: a wide deadline is what
+/// a maintenance window *is*, so the fix is a judgement the author has to make: usually a deadline
+/// shorter than the interval, occasionally a sparser schedule.
 ///
 /// Reported where a run starts for a slot rather than wherever the schedule is parsed, which is what
 /// keeps it from repeating on every tick of an open window: the plan says it at most once per run it
@@ -4484,6 +4502,34 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
     }
 }
 
+/// How a spec the plan's own checks refused is stated in each place.
+///
+/// A playbook that does not parse is the one whose error is too long for the column: the YAML
+/// parser names where it failed *and* what it was parsing at the time, which is a line of its own.
+/// The column says where to look, or that the YAML is fine but not a list of plays (a single play
+/// written as a mapping, the commonest form of it); the condition keeps the parser's words.
+fn spec_input_failure(plan: &PlaybookPlan, error: &ReconcileError) -> InputFailure {
+    let ReconcileError::InvalidPlaybook(_) = error else {
+        return InputFailure::same(error.to_string());
+    };
+    let summary = match serde_yaml::from_str::<serde_yaml::Value>(&plan.spec.template.playbook) {
+        Err(syntax) => match syntax.location() {
+            Some(at) => format!(
+                "playbook is not valid YAML at line {} column {}",
+                at.line(),
+                at.column()
+            ),
+            None => "playbook is not valid YAML".to_string(),
+        },
+        Ok(serde_yaml::Value::Sequence(_)) => "playbook cannot be rendered".to_string(),
+        Ok(_) => "playbook is not a list of plays".to_string(),
+    };
+    InputFailure {
+        summary,
+        detail: error.to_string(),
+    }
+}
+
 /// Reports on the plan that its desired inputs could not be read, for a tick with no run in
 /// flight to hold open.
 ///
@@ -4502,21 +4548,26 @@ fn inventory_input_failure(error: &ReconcileError) -> InputFailure {
 /// does not stop a Job that is already executing, and changing its phase would contradict the
 /// `activeRun` standing right next to it.
 ///
-/// Best effort, and deliberately so: the reconcile fails on the original error either way, and a
-/// failure to report must not replace the diagnosis it was trying to surface. Same shape as
-/// [`report_failed_abandon`] and the recovery failure path in [`reconcile`].
+/// Best effort, and deliberately so: a failure to report must not replace the diagnosis it was
+/// trying to surface. Same shape as [`report_failed_abandon`] and the recovery failure path in
+/// [`reconcile`]. Returns whether the write landed, so a tick that could not report keeps retrying
+/// at the error requeue instead of waiting for an edit behind the previous verdict.
 async fn report_input_failure(
     api: &Api<PlaybookPlan>,
     object: &PlaybookPlan,
     resource_status: &mut PlaybookPlanStatus,
     failure: InputFailure,
-) {
+) -> bool {
     record_input_failure(resource_status, failure);
-    if let Err(patch_error) = patch_status(api, object, resource_status.clone()).await {
-        warn!(
-            "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
-            object.metadata.namespace, object.metadata.name
-        );
+    match patch_status(api, object, resource_status.clone()).await {
+        Ok(_) => true,
+        Err(patch_error) => {
+            warn!(
+                "Could not report a desired-input read failure on {:?}/{:?}: {patch_error}",
+                object.metadata.namespace, object.metadata.name
+            );
+            false
+        }
     }
 }
 
@@ -4611,8 +4662,11 @@ fn claim_paused_recovery_summary(
 /// same way, so the choice between the two reporting paths is made once here instead of at each
 /// call site. What differs between them is only the diagnostic, which the caller passes in.
 ///
-/// The caller still returns the original error afterwards: this reports, it does not decide the
-/// tick's outcome.
+/// This reports, it does not decide the tick's outcome: the caller hands the original error to
+/// [`conclude_input_error`] afterwards. Returns whether the outage reached the plan, which that
+/// needs before it lets an idle plan wait for an edit. Only the idle path's write can fail without
+/// failing this call — an unlaunched run that is given up writes its outcome with failures
+/// propagated, and one that is held open keeps retrying at the error requeue anyway.
 async fn report_desired_input_error(
     context: &ReconciliationContext,
     object: &PlaybookPlan,
@@ -4621,27 +4675,23 @@ async fn report_desired_input_error(
     resource_status: &mut PlaybookPlanStatus,
     error: &ReconcileError,
     failure: InputFailure,
-) -> Result<(), ReconcileError> {
+) -> Result<bool, ReconcileError> {
     match unlaunched {
-        Some(unlaunched) => {
-            handle_unlaunched_input_error(
-                context,
-                object,
-                api,
-                unlaunched,
-                resource_status,
-                error,
-                &failure,
-            )
-            .await
-        }
+        Some(unlaunched) => handle_unlaunched_input_error(
+            context,
+            object,
+            api,
+            unlaunched,
+            resource_status,
+            error,
+            &failure,
+        )
+        .await
+        .map(|()| true),
         // Nothing in flight to hold open, but the plan still has to say why it is not running: a
         // deleted inventory or Secret would otherwise leave the last successful run's summary
         // standing while every tick fails in the log only.
-        None => {
-            report_input_failure(api, object, resource_status, failure).await;
-            Ok(())
-        }
+        None => Ok(report_input_failure(api, object, resource_status, failure).await),
     }
 }
 
@@ -4774,7 +4824,8 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         ReconcileError::InventoryNotSynced { .. } => false,
         // A spec the user has to edit, exactly like the first arm above: no tick clears it, and
         // holding a run open against it would hold host Leases for as long as the plan stays wrong.
-        ReconcileError::InvalidFileEntry { .. }
+        ReconcileError::InvalidPlaybook(_)
+        | ReconcileError::InvalidFileEntry { .. }
         | ReconcileError::WorkspaceSecretReferenced { .. } => true,
         // Neither is an input read — both come from a run's own infrastructure — but the enum is
         // matched exhaustively so that a new failure has to be classified here deliberately.
@@ -4786,6 +4837,41 @@ fn input_error_supersedes_unlaunched(error: &ReconcileError) -> bool {
         | ReconcileError::JsonSerializationError(_)
         | ReconcileError::YamlSerializationError(_) => false,
     }
+}
+
+/// Whether a tick that could not read its desired inputs may wait [`PERMANENT_INPUT_ERROR_RECHECK`]
+/// instead of retrying at the controller's error requeue.
+///
+/// Only an error no retry can clear, and only with no run in flight. A `Running` run's host Leases
+/// are renewed by the tick, and they outlive the error requeue but not the recheck, so a plan
+/// holding one keeps retrying at the error requeue whatever failed. `status` must be the tick's own
+/// status after the failure was handled — by then a superseded unlaunched run has been released and
+/// left `activeRun`, while the reflector's copy may still lack a run this controller just mirrored.
+fn input_error_waits_for_an_edit(error: &ReconcileError, status: &PlaybookPlanStatus) -> bool {
+    input_error_supersedes_unlaunched(error) && status.active_run.is_none()
+}
+
+/// Ends a tick whose desired inputs could not be read, once the failure is reported on the plan.
+///
+/// An error that only an edit can fix ends the tick as a success with a long requeue (see
+/// [`input_error_waits_for_an_edit`]), so it is logged here in place of the controller's warning.
+/// Not when `reported` is false: until the outage is on the plan, the plan still shows its previous
+/// verdict, and the error requeue is what retries the report.
+fn conclude_input_error(
+    namespace: &str,
+    name: &str,
+    error: ReconcileError,
+    reported: bool,
+    status: &PlaybookPlanStatus,
+) -> Result<Action, ReconcileError> {
+    if !reported || !input_error_waits_for_an_edit(&error, status) {
+        return Err(error);
+    }
+    warn!(
+        "PlaybookPlan {namespace}/{name}: {error}; waiting for an edit, rechecking in {}s",
+        PERMANENT_INPUT_ERROR_RECHECK.as_secs()
+    );
+    Ok(Action::requeue(PERMANENT_INPUT_ERROR_RECHECK))
 }
 
 /// Gives back a run's proxy infrastructure and then its host Leases. Cleanup failures propagate so
@@ -5773,9 +5859,10 @@ async fn observe_ssh_key_revision(
 ///
 /// Three cases deliberately do not reset it:
 ///
-/// - **the first observation.** A plan upgraded into this field has not rotated anything, and a plan
-///   that never had one has no budget to give back. Recording it without acting is what keeps the
-///   upgrade from handing every failed plan in the cluster a free retry at once.
+/// - **the first observation.** A key the plan sees for the first time — a new plan, or one that
+///   has just started referencing a `StaticInventory` — has not been rotated: the plan never
+///   connected with any other key, so no earlier failure can be this key's fault. Recording it
+///   without acting keeps that from being mistaken for a fix.
 /// - **a `Succeeded` plan.** Its hosts are converged and the key it connected with worked; a
 ///   rotation is not a reason to touch them again. This is the same rule the mapper applies, from
 ///   [`status::may_need_another_run`], so a plan can never be woken for a rotation it would then
@@ -9788,7 +9875,7 @@ mod tests {
         // follows targets only what is outdated, so the covered ones are not applied to twice.
         assert!(!taken(&ran_over_a_and_b, &["node-b", "node-c"]));
 
-        // What must not break: a window with nothing left to do is spent, exactly as before. The
+        // What must not break: a window with nothing left to do is spent. The
         // middle case is the one a lagging status produces, where the hosts still look outdated.
         assert!(taken(&ran_over_a_and_b, &["node-a"]));
         assert!(
@@ -10881,6 +10968,148 @@ spec:
                 name: "..".into(),
                 reason: "a name must be a single directory, not a path",
             }
+        ));
+    }
+
+    #[test]
+    fn validate_playbook_rejects_a_playbook_that_does_not_parse() {
+        let plan_with = |playbook: &str| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.playbook = playbook.to_string();
+            plan
+        };
+
+        assert!(validate_playbook(&plan_with("- hosts: all\n  tasks: []\n")).is_ok());
+
+        for broken in [
+            // A YAML syntax error.
+            "- hosts: all\n  tasks: [\n",
+            // Valid YAML, but a playbook is a list of plays.
+            "hosts: all\ntasks: []\n",
+        ] {
+            assert!(
+                matches!(
+                    validate_playbook(&plan_with(broken)),
+                    Err(ReconcileError::InvalidPlaybook(_))
+                ),
+                "{broken:?} must be rejected before a run starts"
+            );
+        }
+    }
+
+    /// The parser's own message runs past 150 characters for an ordinary indentation mistake, so
+    /// the column gets where it failed and the condition gets the message.
+    #[test]
+    fn an_invalid_playbook_is_summarized_by_where_it_fails() {
+        let failure_for = |playbook: &str| {
+            let mut plan = PlaybookPlan::new("plan", PlaybookPlanSpec::default());
+            plan.spec.template.playbook = playbook.to_string();
+            let error = validate_playbook(&plan).unwrap_err();
+            spec_input_failure(&plan, &error)
+        };
+
+        let misindented = failure_for(
+            "- hosts: all\n  tasks:\n    - name: x\n      debug: msg=hi\n     bad: indent\n",
+        );
+        assert_eq!(
+            misindented.summary,
+            "playbook is not valid YAML at line 5 column 6"
+        );
+        assert!(
+            misindented
+                .detail
+                .starts_with("spec.template.playbook is not a valid playbook: did not find"),
+            "{}",
+            misindented.detail
+        );
+
+        let single_play = failure_for("hosts: all\ntasks: []\n");
+        assert_eq!(single_play.summary, "playbook is not a list of plays");
+        assert_eq!(
+            single_play.detail,
+            "spec.template.playbook is not a valid playbook: invalid type: map, expected a sequence"
+        );
+    }
+
+    /// The user's playbook is a spec error no tick can clear, while a failure of the operator's own
+    /// rendering is not, so the two must classify differently.
+    #[test]
+    fn an_invalid_playbook_supersedes_a_run_that_has_not_launched() {
+        let parse_error = || {
+            ansible::RenderError::from(
+                serde_yaml::from_str::<serde_yaml::Sequence>("hosts: all").unwrap_err(),
+            )
+        };
+
+        assert!(input_error_supersedes_unlaunched(
+            &ReconcileError::InvalidPlaybook(parse_error())
+        ));
+        assert!(!input_error_supersedes_unlaunched(
+            &ReconcileError::RenderError(parse_error())
+        ));
+    }
+
+    /// An idle plan stuck on an error only an edit can fix stops retrying every few seconds, but a
+    /// plan with a run in flight never does: that tick is what renews the run's host Leases.
+    #[test]
+    fn only_an_idle_plan_waits_for_an_edit_to_fix_its_inputs() {
+        let permanent = || ReconcileError::InvalidFileEntry {
+            name: "files".into(),
+            reason: "test",
+        };
+        let transient = || ReconcileError::InventoryNotSynced {
+            name: "workers".into(),
+            generation: 2,
+            observed: "1".into(),
+        };
+        let idle = PlaybookPlanStatus::default();
+        let running = PlaybookPlanStatus {
+            active_run: Some(ActiveRun {
+                execution_hash: "1".into(),
+                run_id: "run-1".into(),
+                job_name: "apply-plan-1-1".into(),
+                play_uid: "play-uid".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 1,
+                attempt: 1,
+                triggered_slot: None,
+                retry_generation: 0,
+            }),
+            ..Default::default()
+        };
+
+        assert!(input_error_waits_for_an_edit(&permanent(), &idle));
+        assert!(!input_error_waits_for_an_edit(&permanent(), &running));
+        assert!(!input_error_waits_for_an_edit(&transient(), &idle));
+
+        assert_eq!(
+            conclude_input_error("ns", "plan", permanent(), true, &idle).ok(),
+            Some(Action::requeue(PERMANENT_INPUT_ERROR_RECHECK))
+        );
+        assert!(matches!(
+            conclude_input_error("ns", "plan", permanent(), true, &running),
+            Err(ReconcileError::InvalidFileEntry { .. })
+        ));
+    }
+
+    /// A plan whose status write failed still shows its previous verdict, so it must not go quiet
+    /// for the long recheck: the error requeue is what retries the report.
+    #[test]
+    fn an_idle_plan_that_could_not_report_its_input_error_keeps_retrying() {
+        let permanent = ReconcileError::InvalidFileEntry {
+            name: "files".into(),
+            reason: "test",
+        };
+
+        assert!(matches!(
+            conclude_input_error(
+                "ns",
+                "plan",
+                permanent,
+                false,
+                &PlaybookPlanStatus::default()
+            ),
+            Err(ReconcileError::InvalidFileEntry { .. })
         ));
     }
 
@@ -12981,9 +13210,8 @@ spec:
         assert_eq!(failed.retry_generation, 1);
     }
 
-    /// The upgrade case. Every plan that predates this field observes its key for the first time on
-    /// the first tick after the operator is upgraded, and that is not a rotation — without this,
-    /// upgrading would hand a free retry to every failed plan in the cluster at once.
+    /// A key seen for the first time is not a rotation, even on a failed plan: the plan never
+    /// connected with any other key, so this one cannot be the fix for its failure.
     #[test]
     fn the_first_observation_of_a_key_is_recorded_but_changes_nothing() {
         let mut status = PlaybookPlanStatus {
@@ -13107,8 +13335,8 @@ spec:
         }
     }
 
-    /// Unlike an SSH key, a retry annotation seen for the first time *is* a request: nothing
-    /// carried it before this feature, so there is no upgrade to protect.
+    /// Unlike an SSH key, a retry annotation seen for the first time *is* a request: a plan has no
+    /// annotation it starts with, so any value that appears was set to ask for a retry.
     #[test]
     fn the_first_retry_request_a_plan_sees_acts() {
         let mut status = failed_with_spent_budget(Phase::Failed);

@@ -46,10 +46,15 @@ spec:
         ansible_python_interpreter: /usr/bin/python3
 ```
 
-Group variables are part of a plan's execution hash, so changing one re-applies the playbook on the
-next run. The connection variables the operator manages — `ansible_user`, the `ansible_ssh_*`
+Group variables are part of the execution hash of every plan that references the inventory, so
+changing one re-applies that plan's playbook to all of its hosts on its next run, not only to that
+group's hosts. The connection variables the operator manages — `ansible_user`, the `ansible_ssh_*`
 options, `ansible_host`, and `ansible_port` — are rejected: they come from the `ssh` block below, and
 a plan that references an inventory setting one does not run until you remove it.
+
+Which group a host is in is not part of the hash. A host that has already been applied and then moves
+to another group or inventory is not re-run, even when the new group sets different variables — see
+[Moving a host between groups](./scheduling-and-modes.md#moving-a-host-between-groups).
 
 ## SSH credentials
 
@@ -74,8 +79,10 @@ kubectl create secret generic ssh-key \
   --from-file=known_hosts=./known_hosts
 ```
 
-Because the key lives in a Secret in the plan's namespace, changing it re-triggers affected plans
-(the operator watches referenced Secrets), and rotating a key is just updating the Secret.
+Rotating a key is just updating the Secret. The key is not part of the execution hash, so a rotation
+never re-applies the playbook to hosts that are already current, and a plan whose last run succeeded
+ignores it. A plan whose last run failed gets its attempt budget back and tries again — see
+[What wakes a plan](./scheduling-and-modes.md#what-wakes-a-plan).
 
 ## Multiple inventories, multiple credentials
 

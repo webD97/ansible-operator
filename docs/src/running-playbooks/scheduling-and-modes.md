@@ -164,7 +164,8 @@ The inventories contribute their `variables` only, keyed by group name, so a gro
 omitting the field or writing an empty `{}`, which render identically — contributes nothing at all.
 Which *hosts* a group resolves to is deliberately not part of the hash: a
 node joining or leaving changes who the plan targets, not what it applies, and a new node is already
-out of date because it has no recorded hash of its own.
+out of date because it has no recorded hash of its own. A host that only *moves* between groups is
+not re-run either — see [Moving a host between groups](#moving-a-host-between-groups).
 
 - Each host records the hash it **last succeeded on** (`.status.hostsStatus.<host>.lastAppliedHash`).
 - A host whose last-applied hash equals the current hash is **current** and is skipped (in
@@ -200,6 +201,22 @@ This is what makes `OneShot` idempotent and cheap: editing an unrelated field do
 everything, but a real change to the playbook or its inputs does. The current hash is visible as
 `.status.currentHash` and in the `Current hash` printer column.
 
+### Moving a host between groups
+
+Group membership is not part of what gets applied. A host that already succeeded on the current hash
+stays current when it moves to another group or inventory — for example because its Node was
+relabelled and now matches a different group's selector — and when it is listed under several groups
+at once. It runs once, not once per group, and a move does not run it again.
+
+That holds even when the move changes what the host would get: when the two groups set different
+`variables`, or when a play targets only one of them (`hosts: gpu`). The host keeps the result of the
+run it already had, until something the hash covers changes. To re-run it anyway, edit the playbook
+or, on a plan that already declares one, bump
+[`spec.provides.version`](./playbook-plans.md#declaring-what-a-plan-provides). Either moves the hash
+of the whole plan, so it re-runs every host of the plan, not only the one that moved. Adding
+`spec.provides` to a plan that has none does the same, and also starts labelling the cluster Nodes
+the plan converges with that version.
+
 ### What wakes a plan
 
 A plan is re-evaluated whenever one of the things it is built from changes, and otherwise on a
@@ -214,7 +231,7 @@ timer. The watched inputs are:
 | A Node it is still waiting on becoming `Ready` | at once — for a scheduled plan, only while its tick's window is open |
 | A `StaticInventory`'s SSH key Secret | at once, but **only for a plan whose last run did not succeed** |
 | The run's Job finishing | at once |
-| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan — a plan [held](./cluster-nodes.md#holding-instead-of-starting) for its Nodes also once when its tick's window closes |
+| Nothing at all | on a timer: the time until the next scheduled tick, or an hour for an unscheduled plan — a plan [held](./cluster-nodes.md#holding-instead-of-starting) for its Nodes also once when its tick's window closes, and one whose [inputs cannot be read](./results-and-troubleshooting.md#the-plans-inputs-cannot-be-read) every 15 seconds, or every five minutes when only an edit can fix them and no run is in flight |
 
 "Still waiting on" is narrower than "not current", and it is the same question the run's target set
 answers — so a plan is never woken for a host it would not then run. For a `Recurring` plan that is
@@ -259,9 +276,9 @@ inside an open schedule window retries in that window.
 
 Two details worth knowing:
 
-- **The first key a plan ever sees is not a rotation.** A plan created before this behaviour existed,
-  or one reaching a `StaticInventory` for the first time, records the key it finds without acting on
-  it. Only a *change* from a key the plan already recorded counts.
+- **The first key a plan ever sees is not a rotation.** A plan reaching a `StaticInventory` for the
+  first time records the key it finds without acting on it. Only a *change* from a key the plan
+  already recorded counts.
 - **A rotation during a run waits for it.** The run in flight finishes against the key it started
   with, and the rotation is acted on once its result is in.
 
