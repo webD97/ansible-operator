@@ -655,7 +655,10 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   way to sanity-check chart wiring.
 - CI (`.github/workflows/build-test-push.yml`): `cargo test` and the Python suite as separate
   parallel jobs, + `cargo build --release`, then a Containerfile distroless image (binary copied
-  in, no cargo build inside the image).
+  in, no cargo build inside the image). A `docs` job builds the guide with a pinned, checksummed
+  mdBook release, and the `test` job builds the API docs with `RUSTDOCFLAGS=-D warnings`, the same
+  check as `just apidoc`. `book.toml` sets `create-missing = false`, so a `SUMMARY.md` entry
+  whose file is missing fails the build instead of rendering an empty page.
 - `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
   not something to modify as part of feature work.
 ```

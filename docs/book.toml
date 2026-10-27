@@ -5,6 +5,11 @@ authors = ["Christian Danscheid"]
 language = "en"
 src = "src"
 
+[build]
+# The default creates an empty page for a SUMMARY.md entry whose file is missing, so a broken entry
+# would build (and ship) instead of failing CI.
+create-missing = false
+
 [output.html]
 git-repository-url = "https://github.com/webd97/ansible-operator"
 edit-url-template = "https://github.com/webd97/ansible-operator/edit/main/docs/{path}"
