@@ -130,6 +130,12 @@ jobs:
       - name: Build guide
         run: mdbook build docs
 
+      - name: Upload guide for GitHub Pages
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/book
+
   # Release build. Only runs for real releases (v*.*.* tags) or an explicit manual build —
   # `cargo build --release` never runs on ordinary commits. Compiled in bookworm so the
   # binary's glibc matches the distroless/cc-debian12 runtime it is COPY'd into.
@@ -301,3 +307,33 @@ jobs:
           helm package chart --destination dist
           helm push "dist/ansible-operator-${release_version}.tgz" \
             "oci://ghcr.io/${repository_owner}/charts"
+
+  # Publish the guide built by `docs` to GitHub Pages, replacing the whole site, so it always
+  # documents the latest release. Only after the chart is published, so the site never describes
+  # a release that cannot be installed yet. Pre-release tags (`v1.2.0-rc.1`) are not published:
+  # the site would otherwise document a version most installations are not running.
+  publish-docs:
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    needs: [docs, publish-chart]
+    runs-on: ubuntu-latest
+
+    # The environment's deployment rules must allow `v*` tags: the one GitHub creates when Pages is
+    # switched to "GitHub Actions" admits only the default branch.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    # Two releases tagged in quick succession must not deploy concurrently. A newer pending deploy
+    # replaces an older pending one, but never cancels one in progress.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

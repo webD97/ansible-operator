@@ -658,7 +658,11 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   in, no cargo build inside the image). A `docs` job builds the guide with a pinned, checksummed
   mdBook release, and the `test` job builds the API docs with `RUSTDOCFLAGS=-D warnings`, the same
   check as `just apidoc`. `book.toml` sets `create-missing = false`, so a `SUMMARY.md` entry
-  whose file is missing fails the build instead of rendering an empty page.
+  whose file is missing fails the build instead of rendering an empty page. On a release tag
+  without a pre-release suffix, `publish-docs` deploys that build to GitHub Pages after
+  `publish-chart`, replacing the whole site, so it always documents the latest release. That needs
+  two repository settings no workflow can make: Pages → Source "GitHub Actions", and a `v*` tag
+  rule on the `github-pages` environment, which otherwise admits only the default branch.
 - `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
   not something to modify as part of feature work.
 ```
