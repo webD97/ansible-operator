@@ -664,7 +664,8 @@ eyeball new cross-page links (or run the `mdbook-linkcheck` backend if installed
   two repository settings no workflow can make: Pages → Source "GitHub Actions", and a `v*` tag
   rule on the `github-pages` environment, which otherwise admits only the default branch.
   `publish-docs.yml` publishes any ref by hand (run it from `main`); the mdBook pin both workflows
-  install lives in `.github/actions/setup-mdbook`.
+  install lives in `.github/actions/setup-mdbook`. The checks also run weekly on `main`, so a new
+  stable toolchain's lints surface without a PR.
 - `.agents/skills/` is a vendored skill pack (rust-skills), unrelated to this project's domain —
   not something to modify as part of feature work.
 ```

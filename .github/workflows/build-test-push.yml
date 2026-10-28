@@ -6,6 +6,11 @@ on:
     tags: ["v*.*.*"]
   pull_request:
     branches: ["main"]
+  # Weekly run of the checks on main, so a new stable Rust whose clippy or rustdoc lints fail the
+  # `-D warnings` gates is noticed without waiting for the next PR. The release jobs are gated on
+  # tags or manual runs and stay skipped.
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
   # Manual, on-demand image build for any ref (e.g. main). Main pushes never publish an
   # image on their own; run this to cut one when you actually want it.
   workflow_dispatch: {}
