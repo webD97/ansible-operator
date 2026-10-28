@@ -78,8 +78,9 @@ pub async fn record_prepared(
 
     let object = match api.get_opt(play.job_name).await? {
         Some(existing) if !same_run_record(&existing, &desired) => {
-            return Err(ReconcileError::PreconditionFailed(
-                "existing Play does not belong to the selected run",
+            return Err(ReconcileError::record_mismatch(
+                &existing,
+                "already exists for another run",
             ));
         }
         // Includes a statusless record: `same_run_record` has just proved it is *this* run's, and
@@ -91,8 +92,9 @@ pub async fn record_prepared(
             Err(err) if is_conflict(&err) => {
                 let existing = api.get(play.job_name).await?;
                 if !same_run_record(&existing, &desired) {
-                    return Err(ReconcileError::PreconditionFailed(
-                        "conflicting Play does not belong to the selected run",
+                    return Err(ReconcileError::record_mismatch(
+                        &existing,
+                        "was created concurrently for another run",
                     ));
                 }
                 existing
@@ -108,8 +110,9 @@ pub async fn record_prepared(
         ) => Ok(object),
         Some(
             PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown | PlayPhase::Aborted,
-        ) => Err(ReconcileError::PreconditionFailed(
-            "selected Play is already terminal",
+        ) => Err(ReconcileError::record_mismatch(
+            &object,
+            "is already terminal",
         )),
     }
 }
@@ -144,12 +147,9 @@ pub async fn record_running(
 ) -> Result<Play, ReconcileError> {
     let api = Api::<Play>::namespaced(client.clone(), namespace);
     let object = api.get(play_name).await?;
-    let status = object
-        .status
-        .as_ref()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "prepared Play has no status",
-        ))?;
+    let status = object.status.as_ref().ok_or_else(|| {
+        ReconcileError::record_mismatch(&object, "was prepared but has no status")
+    })?;
 
     verify_play_uid(&object, play_uid)?;
     match status.phase {
@@ -162,8 +162,93 @@ pub async fn record_running(
             Ok(object)
         }
         PlayPhase::Prepared | PlayPhase::Starting | PlayPhase::Aborted => Err(
-            ReconcileError::PreconditionFailed("Play is not committed to start"),
+            ReconcileError::record_mismatch(&object, "is not committed to start"),
         ),
+    }
+}
+
+/// Why a run's Job counts as never having started, in each of the two places it is said.
+///
+/// `summary` lands in the plan's `Summary` print column, one line per plan, so it names the timeout
+/// and what the Job waited on in a word. `reason` is the whole account — the pod, the container,
+/// the image and the kubelet's message — for the `Running` condition, the record and the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobStall {
+    pub summary: String,
+    pub reason: String,
+}
+
+impl JobStall {
+    /// The stall a run recorded, if it recorded one.
+    pub fn recorded(status: &PlayStatus) -> Option<Self> {
+        let reason = status.stall_reason.clone()?;
+        let summary = status
+            .stall_summary
+            .clone()
+            .unwrap_or_else(|| "Job did not start".to_string());
+        Some(Self { summary, reason })
+    }
+}
+
+/// Writes down why a `Running` run's Job is about to be cancelled for never starting — see
+/// [`PlayStatus::stall_reason`]. The phase stays `Running`: the run is not finished until its Job
+/// has stopped, and `record_finished` carries the reason into the terminal status.
+///
+/// Recorded before the cancellation so the decision is taken once. Every later tick reads it back
+/// and carries on cancelling, including after an operator restart, instead of re-judging a Job
+/// whose pods are already being torn down.
+pub async fn record_stalled(
+    api: &Api<Play>,
+    play_name: &str,
+    play_uid: &str,
+    stall: &JobStall,
+) -> Result<Play, ReconcileError> {
+    for attempt in 0..=TRANSITION_CONFLICT_RETRIES {
+        let object = api.get(play_name).await?;
+        verify_play_uid(&object, play_uid)?;
+        let status = object
+            .status
+            .as_ref()
+            .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no status"))?;
+
+        let Some(status) = decide_stall(status, stall)
+            .map_err(|reason| ReconcileError::record_mismatch(&object, reason))?
+        else {
+            return Ok(object);
+        };
+        match replace_status(api, object, status).await {
+            Err(error) if error.is_conflict() && attempt < TRANSITION_CONFLICT_RETRIES => {
+                debug!(
+                    "Lost a write race recording a stall on Play {play_name}; re-reading and retrying"
+                );
+            }
+            result => return result,
+        }
+    }
+
+    unreachable!("the loop returns on its last iteration")
+}
+
+/// The pure decision behind [`record_stalled`]: `Some(status)` to write, `None` if there is nothing
+/// to write, `Err` with the reason if the record is not a running run.
+///
+/// The first reason wins. A replay after the write landed carries the reason a later tick derived
+/// from pods that are already being deleted, which describes the teardown rather than the stall.
+/// A run that finished in the meantime keeps its result, since its Job turned out to start after all.
+fn decide_stall(status: &PlayStatus, stall: &JobStall) -> Result<Option<PlayStatus>, &'static str> {
+    match status.phase {
+        PlayPhase::Running if status.stall_reason.is_none() => {
+            let mut next = status.clone();
+            next.stall_reason = Some(stall.reason.clone());
+            next.stall_summary = Some(stall.summary.clone());
+            Ok(Some(next))
+        }
+        PlayPhase::Running | PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown => {
+            Ok(None)
+        }
+        PlayPhase::Prepared | PlayPhase::Starting | PlayPhase::Launching | PlayPhase::Aborted => {
+            Err("cannot have a stalled Job, because it has not started")
+        }
     }
 }
 
@@ -282,9 +367,10 @@ async fn transition_phase(
         let status = object
             .status
             .as_ref()
-            .ok_or(ReconcileError::PreconditionFailed("Play has no status"))?;
+            .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no status"))?;
 
-        let Some(status) = decide_transition(status, &expected, next.clone(), unreachable_hosts)?
+        let Some(status) = decide_transition(status, &expected, next.clone(), unreachable_hosts)
+            .map_err(|reason| ReconcileError::record_mismatch(&object, reason))?
         else {
             return Ok(object);
         };
@@ -300,7 +386,7 @@ async fn transition_phase(
 }
 
 /// The pure decision behind [`transition_phase`]: `Some(status)` to write, `None` if the record is
-/// already there, `Err` if it moved somewhere else.
+/// already there, `Err` with the reason if it moved somewhere else.
 ///
 /// Idempotence is the point. Every caller is a step in a crash-recoverable protocol that may be
 /// replayed after the write landed but before the operator observed it, so re-running a transition
@@ -331,7 +417,7 @@ fn decide_transition(
     expected: &PlayPhase,
     next: PlayPhase,
     unreachable_hosts: Option<&[UnreachableHost]>,
-) -> Result<Option<PlayStatus>, ReconcileError> {
+) -> Result<Option<PlayStatus>, &'static str> {
     if status.phase == next {
         return Ok(match unreachable_hosts {
             Some(hosts) if hosts != status.unreachable_hosts => {
@@ -343,9 +429,7 @@ fn decide_transition(
         });
     }
     if status.phase != *expected {
-        return Err(ReconcileError::PreconditionFailed(
-            "Play phase changed before transition",
-        ));
+        return Err("phase changed before the transition");
     }
     let mut next_status = status.clone();
     next_status.phase = next;
@@ -363,7 +447,7 @@ fn decide_transition(
 /// a single value. Matching field-by-field on everything else would buy nothing and would be the
 /// same brittleness `validate_selected_job` deliberately avoids for Jobs: any server-side
 /// normalization the operator failed to predict would make the comparison fail forever, and the
-/// failure mode is an unrepairable `PreconditionFailed` on that run number.
+/// failure mode is an unrepairable `RecordMismatch` on that run number.
 fn same_run_record(existing: &Play, desired: &Play) -> bool {
     existing_owner_matches(existing, desired)
         && play_belongs_to_plan(
@@ -432,22 +516,24 @@ pub async fn acknowledge_finished(
     let object = api
         .get_opt(play_name)
         .await?
-        .ok_or(ReconcileError::PreconditionFailed(
-            "finished Play disappeared before it could be acknowledged",
-        ))?;
+        .ok_or_else(|| ReconcileError::RecordMismatch {
+            namespace: namespace.into(),
+            play: play_name.into(),
+            phase: None,
+            reason: "disappeared before its result could be acknowledged",
+        })?;
     verify_play_uid(&object, play_uid)?;
     let status = object
         .status
         .as_ref()
-        .ok_or(ReconcileError::PreconditionFailed(
-            "finished Play has no status",
-        ))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(&object, "finished but has no status"))?;
     if !matches!(
         status.phase,
         PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown
     ) {
-        return Err(ReconcileError::PreconditionFailed(
-            "cannot acknowledge a nonterminal Play",
+        return Err(ReconcileError::record_mismatch(
+            &object,
+            "cannot be acknowledged before it is terminal",
         ));
     }
     if status.plan_status_recorded {
@@ -472,7 +558,7 @@ pub async fn delete_uninitialized(
         .metadata
         .name
         .as_deref()
-        .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(play, "has no name"))?;
     let params = DeleteParams::default().preconditions(Preconditions {
         uid: play.metadata.uid.clone(),
         resource_version: play.metadata.resource_version.clone(),
@@ -505,8 +591,9 @@ pub async fn delete_aborted(
     };
     verify_play_uid(&object, play_uid)?;
     if object.status.as_ref().map(|status| &status.phase) != Some(&PlayPhase::Aborted) {
-        return Err(ReconcileError::PreconditionFailed(
-            "aborted Play changed before it could be deleted",
+        return Err(ReconcileError::record_mismatch(
+            &object,
+            "left Aborted before it could be deleted",
         ));
     }
     let params = DeleteParams::default().preconditions(Preconditions {
@@ -542,27 +629,39 @@ pub async fn record_finished(
         .metadata
         .name
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no name"))?;
     // The terminal status is built fresh rather than derived from the record, so anything the run
     // wrote down about itself has to be carried across explicitly.
-    let unreachable_hosts = object
-        .status
-        .as_ref()
+    let recorded = object.status.as_ref();
+    let unreachable_hosts = recorded
         .map(|status| status.unreachable_hosts.clone())
         .unwrap_or_default();
-    let status = terminal_status(&job_name, hosts, parsed, unreachable_hosts);
+    let mut status = terminal_status(&job_name, hosts, parsed, unreachable_hosts);
+    carry_stall(recorded, &mut status);
     match object.status.as_ref().map(|status| &status.phase) {
         Some(PlayPhase::Launching | PlayPhase::Running) => {
             replace_status(api, object, status).await
         }
         Some(PlayPhase::Succeeded | PlayPhase::Failed | PlayPhase::Unknown) => Ok(object),
         Some(PlayPhase::Prepared | PlayPhase::Starting | PlayPhase::Aborted) => Err(
-            ReconcileError::PreconditionFailed("cannot finish a run that did not start"),
+            ReconcileError::record_mismatch(&object, "cannot finish a run that did not start"),
         ),
-        None => Err(ReconcileError::PreconditionFailed(
-            "cannot finish an uninitialized Play",
+        None => Err(ReconcileError::record_mismatch(
+            &object,
+            "cannot finish a run that was never initialized",
         )),
     }
+}
+
+/// Carries the recorded stall into a finished run's status, but only when its result is `Unknown`.
+/// A Job that turned out to start and report a recap before its cancellation landed was not
+/// cancelled for never starting.
+fn carry_stall(recorded: Option<&PlayStatus>, finished: &mut PlayStatus) {
+    let Some(recorded) = recorded.filter(|_| finished.phase == PlayPhase::Unknown) else {
+        return;
+    };
+    finished.stall_reason = recorded.stall_reason.clone();
+    finished.stall_summary = recorded.stall_summary.clone();
 }
 
 /// Deletes the oldest `Play`s for `plan` beyond its success/failure history limits.
@@ -783,6 +882,8 @@ fn terminal_status(
         recap: sum_recap(parsed, &unreachable_hosts),
         hosts: host_results,
         unreachable_hosts,
+        stall_reason: None,
+        stall_summary: None,
     }
 }
 
@@ -961,7 +1062,7 @@ async fn replace_status(
         .metadata
         .name
         .clone()
-        .ok_or(ReconcileError::PreconditionFailed("Play name not set"))?;
+        .ok_or_else(|| ReconcileError::record_mismatch(&object, "has no name"))?;
     object.status = Some(status);
     Ok(api
         .replace_status(&name, &PostParams::default(), &object)
@@ -979,7 +1080,10 @@ fn play_is_terminal(play: &Play) -> bool {
 
 fn verify_play_uid(play: &Play, expected_uid: &str) -> Result<(), ReconcileError> {
     if play.metadata.uid.as_deref() != Some(expected_uid) {
-        return Err(ReconcileError::PreconditionFailed("Play UID changed"));
+        return Err(ReconcileError::record_mismatch(
+            play,
+            "was replaced by another object (UID changed)",
+        ));
     }
     Ok(())
 }
@@ -1694,6 +1798,73 @@ mod tests {
         assert_eq!(status.phase, PlayPhase::Succeeded);
         assert_eq!(status.host_count, 2);
         assert_eq!(status.failed_host_count, 0);
+    }
+
+    /// The stall is decided once: a replay keeps the first reason, and a run that finished after
+    /// all keeps its result.
+    #[test]
+    fn a_stall_is_recorded_once_and_only_on_a_running_record() {
+        let at = |phase: PlayPhase| PlayStatus {
+            phase,
+            ..Default::default()
+        };
+
+        let stall = |word: &str| JobStall {
+            summary: format!("{word} in short"),
+            reason: word.to_string(),
+        };
+
+        let stalled = decide_stall(&at(PlayPhase::Running), &stall("first"))
+            .unwrap()
+            .expect("a running record without a reason must be written");
+        assert_eq!(stalled.phase, PlayPhase::Running);
+        assert_eq!(JobStall::recorded(&stalled), Some(stall("first")));
+
+        assert!(decide_stall(&stalled, &stall("second")).unwrap().is_none());
+        assert!(
+            decide_stall(&at(PlayPhase::Unknown), &stall("late"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(decide_stall(&at(PlayPhase::Launching), &stall("early")).is_err());
+    }
+
+    /// The terminal status is built from scratch, so the recorded stall has to be carried into it,
+    /// but only into a run whose recap is missing: a Job that reported one started after all.
+    #[test]
+    fn a_recorded_stall_is_carried_only_into_an_unknown_result() {
+        let hosts = vec!["a".to_string()];
+        let recorded = PlayStatus {
+            phase: PlayPhase::Running,
+            stall_reason: Some("the Job did not start within 600s: …".into()),
+            stall_summary: Some("Job did not start within 600s: ImagePullBackOff".into()),
+            ..Default::default()
+        };
+        let carried = |recorded: Option<&PlayStatus>, finished: &PlayStatus| {
+            let mut finished = finished.clone();
+            carry_stall(recorded, &mut finished);
+            JobStall::recorded(&finished)
+        };
+
+        let lost = terminal_status("job", &hosts, None, Vec::new());
+        assert_eq!(
+            carried(Some(&recorded), &lost),
+            JobStall::recorded(&recorded)
+        );
+        assert!(carried(Some(&recorded), &lost).is_some());
+
+        let recap = output(&[(
+            "a",
+            HostStats {
+                ok: 1,
+                completed: true,
+                ..Default::default()
+            },
+        )]);
+        let reported = terminal_status("job", &hosts, Some(&recap), Vec::new());
+        assert_eq!(carried(Some(&recorded), &reported), None);
+
+        assert_eq!(carried(None, &lost), None);
     }
 
     /// Each protocol step may be replayed after its write landed but before the operator observed

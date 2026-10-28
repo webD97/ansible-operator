@@ -25,7 +25,7 @@ per-host status, and the summary line.
 |---|---|
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. |
-| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
+| `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, with reason `JobDidNotStart` that its Job never started and is being cancelled, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
 | `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable). |
@@ -318,11 +318,30 @@ record as a first response to a stuck plan; inspect the run and Job first. See [
 
 ### The plan is stuck in `UnauthorizedNamespace`
 
-The plan's namespace has not been **enrolled** with the operator, so the operator has no RBAC to read
+The summary reads **"namespace '…' is not enrolled (watchNamespaces)"**. The plan's namespace has
+not been **enrolled** with the operator, so the operator has no RBAC to read
 its Secrets or create its Job and refuses to run it (fail-closed). This is a cluster-admin action,
 not something you can fix from the tenant side: an admin must add your namespace to the chart's
 `watchNamespaces` and roll the operator. See
 [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
+
+Once the namespace is enrolled again, the restarted operator moves the plan on by itself. A
+`OneShot` plan whose hosts are all up to date reports `Succeeded`. A `OneShot` plan that had spent
+all its attempts reports `Failed` and can be
+[retried with the retry annotation](./scheduling-and-modes.md#asking-a-failed-plan-to-try-again),
+though it no longer tells `HostsUnreachable` apart from `Failed`. Any other plan reports `Pending`,
+or `Delayed` while it waits for its schedule, and runs, or waits for its schedule or `suspend`, as
+usual. Such a plan does not get its last verdict back, even if its last run failed: it keeps that
+phase until its next run finishes, and a retry request has no effect until a run fails again. This
+covers every `Recurring` plan. If that last run failed in a schedule window that is still open, the
+plan does not retry inside that window, even with `maxAttempts` left.
+
+If the namespace was un-enrolled while a run was in flight, `.status.activeRun` still names that run.
+The operator has cut it off from your cluster Nodes by removing its proxy pods and released its host
+locks. A Job that was already running carries on against any `StaticInventory` hosts, and the
+cluster Nodes it had not finished with are reported `Unreachable` once the namespace is enrolled
+again and the operator collects the result. A run whose Job had not been created yet is resumed
+instead.
 
 ### A `ClusterInventory` resolves to zero hosts
 
@@ -343,8 +362,8 @@ closes.
 
 ### The plan's name is too long
 
-The plan is `Failed` and its summary reads **"name is N characters; a PlaybookPlan name must be at
-most 63 …"**. Applying such a plan is normally rejected outright; you only see this state on a
+The plan is `Failed` and its summary reads **"name is N characters, longer than the 63 allowed"**.
+Applying such a plan is normally rejected outright; you only see this state on a
 cluster that does not enforce CRD validation rules. Either way nothing is created for the plan.
 
 The name is used as a label value on every object a run creates, and Kubernetes label values stop at
@@ -405,15 +424,15 @@ running, and so could not decide anything this tick:
   does not acquire host Leases or create managed-SSH proxy pods for this invalid spec. Only the YAML
   shape is checked here: a list whose entries are not valid plays is accepted and fails when Ansible
   runs it.
-- **"spec.template.files entry … is not usable: …"** — a file entry has an invalid mount name or
-  does not describe exactly one recognized Kubernetes volume source without unknown fields. Correct
-  the named entry; a new run does not acquire host Leases or create managed-SSH proxy pods for this
-  invalid spec.
-- **"spec.template references Secret … which is this plan's own workspace"** — a `secretRef` names
-  the [workspace Secret](./playbook-plans.md#one-job-per-run) the operator generates for this plan.
-  It is rewritten on every run, so hashing it as an input would make the plan replace its own
-  finished run indefinitely. Drop the reference: the workspace is already mounted as the run's
-  working directory, so a playbook reads it from there without asking for it.
+- **"files entry … is not usable"** — a `spec.template.files` entry has an invalid mount name or
+  does not describe exactly one recognized Kubernetes volume source without unknown fields; the
+  `Ready` condition says which. Correct the named entry; a new run does not acquire host Leases or
+  create managed-SSH proxy pods for this invalid spec.
+- **"template references the plan's own workspace Secret"** — a `secretRef` names the [workspace
+  Secret](./playbook-plans.md#one-job-per-run) the operator generates for this plan; the `Ready`
+  condition names it. It is rewritten on every run, so hashing it as an input would make the plan
+  replace its own finished run indefinitely. Drop the reference: the workspace is already mounted as
+  the run's working directory, so a playbook reads it from there without asking for it.
 
 The forms that need an edit — all of the above except `not in sync` and the API errors — are
 rechecked as soon as the edit lands: changing the plan, or creating or changing the inventory or
@@ -471,8 +490,8 @@ another run.
 
 ### A Secret already occupies the workspace Secret's name
 
-The summary reads **"could not prepare run …: Secret "workspace-…" already exists but is not owned
-by this PlaybookPlan, so it cannot be used as its workspace"**.
+The summary reads **"could not prepare run …: workspace Secret "workspace-…" belongs to someone
+else"**.
 
 Every run renders its playbook, its resolved inventory and its inline variables into a generated
 **workspace Secret** named `workspace-<truncated-plan>-<id>`, owned by the plan (see
@@ -519,23 +538,71 @@ normal — `.status.summary` then reads **"applying run …"**, naming the run, 
 `WaitingForNodes` conditions say whether it is waiting on a host lock or on proxy pods rather than
 executing.
 
+A run also stays `Applying`, with the summary it already had (**"applying run …"**, or **"cancelling
+run …"** below), when the Node running its Job's pod stops reporting. The pod's `Ready` condition
+then turns `False`, and after a few minutes `kubectl` shows the pod `Terminating` (`Unknown` on some
+versions). Both say the Node stopped reporting, not that the playbook stopped: a partitioned Node
+keeps running its containers, and the playbook may still be applying to its hosts. From Kubernetes
+1.31 on, the Job is not marked finished while its pod may still run, so the run keeps its host
+Leases, and every other plan that shares a host with it waits too. Recovering the Node resolves it;
+so does removing the `Node` object, after which Kubernetes deletes the pods bound to it and the run
+finishes with its hosts [`Unknown`](#hosts-show-unknown). `kubectl get pods -n <plan-namespace> -l
+ansible.cloudbending.dev/run-id=<runId> -o wide` shows which Node the pod is on, with `<runId>` from
+`.status.activeRun.runId`. A target Node going down does not cause this: Ansible gives up on that
+host and the run carries on (see [Hosts show `Unreachable`](#hosts-show-unreachable)).
+
 The related **"could not prepare a run: …"** summary, without a run name, means setup failed before
 the operator recorded an active run. There is no `Play`, host Lease, or managed-SSH proxy pod to
 recover in that case; the operator reports the error and retries normally.
 
+A Job or `Play` the plan did not create can hold the name a new run would take. The operator then
+numbers the run past it and logs the name it skipped. Only when sixteen names in a row are held does
+it give up with **"could not prepare a run: run names up to … are all held by other objects"**. The
+operator's log names the first and last of them. Inspect those objects and delete the ones that are
+not the operator's.
+
 If it stays there with nothing progressing, `.status.summary` says which of the following it is
 instead, and `.status.activeRun` names the run it is waiting on:
 
+- **"cancelling run …: Job did not start within …s: …"** — the run's Job never started the
+  playbook within the operator's start timeout (see [Runs whose Job never
+  starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)), so the operator is
+  cancelling it. The summary ends with what it was waiting on in a word, such as `ImagePullBackOff`
+  or `Unschedulable`; the full account, naming the pod, the container and the kubelet's message, is
+  the message of the plan's `Running` condition (reason `JobDidNotStart`, shown by `kubectl
+  describe playbookplan`). It is one of: **"no pod was created for it"** (look at `kubectl describe
+  job` for the events: Pod Security admission, an admission webhook, a `ResourceQuota` or a missing
+  ServiceAccount), **"the Job is suspended"** (something outside the operator, such as a queueing
+  controller like Kueue, suspended it; the operator never does), **"pod … is not scheduled: …"**,
+  or **"pod …: container … is waiting: …"** with the reason, such as `ImagePullBackOff` for an image
+  that does not exist or cannot be pulled. Once the Job has stopped, the run finishes with every
+  host [`Unknown`](#hosts-show-unknown) and spends an attempt; the plan's summary keeps the short
+  form in parentheses, and the run's `Play` keeps the full account in `.status.stallReason`
+  (`kubectl get play <job-name> -o jsonpath='{.status.stallReason}'`). Fix what the Job waited on;
+  if the plan has used up its attempts by then, [ask it to try
+  again](./scheduling-and-modes.md#asking-a-failed-plan-to-try-again).
 - **"waiting for Job … which does not carry this run's identity"** — a Job with the name this run
   expects exists, but it is not the one this run created. This normally means a Job was created or
   edited outside the operator; a very unlikely generated-name collision can produce the same symptom
   after an older `Play` was pruned while its Job was still retained. The operator will not adopt the
   Job or modify it. For a run that had already reached `Running`, it waits for that Job to finish or be
-  removed; then its locks and proxy pods are cleaned up and its hosts are reported
-  [`Unknown`](#hosts-show-unknown), since the recap of a Job the operator did not create is not this
-  run's to read, and the plan carries on. For a `Launching` run, even a finished foreign Job still
-  occupies the recorded name, so the Job must be removed; if the run is still wanted, the operator
-  then creates its own Job, otherwise it abandons the unlaunched run.
+  removed, up to the timeout below; then its locks and proxy pods are cleaned up and its hosts are
+  reported [`Unknown`](#hosts-show-unknown), since the recap of a Job the operator did not create is
+  not this run's to read, and the plan carries on. For a `Launching` run, even a finished foreign Job
+  still occupies the recorded name, so the run cannot launch under it: once the Job is removed, the
+  operator creates its own Job if the run is still wanted and otherwise abandons the unlaunched run,
+  and once the timeout below has passed it abandons the run anyway.
+
+  The wait is bounded by the operator's start timeout (`runs.startTimeoutSeconds`, ten minutes by
+  default — see [Runs whose Job never
+  starts](../cluster-operators/deployment.md#runs-whose-job-never-starts)), measured from when the
+  foreign Job was created. Once the foreign Job is older than that, the operator stops waiting on it
+  without touching it: a `Running` run is finished with its hosts `Unknown`, and a `Launching` run
+  is abandoned (**"aborted the run: Job …, which it did not create, has held its name for longer
+  than …s"**) and the next run is numbered past the taken name. Either way the operator first makes
+  sure no pod carrying the run's ID may still be executing, and keeps waiting while one may, or while
+  the unfinished foreign Job would create pods carrying that ID. Deleting
+  the foreign Job yourself, as below, resolves it sooner.
 
   An administrator should first confirm that the Job is really foreign, then delete that **exact Job**
   if it is safe to stop it. Do not delete the `Play`, its Leases, or the operator's proxy resources as
@@ -591,11 +658,20 @@ instead, and `.status.activeRun` names the run it is waiting on:
   already created remain in place. The rest of the message is the underlying API, admission,
   workspace, proxy, Job, or run-record error to correct.
 
-  The form **"Secret … already exists but is not owned by this PlaybookPlan"** has its own entry —
+  This and the other messages below that end with an error give it in short. An error from the
+  Kubernetes API is reduced to its reason, HTTP code and object, such as `Forbidden (403): secrets
+  "vars"`; the operator logs every one of these errors in full, with the API server's message
+  (which, for `Forbidden`, names the identity and the permission that was missing).
+
+  The form `Job <ns>/<name>: does not carry this run's identity` means a Job the run did not
+  create holds the name it recorded. It names that Job; see the "waiting for Job …" entry above for
+  how to confirm that it is foreign.
+
+  The form **"workspace Secret … belongs to someone else"** has its own entry —
   see [A Secret already occupies the workspace Secret's
   name](#a-secret-already-occupies-the-workspace-secrets-name).
 
-  The specific **"Pod/Secret … already exists but is not this run's managed-ssh proxy for host …"**
+  The specific **"proxy Pod/Secret … for host … is not this run's"**
   form can mean an object was planted or edited in the operator namespace. It can also mean two Node
   names produced the same shortened resource-name segment, which requires a deliberately constructed
   collision rather than an ordinary hash accident. Inspect the exact Pod or Secret named in the
@@ -611,13 +687,15 @@ instead, and `.status.activeRun` names the run it is waiting on:
   looking at if the message persists, since these are node-root pods. The run's `Play` is deliberately
   kept meanwhile: it is the handle the retry works from, so do not delete it to unstick the plan.
 - **"run recovery failed: …"** — the operator could not resume the run after a restart. The rest of
-  the message is the underlying error; the operator retries every tick. If the message is
-  **"more than one Play claims to be this plan's active run"**, something outside the operator
-  created a second run record: a plan only ever has one run in flight, and the operator refuses to
-  guess which one is real rather than orphan the other's proxy pods. Look at
-  `kubectl get plays -n <ns> -l ansible.cloudbending.dev/playbookplan=<plan>`, work out which record
-  the operator wrote, and delete the stray one. The host locks of both are kept alive meanwhile, so
-  no other plan can start on those hosts while you do.
+  the message is the underlying error; the operator retries every tick. An error about a run record
+  starts with `Play <ns>/<name> (phase <phase>)`, naming the record and the phase it was in. If the
+  message is **"N Plays claim to be the active run"**, something outside the operator created a
+  second run record: a plan only ever has one run in flight, and the operator refuses to guess which
+  one is real rather than orphan the other's proxy pods. The operator's log names the competing
+  records (`kubectl get play -n <ns>` lists them too, with their phase); look at each with
+  `kubectl get play -n <ns> <name> -o yaml`, work out which record the operator wrote, and delete
+  the stray one. The host locks of both are kept alive meanwhile, so no other plan can start on
+  those hosts while you do.
 - **"run recovery paused: …"** — the operator needs something it cannot currently read to decide
   what to do with the run: an inventory, `NodeAccessPolicy` or referenced Secret lookup that is
   failing for a reason that may clear on its own, such as an API error or a lost connection. The
@@ -746,13 +824,19 @@ proxy pods and its host Leases. Normally that takes a few seconds. It lasts long
   it and the teardown finishes on its own.
 - **the operator is not running.** Nothing releases the run until it comes back; the plan waits
   rather than leaking. Restore the operator and the deletion completes on its own.
-- **the plan's namespace was un-enrolled while the run was in flight.** The operator can then neither
-  release the run nor remove its own finalizer. Re-enrol the namespace and it finishes the teardown;
-  see [Deployment → enrolled namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
+- **the plan's namespace was un-enrolled while the run was in flight.** The operator then releases
+  the run's proxy pods and host Leases, but it can neither cancel the run's Job nor remove its own
+  finalizer. Re-enrol the namespace and it finishes the teardown. Removing the finalizer by hand is
+  also safe here, and needs none of the cleanup below, once the operator has released the run: what
+  is left lives in the plan's namespace and is deleted with the plan. The run is released when
+  `kubectl get pods -n <operator-namespace> -l ansible.cloudbending.dev/run-id=<runId>` returns
+  nothing, with `<runId>` from `.status.activeRun.runId`. See [Deployment → enrolled
+  namespaces](../cluster-operators/deployment.md#enrolled-namespaces).
 
-Removing the finalizer by hand ends the wait but strands the run's proxy pods and host Leases. Before
-doing it, capture the run's identity — the plan's `Play` records and its Job are owned by the plan
-and are deleted with it, and they are what the manual cleanup procedure reads those values from:
+In every other case, removing the finalizer by hand ends the wait but strands the run's proxy pods
+and host Leases. Before doing it, capture the run's identity — the plan's `Play` records and its Job
+are owned by the plan and are deleted with it, and they are what the manual cleanup procedure reads
+those values from:
 
 ```sh
 PLAN_NAMESPACE=my-team
@@ -894,6 +978,13 @@ the host is reached:
 - a **`StaticInventory` host**: it is down, not accepting connections, or rejecting the key in
   `spec.ssh.secretRef`.
 
+A host can also go away in the middle of a run: powered off, crashed or cut off from the network
+during a task. Such a host sends nothing that would close the connection, so the operator's SSH
+settings give up on it after about two minutes without an answer and report it `Unreachable`. The
+rest of the run carries on and finishes instead of waiting for it. A `reboot` task is not affected,
+since Ansible's `reboot` module reconnects on its own and fails the host after its own timeout if
+the machine does not come back.
+
 Such a run leaves the plan in the `HostsUnreachable` phase rather than `Failed`, provided *every*
 host that did not succeed was one nothing could connect to. That is the distinction the phase exists
 for: the playbook is fine and the plan is waiting for a machine. One host that ran a task and failed
@@ -948,6 +1039,12 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
 
   See [`python3` must be on `PATH`](./playbook-plans.md#python3-must-be-on-path) for the image
   requirement and a local verification command.
+- **The run's Job never started.** The operator cancelled it after its start timeout, and
+  `.status.summary` ends with *"(cancelled: Job did not start within …s: …)"*, naming what it
+  waited on in a word; the run's `Play` has the full account in `.status.stallReason`. See [The plan is stuck in `Applying`](#the-plan-is-stuck-in-applying).
+- **The run's Job ran past its deadline.** Kubernetes stopped it before the playbook reached its
+  end, and `.status.summary` ends with *"(the Job exceeded its deadline of …s)"*. See [Bounding how
+  long a run takes](./playbook-plans.md#bounding-how-long-a-run-takes).
 - **The run's `Play` was deleted while the run was still live.** That record is the only thing the
   run can be recovered from, so the operator releases the run's locks and proxy pods and reports
   the whole run as unknown rather than leaving the plan stuck. The next run reports these hosts
@@ -956,8 +1053,8 @@ If *every* host of one run shows `Unknown` at once, check these causes first:
   termination message, which Kubernetes caps at 4096 bytes. The operator compresses it when it does
   not fit, which is good for several hundred hosts, but a plan larger than that cannot report a
   per-host result at all. This case says so rather than leaving you to guess: `.status.summary`
-  reads *"the recap for N hosts does not fit the kubelet's termination-message limit"*, and the
-  operator logs the same. Split the plan across smaller inventories — each plan gets its own recap,
+  ends with *"(the recap for N hosts exceeds the termination-message limit)"*, and the operator
+  logs the same. Split the plan across smaller inventories — each plan gets its own recap,
   so two plans of 300 hosts fit where one of 600 does not.
 
   Unlike the other causes here, this one is deterministic: every retry reproduces it, so the plan
