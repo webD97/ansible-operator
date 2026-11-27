@@ -404,7 +404,10 @@ resting state. It reads
 [`HostsUnreachable`](./results-and-troubleshooting.md#phases) rather than `Failed` for as
 long as that lasts, provided every host it did not apply to was one nothing could reach — the
 playbook is fine, and the plan is waiting for hardware. The condition says exactly which Node. Removing the Node from the cluster
-or from the inventory's selector is what ends it.
+or from the inventory's selector is what ends it: a `OneShot` plan whose remaining hosts are all
+up to date, or a plan of either mode left with no hosts, reports `Succeeded` on its next reconcile,
+and a `Recurring` plan that still has hosts on its next run — see
+[a failed host leaves the inventory](./results-and-troubleshooting.md#a-failed-host-leaves-the-inventory).
 
 The hold is asked before a run starts, so it cannot catch a proxy pod that fails *after* it passed.
 If that leaves a started run with every host excluded, the run is recorded straight away without a
