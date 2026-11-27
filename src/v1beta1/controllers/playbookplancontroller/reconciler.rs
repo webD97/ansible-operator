@@ -2874,7 +2874,8 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
 /// No hosts selected is nothing to do, so the plan is done: `Succeeded`, as after a run that
 /// reached every host. One plan deployed to several clusters selects no Node in some of them, and
 /// `Pending` (`OneShot`) or a `Delayed` that never ends (`Recurring`) read there like a plan stuck
-/// on something.
+/// on something. That includes a plan whose last run failed: the hosts the failure was about are
+/// gone, and with no host left no run will ever come to replace it. The `Play` still records it.
 ///
 /// No hosts because `NodeAccessPolicy` granted none of the selected nodes is a refusal instead, and
 /// no hosts because they wait for another plan's dependency label is a wait. Reporting either
@@ -2882,11 +2883,14 @@ fn phase_while_waiting_for_schedule(current: &Phase) -> Phase {
 /// converged plan. Both keep the phase of a plan that has not run: `Pending` for `OneShot`,
 /// `Delayed` for `Recurring`, whose next slot is still ahead.
 ///
-/// Either way a verdict stands, as in [`phase_while_waiting_for_schedule`]: it records a run that
-/// did happen, and losing the hosts does not undo it. A failure is only ever written by a run, but
-/// `Succeeded` is also written without one — by the "nothing to do" case here, and by
-/// `restore_idle_oneshot_status` for a revision with no outdated hosts — so under a refusal or a
-/// wait it counts only once a host has succeeded on the current revision.
+/// Under a refusal or a wait a verdict stands until it ends, as in
+/// [`phase_while_waiting_for_schedule`]. The refused or waiting Nodes need not be the ones a failure
+/// was about, but either state is something to fix or wait for rather than a converged plan, and the
+/// summary says which; a failure kept also keeps the retry annotation usable for a spent budget once
+/// those Nodes arrive. A failure is only ever written by a run, but `Succeeded` is also written
+/// without one — by the "nothing to do" case here, and by
+/// `restore_idle_oneshot_status` for a revision with no outdated hosts — so there it counts only
+/// once a host has succeeded on the current revision.
 fn phase_without_hosts(
     status: &PlaybookPlanStatus,
     mode: &ExecutionMode,
@@ -2894,9 +2898,9 @@ fn phase_without_hosts(
 ) -> Phase {
     let current = &status.phase;
     let nothing_to_do = matches!(resolution, HostResolution::Hosts | HostResolution::Nothing);
-    if is_failure_verdict(current)
-        || (current == &Phase::Succeeded
-            && (nothing_to_do || succeeded_on_current_revision(status)))
+    if !nothing_to_do
+        && (is_failure_verdict(current)
+            || (current == &Phase::Succeeded && succeeded_on_current_revision(status)))
     {
         return current.clone();
     }
@@ -2911,6 +2915,19 @@ fn phase_without_hosts(
         ) => Phase::Delayed,
         (HostResolution::Hosts | HostResolution::Nothing, _) => Phase::Succeeded,
     }
+}
+
+/// Writes [`phase_without_hosts`], retiring what a failure verdict it replaces left behind.
+fn set_phase_without_hosts(
+    status: &mut PlaybookPlanStatus,
+    mode: &ExecutionMode,
+    resolution: HostResolution,
+) {
+    let phase = phase_without_hosts(status, mode, resolution);
+    if is_failure_verdict(&status.phase) && !is_failure_verdict(&phase) {
+        retire_outlived_failure(status);
+    }
+    status.phase = phase;
 }
 
 /// Whether some host carries a success for the plan's current revision.
@@ -3035,7 +3052,7 @@ fn update_idle_status<Tz: TimeZone>(
         if !resolves_to_hosts {
             status.next_run = None;
             if !suspend {
-                status.phase = phase_without_hosts(status, mode, resolution);
+                set_phase_without_hosts(status, mode, resolution);
             }
         }
         return None;
@@ -3051,7 +3068,7 @@ fn update_idle_status<Tz: TimeZone>(
     }
 
     if !resolves_to_hosts {
-        status.phase = phase_without_hosts(status, mode, resolution);
+        set_phase_without_hosts(status, mode, resolution);
     }
     let next = forecast_next_run(schedule, now.clone(), None)?;
     status.next_run = Some(next.fixed_offset());
@@ -12813,29 +12830,60 @@ spec:
         }
     }
 
-    /// A verdict is a run that happened, so losing every host does not rewrite it — in either mode,
-    /// the same rule `phase_while_waiting_for_schedule` applies.
+    /// A plan left with no hosts at all has nothing to do, and a failure verdict would describe hosts
+    /// it no longer has — the run that wrote it is still in its `Play`. In either mode it reports
+    /// `Succeeded`, with the attempts those hosts spent handed back so a host joining later is
+    /// applied to, and `Ready` restated rather than left counting them. A refusal or a wait is not
+    /// nothing to do: it is something to fix or wait for, and the verdict stands until it ends.
     #[test]
-    fn a_plan_without_hosts_keeps_the_verdict_of_a_run_that_happened() {
+    fn a_plan_left_without_hosts_retires_its_failure_verdict() {
         let now = "2025-08-12T19:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let excluded = ["node-a".to_string()];
         for mode in [ExecutionMode::OneShot, ExecutionMode::Recurring] {
             for verdict in [Phase::Failed, Phase::HostsUnreachable] {
-                let mut status = PlaybookPlanStatus {
+                let failed = || PlaybookPlanStatus {
                     phase: verdict.clone(),
+                    retry_count: 3,
+                    hosts_status: Some(BTreeMap::new()),
+                    conditions: vec![v1beta1::PlaybookPlanCondition {
+                        type_: "Ready".into(),
+                        status: "False".into(),
+                        reason: Some("SomeHostsDidNotSucceed".into()),
+                        message: Some("3/4 hosts completed successfully".into()),
+                        last_transition_time: None,
+                    }],
                     ..Default::default()
                 };
+                let idle = |status: &mut PlaybookPlanStatus, resolution| {
+                    update_idle_status(
+                        &mode,
+                        Some(&Schedule::parse("0 20 * * *").unwrap()),
+                        false,
+                        false,
+                        resolution,
+                        now,
+                        status,
+                    );
+                };
 
-                update_idle_status(
-                    &mode,
-                    Some(&Schedule::parse("0 20 * * *").unwrap()),
-                    false,
-                    false,
-                    HostResolution::Nothing,
-                    now,
-                    &mut status,
-                );
+                let mut nothing = failed();
+                idle(&mut nothing, HostResolution::Nothing);
+                assert_eq!(nothing.phase, Phase::Succeeded, "{mode:?} {verdict:?}");
+                assert_eq!(nothing.retry_count, 0, "{mode:?} {verdict:?}");
+                assert_eq!(nothing.retry_generation, 1, "{mode:?} {verdict:?}");
+                let ready = ready_condition(&nothing);
+                assert_eq!(ready.status, "True", "{mode:?} {verdict:?}");
+                assert_eq!(ready.reason.as_deref(), Some("HostsUpToDate"));
 
-                assert_eq!(status.phase, verdict, "{mode:?}");
+                for resolution in [
+                    HostResolution::ExcludedByPolicy(&excluded),
+                    HostResolution::WaitingForDependencies,
+                ] {
+                    let mut status = failed();
+                    idle(&mut status, resolution);
+                    assert_eq!(status.phase, verdict, "{mode:?} {resolution:?}");
+                    assert_eq!(status.retry_count, 3, "{mode:?} {resolution:?}");
+                }
             }
         }
     }

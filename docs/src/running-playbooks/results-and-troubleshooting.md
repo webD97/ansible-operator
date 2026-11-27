@@ -27,7 +27,7 @@ per-host status, and the summary line.
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. A `Recurring` plan that has not run also stays here when no `NodeAccessPolicy` grants its namespace the Nodes it selects, or when every one of them waits for another plan's dependency label. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, with reason `JobDidNotStart` that its Job never started and is being cancelled, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
 | `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. A plan whose inventories select no hosts at all is `Succeeded` too, since it has nothing to apply — see [a `ClusterInventory` resolves to zero hosts](#a-clusterinventory-resolves-to-zero-hosts). It can also follow a failed run whose failed hosts have since left the plan, while that run's `Play` still records the failure — see [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory). The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
-| `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. A `OneShot` plan whose failed hosts have all left the inventory reports `Succeeded` instead — see [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory). The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. A `OneShot` plan whose failed hosts have all left the inventory while every host it still has is up to date (a Node that joined meanwhile is not, so it keeps the verdict), or a plan of either mode left with no hosts at all, reports `Succeeded` instead — see [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory). The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
 | `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable), and [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory) for a machine that is not coming back. |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
@@ -357,10 +357,12 @@ A plan with no hosts does not create an empty Job. Its `.status.summary` says wh
 it is in, and the phase follows from that:
 
 - **"plan currently resolves to no hosts"** — the inventories select no Node, for example because
-  this cluster has none with the labels you selected on. There is nothing to do, so a plan without a
-  run verdict is `Succeeded`. This is the expected state for a plan deployed to several clusters that
-  only some of them have Nodes for. A plan that has never run has no `Ready` condition in this
-  state, since `Ready` is only written from a run's result; monitor such plans by their phase.
+  this cluster has none with the labels you selected on. There is nothing to do, so the plan is
+  `Succeeded` — even if its last run failed, since the hosts that failure was about are gone (see
+  [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory)). This is the expected
+  state for a plan deployed to several clusters that only some of them have Nodes for. A plan that
+  has never run has no `Ready` condition in this state, since `Ready` is only written from a run's
+  result; monitor such plans by their phase.
 - **"plan currently resolves to no hosts: no NodeAccessPolicy grants this namespace node(s) node-a
   and 4 more"** — Nodes match, but policy enforcement removed every one of them. The summary names
   the first; the operator log lists them all. That is a refusal rather than
@@ -373,11 +375,13 @@ it is in, and the phase follows from that:
   names the plans; if the wait does not end, see
   [a dependency never becomes satisfied](#a-dependency-never-becomes-satisfied).
 
-In all three cases a previous run's `Failed` or `HostsUnreachable` verdict remains visible, and so
-does `Succeeded` — under a refusal or a wait, only if a run actually succeeded on the current
-playbook and inputs, so a plan that was `Succeeded` because nothing matched does not stay that way
-once a refused or waiting Node joins. A suspended plan keeps its phase. A `Recurring` plan continues
-to forecast `.status.nextRun`; a `OneShot` plan shows none. If matching, authorized hosts appear,
+Under a refusal or a wait, a previous run's `Failed` or `HostsUnreachable` verdict remains visible
+until the refusal or wait ends, even when the refused or waiting Nodes are not the ones it was
+about: either is something to fix or wait for, and the summary says which. So does `Succeeded`,
+but only if a run actually succeeded on the current playbook and inputs, so a plan that was
+`Succeeded` because nothing matched does not stay that way once a refused or waiting Node joins. A
+suspended plan keeps its phase. A `Recurring` plan continues to forecast `.status.nextRun`; a
+`OneShot` plan shows none. If matching, authorized hosts appear,
 the plan runs on them like any outdated host: a `Recurring` plan on a later tick, or in the current
 tick's grace window if it reconciles again before that window closes; a `OneShot` plan right away,
 or at its next scheduled time if it has a schedule.
@@ -1048,7 +1052,11 @@ succeed has since left the plan — its Node deleted for good, or a selector, in
   stands: it is still owed a run.
 - A **`Recurring`** plan keeps the verdict until its next scheduled run replaces it.
 
-The run's `Play` record is not changed: it still shows the result as it was when the run finished.
+A plan left with no hosts at all reports `Succeeded` in both modes, with its attempt budget
+restored, unless it is suspended or a `NodeAccessPolicy` refusal or a dependency wait is why it has
+none — see
+[a `ClusterInventory` resolves to zero hosts](#a-clusterinventory-resolves-to-zero-hosts). The
+run's `Play` record is not changed: it still shows the result as it was when the run finished.
 
 ### Hosts show `Incomplete`
 
