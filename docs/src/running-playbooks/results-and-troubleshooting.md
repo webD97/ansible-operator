@@ -26,9 +26,9 @@ per-host status, and the summary line.
 | `Pending` | Triggers not yet evaluated — the resting state right after creation, after the inputs changed, or while unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent a plan with no run verdict from starting. A `OneShot` plan that has not run also stays here when no `NodeAccessPolicy` grants its namespace the Nodes it selects, or when every one of them waits for another plan's dependency label — see [a `ClusterInventory` resolves to zero hosts](#a-clusterinventory-resolves-to-zero-hosts). |
 | `Delayed` | The plan is waiting for its scheduled time and has no result yet under the current playbook and inputs. A `Recurring` plan that has not run also stays here when no `NodeAccessPolicy` grants its namespace the Nodes it selects, or when every one of them waits for another plan's dependency label. |
 | `Applying` | A run is active: it may be waiting for host locks, preparing proxy infrastructure, or running its Job. `Running=True` means the operator has created or identified the run's own Job; `Running=False` with reason `JobIdentityMismatch` means another Job holds its name, with reason `JobDidNotStart` that its Job never started and is being cancelled, and with reason `RunRecordLost` that the run's `Play` record is gone and its Job is being stopped before its hosts are released. |
-| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. A plan whose inventories select no hosts at all is `Succeeded` too, since it has nothing to apply — see [a `ClusterInventory` resolves to zero hosts](#a-clusterinventory-resolves-to-zero-hosts). The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
-| `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
-| `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable). |
+| `Succeeded` | Every host targeted by the latest run succeeded. A `OneShot` plan is then quiet until the inputs change; a `Recurring` plan keeps this result between ticks, with `.status.nextRun` naming the next one. A plan whose inventories select no hosts at all is `Succeeded` too, since it has nothing to apply — see [a `ClusterInventory` resolves to zero hosts](#a-clusterinventory-resolves-to-zero-hosts). It can also follow a failed run whose failed hosts have since left the plan, while that run's `Play` still records the failure — see [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory). The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. |
+| `Failed` | The latest run did not succeed on every host, or its recap could not be read — and at least one of those hosts was *reached*, which is what separates it from `HostsUnreachable`. A `Recurring` plan keeps this result between ticks the same way. A `OneShot` plan whose failed hosts have all left the inventory reports `Succeeded` instead — see [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory). The verdict remains visible if unreadable [inputs](#the-plans-inputs-cannot-be-read) or an invalid [schedule or time zone](#the-plans-schedule-or-time-zone-is-invalid) prevent another run. Also used when the plan is refused outright — see [the plan's name is too long](#the-plans-name-is-too-long). |
+| `HostsUnreachable` | The latest run applied the playbook to every host it could reach, and the only hosts left over were ones nothing could connect to. A failure, and retried like one — but nothing is wrong with the playbook, so this reads as *waiting for a machine* rather than *broken*. See [Hosts show `Unreachable`](#hosts-show-unreachable), and [a failed host leaves the inventory](#a-failed-host-leaves-the-inventory) for a machine that is not coming back. |
 | `UnauthorizedNamespace` | The plan's namespace is not enrolled for the operator — it will not run. See below. |
 
 ## Summary
@@ -1034,6 +1034,21 @@ than starting another run while they stay down — so a plan in this state is wa
 stuck. That relief is specific to cluster Nodes the operator saw go down: an unreachable
 `StaticInventory` host, or a Node that was `Ready` when the run started, is a failure like any other
 and does spend its attempts.
+
+### A failed host leaves the inventory
+
+A `Failed` or `HostsUnreachable` phase describes hosts the plan targets. When every host that did not
+succeed has since left the plan — its Node deleted for good, or a selector, inventory or
+`NodeAccessPolicy` change that no longer takes it — the phase follows:
+
+- A **`OneShot`** plan whose remaining hosts are all up to date reports `Succeeded` on its next
+  reconcile, with `Ready` restated from those hosts and a summary like `3/3 up-to-date`. Its
+  [attempt budget](./scheduling-and-modes.md#retries) is restored too, so a host that joins later is
+  applied to as usual. While a host that did not succeed is still in the inventory, the verdict
+  stands: it is still owed a run.
+- A **`Recurring`** plan keeps the verdict until its next scheduled run replaces it.
+
+The run's `Play` record is not changed: it still shows the result as it was when the run finished.
 
 ### Hosts show `Incomplete`
 

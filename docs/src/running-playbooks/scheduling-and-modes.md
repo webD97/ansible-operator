@@ -380,8 +380,12 @@ What the budget covers depends on the mode, because what counts as "the same pie
   later can run without an unrelated plan edit — and so does a run whose only
   non-successes were hosts on Nodes that were already `NotReady` when it launched, since every host
   it could reach did succeed (see [Unreachable Nodes and the attempt
-  budget](./cluster-nodes.md#unreachable-nodes-and-the-attempt-budget)). A `schedule` does not reset a
-  failed execution: it says when a `OneShot` plan may run, not how often it may fail.
+  budget](./cluster-nodes.md#unreachable-nodes-and-the-attempt-budget)). It also comes back when
+  every host the plan failed on has left its inventory and every host it still has is up to date
+  (see [a failed host leaves the
+  inventory](./results-and-troubleshooting.md#a-failed-host-leaves-the-inventory)). A `schedule`
+  does not reset a failed execution: it says when a `OneShot` plan may run, not how often it may
+  fail.
 - **`Recurring`** spends its budget on one schedule tick, and defaults to `1` — no retry, since the
   next tick re-applies the same playbook anyway. With a higher `maxAttempts` a failed run is retried
   within the current tick, and the next tick starts over with a full budget whatever the previous one
@@ -433,10 +437,10 @@ the next slot — which for a `Recurring` plan would have started with a fresh b
 request matters there only while a window is open.
 
 What stops the earlier failures counting is a generation number. Each request that acts raises
-`.status.retryGeneration`, every `Play` records the generation it was started under
-(`.spec.retryGeneration`), and a window counts only the failures of the current generation. So after
-a request, `kubectl get plays -o wide` can show a window's earlier failed runs next to new ones whose
-`Try` starts again at 1: the earlier ones belong to an older generation and no longer count.
+`.status.retryGeneration`, and so does a plan retiring a failure whose hosts have left it; every
+`Play` records the generation it was started under (`.spec.retryGeneration`), and a window counts
+only the failures of the current generation. So after a request, `kubectl get plays -o wide` can
+show a window's earlier failed runs next to new ones whose `Try` starts again at 1: the earlier ones belong to an older generation and no longer count.
 
 The request is an annotation rather than a spec field so that a plan managed by Helm can be retried
 without editing its values: `helm upgrade` leaves alone an annotation that the chart does not render.
@@ -455,7 +459,10 @@ nothing at all, **including for hosts that become eligible later**. So if your p
 that were labelled afterwards. That is deliberate — a playbook that is failing should be fixed
 before it reaches more hosts — but it means the fix is to correct the plan (which hands it a fresh
 budget) or, once the cause is gone, to [ask it to try again](#asking-a-failed-plan-to-try-again),
-not to wait.
+not to wait. The one exception is a plan whose failed hosts have all left its inventory while every
+host it still has is up to date: it reports `Succeeded` and gets its budget back, so a Node that
+joins later is applied to — see
+[a failed host leaves the inventory](./results-and-troubleshooting.md#a-failed-host-leaves-the-inventory).
 
 ## Host locks
 

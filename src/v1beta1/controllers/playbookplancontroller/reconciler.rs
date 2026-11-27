@@ -1649,15 +1649,11 @@ async fn reconcile(
                 requeue_after = requeue;
             }
         }
-    } else if resource_status.active_run.is_none()
-        && matches!(object.spec.mode, ExecutionMode::OneShot)
-        && outdated_hosts.is_empty()
-        && resource_status.hosts_status.is_some()
-        && resource_status.phase == Phase::Pending
-    {
-        // A revision edit resets the visible terminal state, but not the per-host results. If it is
-        // reverted before another run starts, restore the idle verdict instead of waiting for a new
-        // hash change.
+    } else if restores_idle_oneshot_verdict(
+        &resource_status,
+        &object.spec.mode,
+        outdated_hosts.len(),
+    ) {
         let total_count = distinct_host_count(&resource_status.eligible_hosts);
         restore_idle_oneshot_status(&mut resource_status, total_count);
     } else if eligible_to_start && resource_status.active_run.is_none() {
@@ -2989,7 +2985,10 @@ impl<'a> HostResolution<'a> {
 ///     did, are the truth about this plan. Overwriting them here would also clobber the finished
 ///     run's own report, because the run's per-host results are applied
 ///     (`status::apply_terminal_play_status`) long before the owed set is computed — so the tick
-///     that finishes a run is itself one of these ticks.
+///     that finishes a run is itself one of these ticks. The one exception is a `OneShot` failure
+///     whose failed hosts have all left the inventory: [`restore_idle_oneshot_status`] restates it
+///     earlier in the first idle tick after that, because it describes no host the plan still has.
+///     For hosts that left during the run, that is the tick after the one that finishes it.
 ///
 /// The next *future* occurrence is advertised rather than a slot whose grace window is currently
 /// open: there is nothing left to run in that slot. Another reconcile can still start the current
@@ -6397,18 +6396,63 @@ fn restore_summary_after_overlay(
     }
 }
 
-/// Restores an idle `OneShot` verdict after a revision is changed and then reverted.
+/// Whether an idle `OneShot` plan's phase is restated from its per-host results by
+/// [`restore_idle_oneshot_status`]: it has hosts, every one of them is on the current revision,
+/// and its phase is one of two that no longer describe that.
 ///
-/// The conditions under which that is the right thing to do — idle, `OneShot`, no outdated hosts,
-/// per-host results still on the plan, and a phase the revision edit reset to `Pending` — are the
-/// caller's `else if`, and are not restated here. They have to be the caller's: they select this
-/// branch out of the chain that also decides scheduling, so a plan that fails them must fall through
-/// to the next arm rather than reach a function that quietly does nothing.
+/// - **`Pending`**: a revision edit resets the visible terminal state, but not the per-host results.
+///   If it is reverted before another run starts, the old results are current again, and the idle
+///   verdict is restored instead of waiting for a new hash change.
+/// - **A failure verdict**: a host that fails or is not reached keeps the hash of its last success,
+///   so in `OneShot` it stays outdated until a run succeeds on it. Nothing outdated under a failure
+///   therefore means every host the run did not apply to has left the inventory — a deleted Node, a
+///   selector or policy that no longer takes it. A `OneShot` plan starts no run without an outdated
+///   host, so without this the plan would report that failure for as long as it exists.
+///
+/// `Recurring` is left out because the same counters mean the opposite there: it re-applies to
+/// hosts that are already current, so a host that failed today still carries yesterday's hash, and
+/// "nothing outdated" is what a genuine failure looks like. Its next run replaces the verdict. A
+/// plan with no hosts at all is left to [`update_idle_status`], which tells nothing to do apart
+/// from a refusal or a wait.
+///
+/// Asked in the tick's `else if` chain rather than inside the restore, because it selects that arm
+/// out of the chain that also decides scheduling: a plan that fails it must fall through to the next
+/// arm rather than reach a function that quietly does nothing.
+fn restores_idle_oneshot_verdict(
+    status: &PlaybookPlanStatus,
+    mode: &ExecutionMode,
+    outdated_count: usize,
+) -> bool {
+    status.active_run.is_none()
+        && matches!(mode, ExecutionMode::OneShot)
+        && outdated_count == 0
+        && status.hosts_status.is_some()
+        && (status.phase == Phase::Pending
+            || (is_failure_verdict(&status.phase)
+                && distinct_host_count(&status.eligible_hosts) > 0))
+}
+
+/// Restores an idle `OneShot` verdict; see [`restores_idle_oneshot_verdict`] for when.
 fn restore_idle_oneshot_status(status: &mut PlaybookPlanStatus, total_count: usize) {
+    if is_failure_verdict(&status.phase) {
+        retire_outlived_failure(status);
+    }
     status.phase = Phase::Succeeded;
     status.next_run = None;
     // Restoring the verdict of a plan that succeeded, so there is no failure to report.
     status.summary = Some(plan_summary(0, total_count, &Phase::Succeeded));
+}
+
+/// Clears what a failure verdict left behind once the hosts it was about have left the plan; the
+/// caller replaces the phase.
+///
+/// The attempt budget is handed back because the attempts it counts were spent on those hosts: kept
+/// spent, a host joining later would never be applied to, and the retry annotation could not hand
+/// it back once the phase no longer reads as a failure. `Ready` is restated because the run that
+/// wrote it counted the hosts that are gone.
+fn retire_outlived_failure(status: &mut PlaybookPlanStatus) {
+    hand_back_retry_budget(status);
+    status::restate_ready_from_hosts(status, 0);
 }
 
 /// Replaces the `UnauthorizedNamespace` the enrolment guard left on an idle plan whose namespace has
@@ -14187,6 +14231,159 @@ spec:
         assert_eq!(status.phase, Phase::Succeeded);
         assert_eq!(status.next_run, None);
         assert_eq!(status.summary.as_deref(), Some("1/1 up-to-date"));
+    }
+
+    /// A `OneShot` plan whose last run reached `worker-1`..`worker-3` but not `worker-4`, as that
+    /// run left it: the verdict, a spent or refunded budget, `Ready` and the summary counting the
+    /// host that was not applied to, and the next slot it is waiting for.
+    fn oneshot_failed_on_one_host(hash: &ExecutionHash, verdict: Phase) -> PlaybookPlanStatus {
+        let applied = |hash: String, outcome| v1beta1::HostStatus {
+            last_applied_hash: hash,
+            last_outcome: outcome,
+            ..Default::default()
+        };
+        PlaybookPlanStatus {
+            current_hash: hash.to_string(),
+            summary: Some(plan_summary(1, 4, &verdict)),
+            phase: verdict,
+            retry_count: 3,
+            next_run: Some("2026-11-30T03:00:00+01:00".parse().unwrap()),
+            eligible_hosts: vec![ResolvedHosts {
+                name: "workers".into(),
+                hosts: vec![
+                    "worker-1".into(),
+                    "worker-2".into(),
+                    "worker-3".into(),
+                    "worker-4".into(),
+                ],
+                ..Default::default()
+            }],
+            hosts_status: Some(BTreeMap::from([
+                (
+                    "worker-1".into(),
+                    applied(hash.to_string(), v1beta1::HostOutcome::Succeeded),
+                ),
+                (
+                    "worker-2".into(),
+                    applied(hash.to_string(), v1beta1::HostOutcome::Succeeded),
+                ),
+                (
+                    "worker-3".into(),
+                    applied(hash.to_string(), v1beta1::HostOutcome::Succeeded),
+                ),
+                (
+                    "worker-4".into(),
+                    applied(String::new(), v1beta1::HostOutcome::Unreachable),
+                ),
+            ])),
+            conditions: vec![v1beta1::PlaybookPlanCondition {
+                type_: "Ready".into(),
+                status: "False".into(),
+                reason: Some("HostsOutdated".into()),
+                message: Some("3/4 hosts on the current revision".into()),
+                last_transition_time: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn without_host(mut status: PlaybookPlanStatus, host: &str) -> PlaybookPlanStatus {
+        status.eligible_hosts[0].hosts.retain(|name| name != host);
+        status
+    }
+
+    /// The host a failed run did not apply to leaves the inventory — its Node deleted for good — so
+    /// every host the plan still targets is on the current revision and nothing is left to run. A
+    /// `OneShot` plan never starts another run then, so only this restore can stop it reporting the
+    /// failure of a host it no longer has. It hands the budget back too: kept spent, a Node joining
+    /// later would never be applied to, and the retry annotation could not help once the phase no
+    /// longer reads as a failure.
+    #[test]
+    fn a_oneshot_plan_whose_failed_host_left_the_inventory_converges() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        for verdict in [Phase::HostsUnreachable, Phase::Failed] {
+            let mut status = without_host(
+                oneshot_failed_on_one_host(&hash, verdict.clone()),
+                "worker-4",
+            );
+            let outdated = find_outdated_hosts(&status, &hash);
+            assert!(outdated.is_empty(), "{verdict:?}");
+            assert!(
+                restores_idle_oneshot_verdict(&status, &ExecutionMode::OneShot, outdated.len()),
+                "{verdict:?}"
+            );
+
+            restore_idle_oneshot_status(&mut status, 3);
+
+            assert_eq!(status.phase, Phase::Succeeded, "{verdict:?}");
+            assert_eq!(status.summary.as_deref(), Some("3/3 up-to-date"));
+            assert_eq!(status.next_run, None);
+            let ready = ready_condition(&status);
+            assert_eq!(ready.status, "True", "{verdict:?}");
+            assert_eq!(ready.reason.as_deref(), Some("HostsUpToDate"));
+            assert_eq!(
+                ready.message.as_deref(),
+                Some("3/3 hosts on the current revision")
+            );
+            assert_eq!(status.retry_count, 0, "{verdict:?}");
+            assert_eq!(status.retry_generation, 1, "{verdict:?}");
+        }
+    }
+
+    /// Where the restore must not reach. A failed host still in the inventory is owed a run, and the
+    /// verdict is the truth about it. A `Recurring` plan's failed hosts keep the hash of their last
+    /// success, so "nothing outdated" is what a genuine failure of it looks like; its next run is what
+    /// replaces the verdict. A run in flight writes its own. A plan left with no hosts at all is
+    /// `update_idle_status`'s to describe, since it tells nothing to do from a refusal or a wait.
+    #[test]
+    fn a_failure_verdict_is_only_retired_when_no_targeted_host_is_owed_a_run() {
+        let hash = ExecutionHash::from_hex("1").unwrap();
+        for verdict in [Phase::HostsUnreachable, Phase::Failed] {
+            let still_there = oneshot_failed_on_one_host(&hash, verdict.clone());
+            let outdated = find_outdated_hosts(&still_there, &hash).len();
+            assert_eq!(outdated, 1);
+            assert!(!restores_idle_oneshot_verdict(
+                &still_there,
+                &ExecutionMode::OneShot,
+                outdated
+            ));
+
+            let gone = without_host(
+                oneshot_failed_on_one_host(&hash, verdict.clone()),
+                "worker-4",
+            );
+            assert!(!restores_idle_oneshot_verdict(
+                &gone,
+                &ExecutionMode::Recurring,
+                0
+            ));
+
+            let mut running = gone.clone();
+            running.active_run = Some(v1beta1::ActiveRun {
+                execution_hash: hash.to_string(),
+                run_id: "run-2".into(),
+                job_name: "plan-2".into(),
+                play_uid: "uid-2".into(),
+                hosts: vec!["worker-1".into()],
+                run_number: 2,
+                attempt: 1,
+                triggered_slot: None,
+                retry_generation: 0,
+            });
+            assert!(!restores_idle_oneshot_verdict(
+                &running,
+                &ExecutionMode::OneShot,
+                0
+            ));
+
+            let mut no_hosts = gone;
+            no_hosts.eligible_hosts.clear();
+            assert!(!restores_idle_oneshot_verdict(
+                &no_hosts,
+                &ExecutionMode::OneShot,
+                0
+            ));
+        }
     }
 
     fn unenrolled_status(
