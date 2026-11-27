@@ -719,27 +719,13 @@ pub fn clear_nodes_not_ready_condition(
     clear_ready_overlay(status, outdated_count, "NodesNotReady")
 }
 
-/// Retires one temporary readiness overlay, restating `Ready` from the plan's per-host results.
-/// Returns whether the named overlay was present and therefore changed.
+/// Retires one temporary readiness overlay, restating `Ready` from the plan's per-host results
+/// through [`restate_ready_from_hosts`]. Returns whether the named overlay was present and
+/// therefore changed.
 ///
 /// Needed for every mode, not only one that also restores a phase: `Ready` is a printer column, and
 /// nothing else rewrites it between runs. A `Recurring` plan would advertise a resolved outage until
 /// its next slot completed, which for a daily schedule is a day of a false negative.
-///
-/// The results are the ones [`apply_terminal_play_status`] already folded into the plan: a host is
-/// current exactly when its last run succeeded at this revision, which is what `outdated_count`
-/// counts the complement of. A plan that has never run has no verdict to restate — and carried no
-/// `Ready` condition before the overlay — so it gets none back rather than an invented one.
-///
-/// It is deliberately said in its **own** reason and wording rather than borrowed from
-/// [`apply_terminal_play_status`], because the two count different populations and only one of them
-/// is about a run. That function reports the hosts *one run* targeted, which in `OneShot` is just the
-/// ones that were outdated when it started; this reports every host the plan is responsible for.
-/// Sharing `AllHostsSucceeded`/`SomeHostsDidNotSucceed` and "N/M hosts completed successfully"
-/// across both would make the same condition change its numbers — a plan whose last run applied 2 of
-/// 10 hosts and failed one would read "1/2 hosts completed successfully", then "9/10 hosts completed
-/// successfully" once an unrelated input outage cleared, with nothing having run in between, so it
-/// would claim completions that never happened.
 fn clear_ready_overlay(
     status: &mut PlaybookPlanStatus,
     outdated_count: usize,
@@ -753,11 +739,32 @@ fn clear_ready_overlay(
         return false;
     }
 
+    restate_ready_from_hosts(status, outdated_count);
+    true
+}
+
+/// Restates `Ready` from the plan's per-host results rather than from a run.
+///
+/// The results are the ones [`apply_terminal_play_status`] already folded into the plan: a host is
+/// current exactly when its last run succeeded at this revision, which is what `outdated_count`
+/// counts the complement of. A plan that has never run has no verdict to restate, so its `Ready`
+/// condition is removed rather than invented.
+///
+/// It is deliberately said in its **own** reason and wording rather than borrowed from
+/// [`apply_terminal_play_status`], because the two count different populations and only one of them
+/// is about a run. That function reports the hosts *one run* targeted, which in `OneShot` is just the
+/// ones that were outdated when it started; this reports every host the plan is responsible for.
+/// Sharing `AllHostsSucceeded`/`SomeHostsDidNotSucceed` and "N/M hosts completed successfully"
+/// across both would make the same condition change its numbers — a plan whose last run applied 2 of
+/// 10 hosts and failed one would read "1/2 hosts completed successfully", then "9/10 hosts completed
+/// successfully" once an unrelated input outage cleared, with nothing having run in between, so it
+/// would claim completions that never happened.
+pub fn restate_ready_from_hosts(status: &mut PlaybookPlanStatus, outdated_count: usize) {
     if status.hosts_status.is_none() {
         status
             .conditions
             .retain(|condition| condition.type_ != "Ready");
-        return true;
+        return;
     }
 
     let total = distinct_host_count(&status.eligible_hosts);
@@ -779,7 +786,6 @@ fn clear_ready_overlay(
     };
 
     upsert_condition(&mut status.conditions, condition);
-    true
 }
 
 #[cfg(test)]
